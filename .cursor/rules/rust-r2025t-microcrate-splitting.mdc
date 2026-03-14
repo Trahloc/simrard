@@ -1,0 +1,95 @@
+---
+description: r2025t criteria for when to split modules into microcrates. Applies when considering crate organization or refactoring in r2025t workspaces.
+alwaysApply: false
+---
+
+# Rust r2025t Microcrate Splitting Criteria
+
+## The Microcrate Threshold
+
+Split a module into its own microcrate when **any** of the following are true:
+
+### 1. Type Proliferation
+
+The module has 3+ non-trivial public types or traits with their own impl blocks.
+
+**Example**: A config module that grows `Config`, `ConfigBuilder`, and `ConfigValidator` each with substantial impl blocks may warrant a split.
+
+### 2. Dependency Isolation
+
+The module pulls in a dependency that nothing else in the parent crate needs.
+
+**Example**: One module needs `serde_json` or a heavy async runtime while the rest of the crate is dependency-light; splitting isolates compile cost and feature surface.
+
+### 3. Test Divergence
+
+The module's tests require materially different fixtures or setup than its siblings.
+
+**Example**: One module needs complex test databases or external services; others use simple mocks. A separate crate keeps test boundaries clear.
+
+### 4. Independent Versioning
+
+You want to version or feature-gate the module independently.
+
+**Example**: Experimental or optional functionality that should only compile under a feature flag; a microcrate makes feature gating and semver clearer.
+
+### 5. Collaboration Boundary
+
+Two developers (or AI agents) would reasonably work on it simultaneously without touching the same files.
+
+**Example**: Distinct subsystems that rarely share code; splitting reduces merge conflicts and clarifies ownership.
+
+## When NOT to Split
+
+**Do not split** merely because a file exceeds a line count. Split when the boundary is load-bearing for compilation, testing, or comprehension.
+
+### Anti-Patterns
+
+- ❌ "This file has 500 lines, let's split it"
+- ❌ "We have 5 modules, let's make 5 microcrates"
+- ❌ "This feels like a separate thing, let's split"
+
+### When Line Count Matters
+
+Line count matters only when it indicates a threshold criterion:
+- High line count + many dependencies → consider dependency isolation
+- High line count + many public types → consider type proliferation
+- High line count + complex test setup → consider test divergence
+
+## The Goal
+
+> Change one file in one microcrate → rebuild only that crate → run tests in under 2 seconds
+
+### Measuring the Goal
+
+- Incremental rebuild time should be <2 seconds for a single crate
+- Test execution for one crate should be near-instant
+- Dependencies should compile in parallel without blocking
+
+## Promotion Path
+
+When splitting, follow this progression:
+
+1. **Start as module**: Keep code as a module in the parent crate
+2. **Evaluate threshold**: Check if any splitting criteria are met
+3. **Nested microcrate**: If splitting is needed but the code is an implementation detail of the parent, create a nested microcrate
+4. **Promote to lib/**: If the code is needed by siblings or has independent identity, move to `lib/<name>/`
+
+## Example Decision Tree
+
+```
+Is this code used by multiple consumers (binary + lib, or multiple libs)?
+├─ Yes → Move to lib/ (shared library)
+└─ No → Keep in current crate as module or nested microcrate
+         │
+         └─ Does it meet a split criterion (deps, types, tests, versioning)?
+            ├─ Yes → Split to nested microcrate (or lib/ if shared)
+            └─ No → Keep as module
+```
+
+## Enforcement
+
+- Split decisions must be justified by at least one threshold criterion
+- Do not split based on line count alone
+- Measure incremental compile times before/after splitting
+- Re-evaluate splits if compile times or clarity do not improve

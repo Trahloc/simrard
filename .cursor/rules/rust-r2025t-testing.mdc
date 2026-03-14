@@ -1,0 +1,123 @@
+---
+description: r2025t testing strategy for unit and integration tests. Applies when writing or organizing tests in r2025t workspaces.
+alwaysApply: false
+---
+
+# Rust r2025t Testing Strategy
+
+## Testing Philosophy
+
+Testing is stratified to optimize compilation speed and AI comprehension. The goal is to keep incremental builds under 2 seconds and provide clear test boundaries.
+
+## Unit Tests (In-File)
+
+Tests that verify internal logic live **inside the source file** they test.
+
+### Example
+
+```rust
+// common.rs (or any module file)
+
+pub fn validate_path(path: &Path) -> bool {
+    path.exists() && path.is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_path_exists() {
+        let path = Path::new("/tmp/test");
+        // test implementation
+    }
+}
+```
+
+### Benefits
+
+- AI and humans see code and tests together in one context
+- Tests compile only when that specific crate is tested
+- Private functions are testable without `pub(crate)` gymnastics
+- Incremental compilation: changing one file only rebuilds that crate's tests
+
+## Integration Tests (Test Crate)
+
+Integration tests live in a dedicated workspace member **`tests/`**. This is a **crate**, not Cargo's default `tests/` folder at the workspace root.
+
+### Why a Crate, Not a Folder?
+
+Cargo's default `tests/` folder compiles each `*.rs` file as a separate binary. That can hurt compile times. A single test crate compiles once and can depend on your workspace crates.
+
+### Test Crate Layout
+
+```
+tests/
+├── Cargo.toml
+├── integration.rs           # crate root
+├── api_flow.rs              # test module
+└── e2e_flow.rs              # test module
+```
+
+### Test Crate Cargo.toml
+
+```toml
+[package]
+name = "myapp-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "myapp_tests"
+path = "integration.rs"
+
+[[test]]
+name = "integration"
+path = "integration.rs"
+
+[dependencies]
+myapp-bin = { path = "../bin" }
+myapp-lib-common = { path = "../lib/common" }
+# Add other workspace crates as needed
+```
+
+### Test Crate Root
+
+```rust
+// integration.rs
+
+mod api_flow;
+mod e2e_flow;
+
+// Shared test utilities, fixtures, etc.
+```
+
+## Running Tests
+
+```bash
+# Unit tests for one crate
+cargo test -p myapp-lib-common
+
+# All integration tests
+cargo test -p myapp-tests
+
+# Everything
+cargo test --workspace
+```
+
+Replace `myapp` with your project's package prefix.
+
+## Test Organization Rules
+
+1. **Unit tests**: Always in the same file as the code they test, under `#[cfg(test)] mod tests`
+2. **Integration tests**: In the `tests/` workspace member crate
+3. **Test modules**: Use descriptive names (e.g. `api_flow.rs`, `install_flow.rs`)
+4. **Test utilities**: Shared fixtures and helpers in the test crate root or dedicated modules
+
+## Enforcement
+
+- Unit tests must be in-file with `#[cfg(test)] mod tests`
+- Integration tests must live in the `tests/` workspace crate
+- Do not rely on a bare `tests/` folder at workspace root for integration tests if you want a single test binary and workspace dependencies
+- Test crate must be a workspace member with its own Cargo.toml

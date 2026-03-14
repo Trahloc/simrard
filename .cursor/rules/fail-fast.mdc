@@ -1,0 +1,67 @@
+---
+description: Runtime error handling with AI-optimized error messages. No silent fallbacks for systems we control. Applies to scripts, config validation, and backend error handling patterns.
+alwaysApply: false
+---
+# Fail Fast Policy
+
+## Core Principle
+
+**No silent fallbacks.** Fail immediately on errors with structured, actionable feedback. This applies to all languages (Bash, Python, Rust, Go, TypeScript, etc.).
+
+### Context-Rich Error Format
+When throwing an error or exiting with a non-zero code, structure the output with clear keys. This helps AI agents and humans immediately diagnose the issue.
+
+```text
+ERROR: [Component] [Operation] failed
+CAUSE: [Root cause or violated invariant]
+CONTEXT: 
+  - File: [path:line]
+  - Variable: [name]=[value]
+  - State: [current state]
+REQUIRED ACTION: [What needs to be fixed]
+DIAGNOSTIC: [Additional diagnostic information or command to run]
+```
+
+### Error Propagation
+
+- **Enable strict modes**: `set -euo pipefail` (Bash), strict `tsconfig.json` (TS), etc.
+- **Never suppress errors**: Avoid `|| true`, `except: pass`, or `try {} catch {}` blocks without explicit handling.
+- **Propagate explicitly**: Bubble errors up with additional context.
+
+### External Dependencies Exception
+
+Silent fallbacks are **acceptable ONLY for external API requests, network calls, or third-party services** (e.g., CDN unreachable). 
+
+However, you must **ALWAYS log a loud WARNING** before falling back:
+
+```bash
+if ! fetch_external_resource; then
+    echo "WARNING: External dependency unreachable. Using fallback.
+CAUSE: Timeout fetching https://...
+REQUIRED ACTION: Verify network connectivity." >&2
+    use_local_fallback
+fi
+```
+
+### Examples
+
+**❌ BAD (Silent fallback in Bash):**
+```bash
+if [ -f "$CONFIG" ]; then
+    source "$CONFIG"
+else
+    source "/default/config"  # Silent fallback!
+fi
+```
+
+**✅ GOOD (Loud failure):**
+```bash
+[ -f "$CONFIG" ] || {
+    echo "ERROR: Required config file missing
+CAUSE: CONFIG file not found at expected location
+CONTEXT: File $CONFIG
+REQUIRED ACTION: Create config file or fix CONFIG variable" >&2
+    exit 1
+}
+source "$CONFIG"
+```

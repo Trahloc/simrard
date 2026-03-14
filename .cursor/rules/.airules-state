@@ -1,0 +1,6 @@
+{
+  "installed_at": "2026-03-13T13:12:28Z",
+  "airules_source": "/home/trahloc/code/airules",
+  "base_rules": 6,
+  "env": "rust-r2025t"
+}

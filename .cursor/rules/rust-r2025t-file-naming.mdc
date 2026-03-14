@@ -1,0 +1,91 @@
+---
+description: r2025t file naming rules and banned filenames. Applies when creating, renaming, or organizing Rust source files in r2025t workspaces.
+alwaysApply: false
+---
+
+# Rust r2025t File Naming Rules
+
+## Root Source File Rule
+
+For any crate with directory name **X/**:
+
+- The crate root source file **must** be named **X.rs**
+- The crate Cargo.toml **must** explicitly declare the path (e.g. `path = "X.rs"`)
+
+Examples:
+- `lib/common/` → root file: `common.rs`
+- `lib/ai/` → root file: `ai.rs`
+- `command/install/` → root file: `install.rs`
+- Binary: `bin/src/<binary-name>.rs` (e.g. `bin/src/myapp.rs`)
+
+## Banned Filenames
+
+### `mod.rs` — Strictly Forbidden
+
+`mod.rs` is **strictly forbidden** in all contexts. Use the Rust 2018 pattern instead:
+
+- ❌ **Never**: `foo/mod.rs`
+- ✅ **Always**: `foo.rs` as module root; use `foo/` only for a submodule directory with its own `foo.rs` or child modules
+
+### `lib.rs` and `main.rs` — Logic Containers Forbidden
+
+`lib.rs` and `main.rs` are **forbidden as logic containers**. They exist only as optional tooling redirects.
+
+**Rules for redirects:**
+- Contain at most 5 lines of code
+- No business logic, no error handling, no imports beyond the orchestrator
+- Must be marked with a comment explaining their purpose
+- If tooling works without them, omit them
+
+### Redirect Examples
+
+#### Library Redirect
+
+```rust
+// lib.rs - tooling compatibility redirect
+// All logic lives in common.rs (or the crate root file).
+mod common;
+pub use common::*;
+```
+
+Cargo.toml still points to the real root (e.g. `common.rs`); this file exists only for tools that ignore Cargo.toml paths.
+
+#### Binary Redirect
+
+```rust
+// main.rs - tooling compatibility redirect
+// All logic lives in myapp.rs (or your orchestrator name).
+mod myapp;
+
+fn main() {
+    myapp::run();
+}
+```
+
+## Naming Restrictions
+
+- **Do not** name a microcrate `core`. It shadows `std::core`. Use `common`, `shared`, or `kernel` instead.
+- **Never** use `mod.rs`. Always use the Rust 2018 pattern: `foo.rs` as module root, `foo/` only when you have a submodule directory.
+
+## Module Declaration Pattern
+
+When declaring modules, use explicit file names:
+
+```rust
+// common.rs - crate root
+
+mod fs_utils;
+mod xdg;
+
+pub use fs_utils::*;
+pub use xdg::*;
+```
+
+Each module file is explicitly named and matches its logical responsibility.
+
+## Enforcement
+
+- All crate root files must be named X.rs where X is the directory name
+- No `mod.rs` files allowed anywhere
+- `lib.rs` and `main.rs` only as redirects (max 5 lines)
+- File names must match their logical directory location

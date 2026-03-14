@@ -1,0 +1,42 @@
+---
+description: All MDC rules must be configured for intelligent activation with proper frontmatter. Rules should only be always-applied when they truly need to be active in all contexts.
+alwaysApply: false
+---
+# MDC Rules Configuration
+
+## Core Principle
+
+**All MDC rules (.cursor/rules/*.mdc) must be intelligently activated to conserve the AI's limited context window.**
+
+Only make rules `alwaysApply: true` if they are short, globally applicable, and strictly necessary for day-to-day interactions.
+
+## Frontmatter Requirements
+Every MDC rule file must include YAML frontmatter at the top:
+
+```yaml
+---
+description: Clear, specific description of when this rule applies (e.g., "Applies to UI components in React").
+alwaysApply: true|false
+---
+```
+
+## When to use `alwaysApply: true`
+
+Only use `alwaysApply: true` when:
+1. The rule applies absolutely to **all files, contexts, and languages** in the project.
+2. The rule is a **fundamental safety principle** that should never be ignored.
+3. The rule file is **token-efficient** (preferably < 50 lines).
+
+**Examples of Good `alwaysApply: true`:**
+- A `microrules.mdc` file containing short, 1-2 sentence core design tenets.
+- A rule strictly defining authorization mechanics (e.g., "Never run `sudo`, always ask user").
+- A rule defining how the AI should commit to git.
+
+## When to use `alwaysApply: false`
+
+Use `alwaysApply: false` when:
+1. The rule applies to **specific languages** (e.g., "Rust project structure", "TypeScript strictness").
+2. The rule applies to **specific folders or domains** (e.g., "Database migration patterns", "React hooks").
+3. The rule is **long** and highly detailed.
+
+By keeping `alwaysApply: false` for domain-specific knowledge, the AI will dynamically load the rule only when the conversation naturally touches on that domain (e.g., when the user asks about the database), keeping the global prompt clean and focused.

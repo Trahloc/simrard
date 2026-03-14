@@ -1,0 +1,24 @@
+---
+description: Project-specific conventions for simrard. Crate layout, warnings, and rule versioning. Applies when working in the simrard repo.
+alwaysApply: false
+---
+
+# simrard Conventions
+
+## Crate Layout
+
+- simrard uses the **rust-2025-Trahloc (r2025t)** microcrate layout: workspace with `bin/`, `lib/*`, and `tests/`. No `mod.rs`; flattened libs; root entry point is `bin/src/simrard.rs`. See `docs/rust-to-r2025t.md` and the rust-r2025t-* rules.
+- **Edition**: Rust 2024 in all crates.
+
+## Edition
+
+- simrard uses **Rust edition 2024**. The r2025t standard is built on 2024; keep `edition = "2024"` in `Cargo.toml`.
+
+## Warnings and Dead Code
+
+- Warnings are errors (see project `.cargo/config.toml` and warnings-as-errors rule).
+- Planned-but-unimplemented behavior belongs in **TODO comments** (and the code removed or stubbed), not in dead code or `#[allow(unused)]`. Do not leave unused symbols "for later."
+
+## Cursor Rules in This Repo
+
+- In simrard, **`.cursor/rules/` is committed to the repo** (exception to the usual "keep rules in .git/info/exclude" practice). Do not add `.cursor/rules/` to `.git/info/exclude` in this project.

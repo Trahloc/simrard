@@ -1,0 +1,133 @@
+---
+description: r2025t feature flag strategy and coordination patterns. Applies when working with Cargo features in r2025t workspaces.
+alwaysApply: false
+---
+
+# Rust r2025t Feature Flag Strategy
+
+## Feature Coordination Principle
+
+Features flow **downward** from binary to libraries, never upward. The binary is the root that decides what is included. Leaf libraries do not coordinate features with each other.
+
+## Crate-Local Features
+
+Each microcrate owns features for its optional dependencies or conditional compilation.
+
+### Example: Library Crate
+
+```toml
+# lib/common/Cargo.toml
+
+[features]
+default = []
+logging = ["tracing"]
+
+[dependencies]
+tracing = { version = "0.1", optional = true }
+```
+
+Each crate defines features independently based on its needs.
+
+## Workspace-Level Aggregation
+
+The binary crate aggregates features from dependencies and exposes them to end users.
+
+### Example: Binary Crate (with optional command crates)
+
+```toml
+# bin/Cargo.toml
+
+[features]
+default = ["install", "fix"]
+install = ["myapp-command-install"]
+fix = ["myapp-command-fix"]
+status = ["myapp-command-status"]
+full = ["install", "fix", "status"]
+verbose-logging = ["myapp-lib-common/logging"]
+
+[dependencies]
+myapp-command-install = { path = "../command/install", optional = true }
+myapp-command-fix = { path = "../command/fix", optional = true }
+myapp-command-status = { path = "../command/status", optional = true }
+myapp-lib-common = { path = "../lib/common" }
+```
+
+### Key Points
+
+- Binary aggregates optional crates and library features
+- Binary exposes convenience groups (e.g. `full` enables all commands)
+- Binary propagates library features with `crate-name/feature-name` syntax
+- Optional subcommand/plugin crates are gated by features
+
+## Feature Naming Convention
+
+### Verb / Command Features
+
+Use the verb or feature name directly: `install`, `fix`, `status`, `gui`, `server`
+
+### Capability Features
+
+Use descriptive names: `verbose-logging`, `network-retry`, `async-backend`, `default-font`
+
+### Propagated Features
+
+Use **`crate-name/feature-name`** syntax so the mapping is clear:
+
+```toml
+verbose-logging = ["myapp-lib-common/logging"]
+```
+
+## Feature Flow Direction
+
+```
+Binary (Root)
+  ├─→ Optional crates (commands, plugins)
+  │     └─→ Library crates
+  └─→ Library crates (required or optional)
+        └─→ (no feature coordination upward)
+```
+
+**Rules:**
+- Binary decides what is included and what features are exposed
+- Binary propagates features to libraries
+- Optional crates can depend on libraries
+- Libraries do not coordinate features upward
+- Optional crates do not coordinate features with each other
+
+## Example: Full Feature Chain
+
+```toml
+# bin/Cargo.toml
+[features]
+verbose-logging = ["myapp-lib-common/logging"]
+
+# lib/common/Cargo.toml
+[features]
+logging = ["tracing"]
+
+# User runs: cargo build --features verbose-logging
+# Flow: verbose-logging → myapp-lib-common/logging → tracing enabled
+```
+
+## Feature Gating Optional Crates
+
+Optional workspace members should be gated by features:
+
+```toml
+# bin/Cargo.toml
+[features]
+install = ["myapp-command-install"]
+
+[dependencies]
+myapp-command-install = { path = "../command/install", optional = true }
+```
+
+This allows minimal binaries (only needed crates) and clear feature semantics.
+
+## Enforcement
+
+- Features must flow downward from binary to libraries
+- Library crates do not coordinate features with each other
+- Feature names must be clear and descriptive
+- Propagated features must use `crate-name/feature-name` syntax
+- Optional crates must be optional dependencies gated by features when applicable

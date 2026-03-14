@@ -1,0 +1,39 @@
+---
+description: Discover and respect each repo's own conventions
+alwaysApply: true
+---
+
+# Repo Awareness
+
+Do not assume conventions. **Read the repo's docs** when they exist.
+
+## On First Interaction With a Repo
+
+1. Check `git remote -v` to understand topology (upstream clone vs fork vs personal).
+2. Scan for project docs (stop at first hit per category):
+   - **AI agent rules**: `AGENTS.md`, `CLAUDE.md`, `.cursorrules`
+   - **Contribution guide**: `.github/CONTRIBUTING.md`, `CONTRIBUTING.md`
+   - **PR template**: `.github/PULL_REQUEST_TEMPLATE.md`
+3. If the repo has `AGENTS.md` or equivalent, follow it for lint/test/build commands and coding style — do not invent your own.
+4. If no docs exist, fall back to `package.json` scripts / `Makefile` / `Cargo.toml` / `pyproject.toml` for available commands.
+
+## Local Files (Cursor Rules, .envrc, etc.)
+
+- `.cursor/rules/` should be in `.git/info/exclude` (not `.gitignore`) so it stays local without polluting upstream.
+- **Exception — simrard**: In the simrard project, `.cursor/rules/` is committed to the repo; do not add it to `.git/info/exclude` there.
+- Same for any other local-only files: prefer `.git/info/exclude` over modifying `.gitignore`.
+
+## Upstream Clone Setup (When origin = upstream, push blocked)
+
+If this is a fresh clone of someone else's repo and push protection isn't set:
+1. `git config --local remote.origin.pushurl UPSTREAM_DO_NOT_PUSH`
+2. Add `.cursor/rules/` to `.git/info/exclude` (skip this step in the simrard repo; rules are committed there)
+3. Create `local/run` branch for default local work: `git checkout -b local/run origin/main`
+
+## Adding a Fork Remote
+
+```bash
+git remote add fork git@github.com:trahloc/<repo-name>.git
+```
+
+Push PR branches to `fork`. Fetch/rebase from `origin`.

@@ -1,0 +1,58 @@
+---
+description: Git branch protection and workflow for any GitHub project
+alwaysApply: true
+---
+
+# Git Safety
+
+## Detect Repo Type (do this once per session)
+
+Run `git remote -v` and `git config --local remote.origin.pushurl` to classify:
+
+- **Upstream clone** (origin push = `UPSTREAM_DO_NOT_PUSH`): origin is read-only. Push goes to `fork` remote.
+- **Own fork** (origin push = your fork URL): push to origin normally.
+- **Personal project** (origin push = your own repo): push to origin normally.
+
+## Hard Rules (all repo types)
+
+- **NEVER commit on the default branch** (`main`/`master`). Always work on a named branch.
+- **NEVER force-push** unless explicitly asked.
+- Before ANY commit: `git branch --show-current` — confirm you're not on the default branch.
+- If on the default branch: `git checkout -b <branch-name>` first.
+
+## Branch Naming
+
+| Purpose | Pattern | Example |
+|---------|---------|---------|
+| Feature | `trahloc/feat/<name>` | `trahloc/feat/add-auth` |
+| Fix | `trahloc/fix/<name>` | `trahloc/fix/null-check` |
+| Chore | `trahloc/chore/<name>` | `trahloc/chore/update-deps` |
+| Local throwaway | `local/<name>` | `local/experiment` |
+
+- `local/*` = never pushed.
+- `trahloc/*` = pushable (to `fork` or `origin` depending on repo type).
+
+## Commits
+
+- Use Conventional Commits: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`.
+- Scope when the repo has multiple packages: `feat(api): add endpoint`.
+- Write the "why" not the "what".
+
+## Before Commit
+
+Read the repo's own rules first — check for any of these (in priority order):
+1. `AGENTS.md` (AI-specific guidance, lint/typecheck commands)
+2. `.github/CONTRIBUTING.md` or `CONTRIBUTING.md`
+3. `package.json` scripts, `Makefile`, or equivalent for lint/test/typecheck commands
+
+Run whatever pre-commit checks the project defines. If none found, at minimum verify the change doesn't break the build.
+
+## PR Workflow
+
+1. Branch from latest default: `git fetch origin && git checkout -b trahloc/feat/<name> origin/main`
+2. Work, commit.
+3. Sync before PR: `git fetch origin && git rebase origin/main`
+4. Push:
+   - **Upstream clone**: `git push fork trahloc/feat/<name> -u`
+   - **Fork / personal**: `git push origin trahloc/feat/<name> -u`
+5. If a PR template exists (`.github/PULL_REQUEST_TEMPLATE.md`), follow its structure.

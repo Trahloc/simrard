@@ -1,0 +1,158 @@
+---
+description: r2025t development tooling and iterative workflow setup. Applies when setting up development environment or configuring build tools for r2025t workspaces.
+alwaysApply: false
+---
+
+# Rust r2025t Development Tooling
+
+## Philosophy
+
+The goal is **fastest in human time**, not fastest in CPU time. Optimize for iteration speed and developer experience.
+
+## Recommended Tools
+
+### cargo-watch: Auto-Rebuild on File Changes
+
+```bash
+cargo install cargo-watch
+```
+
+**Usage:**
+
+```bash
+# Continuous type checking
+cargo watch -x check
+
+# Test one crate (replace myapp-lib-common with your crate name)
+cargo watch -x "test -p myapp-lib-common"
+
+# Continuous linting
+cargo watch -x "clippy -- -W warnings"
+```
+
+**Benefits:**
+- Immediate feedback on code changes
+- Catches errors within seconds
+- No manual rebuild loop
+
+### sccache: Shared Compilation Cache
+
+```bash
+cargo install sccache
+export RUSTC_WRAPPER=sccache
+```
+
+Add to shell profile for persistence.
+
+**Benefits:**
+- Faster cold builds across projects
+- Shared cache across multiple Rust workspaces
+- Transparent integration with cargo
+
+### mold: Faster Linker (Linux)
+
+Install via package manager, then configure:
+
+```toml
+# .cargo/config.toml
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+**Benefits:**
+- Significantly faster linking
+- Especially noticeable with larger binaries
+
+## IDE Configuration
+
+### rust-analyzer (VS Code, Cursor, etc.)
+
+```json
+{
+    "rust-analyzer.checkOnSave.command": "clippy",
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "rust-analyzer.procMacro.enable": true
+}
+```
+
+**Settings:**
+- Use clippy for on-save checks (catches more issues)
+- Enable build scripts (required for some crates)
+- Enable proc macros (needed for derive macros)
+
+## Development Workflow
+
+### Typical Iteration Loop
+
+1. **Run watch in terminal:**
+   ```bash
+   cargo watch -x check
+   ```
+
+2. **Edit code**: Errors appear within seconds
+
+3. **Test single crate:**
+   ```bash
+   cargo test -p myapp-lib-common
+   ```
+
+4. **Run the binary (if applicable):**
+   ```bash
+   cargo run -p myapp-bin
+   ```
+
+Replace `myapp` with your project's package prefix.
+
+### Microcrate Compilation Benefits
+
+Microcrate boundaries are compilation unit boundaries. The flattened layout plus small crates means:
+
+- Changing one file → rebuild only that crate
+- Parallel compilation across crates
+- Incremental rebuilds are near-instant (<2 seconds)
+
+### Workflow Tips
+
+1. **Test in isolation first**: Use `-p <crate>` to test one crate before full integration
+2. **Use watch mode**: Keep `cargo watch` running for immediate feedback
+3. **Prefer check during edit**: Run `cargo check` instead of `cargo build` during development
+4. **Filter tests**: Use `cargo test --lib` to skip integration tests during quick iterations
+
+## Performance Targets
+
+- **Incremental rebuild**: <2 seconds for single crate change
+- **Type checking**: <1 second with cargo watch
+- **Unit test execution**: Near-instant for single crate
+- **Full workspace build**: Should leverage parallel compilation
+
+## Tool Configuration Files
+
+### .cargo/config.toml
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[build]
+rustc-wrapper = "sccache"
+```
+
+(Use `rustc-wrapper` only if sccache is in PATH; otherwise rely on `RUSTC_WRAPPER` in the environment.)
+
+### Shell Profile
+
+```bash
+# Add to ~/.bashrc or ~/.zshrc
+export RUSTC_WRAPPER=sccache
+```
+
+## Enforcement
+
+- Use cargo-watch for development iteration
+- Configure sccache for shared compilation cache when beneficial
+- Use mold linker on Linux for faster linking
+- Configure rust-analyzer for optimal IDE experience
+- Test crates individually before full workspace testing

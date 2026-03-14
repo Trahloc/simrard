@@ -1,0 +1,173 @@
+---
+description: r2025t crate structure, layout, and naming conventions. Applies when creating new crates, organizing crate directories, or modifying Cargo.toml in r2025t workspaces.
+alwaysApply: false
+---
+
+# Rust r2025t Crate Structure Rules
+
+## Crate Naming Convention
+
+### Package Name Format
+
+For each crate, the package name in Cargo.toml follows: **`<project>-<kind>-<tld>`**
+
+Where:
+- **`<project>`** is the base project name (e.g. `myapp`, `simrard`, `mytool`)
+- **`<kind>`** is one of: `bin`, `lib`, `tests`, or optionally `command` for CLI verb crates
+- **`<tld>`** is the crate directory name (e.g. `common`, `ai`, `install`)
+
+Examples (project name `myapp`):
+- `bin/` → package name: `myapp-bin`
+- `lib/common/` → package name: `myapp-lib-common`
+- `lib/ai/` → package name: `myapp-lib-ai`
+- `tests/` → package name: `myapp-tests`
+- `command/install/` (optional) → package name: `myapp-command-install`
+
+### Library Name Format
+
+The library name in Cargo.toml uses underscores: **`<project>_<kind>_<tld>`**
+
+Examples:
+- `myapp-lib-common` → lib name: `myapp_lib_common`
+- `myapp-command-install` → lib name: `myapp_command_install`
+
+## Flattened Layout (Microcrates)
+
+Microcrates do **not** use a `src/` directory. All source files live directly in the crate directory.
+
+### Example Layout
+
+```
+lib/common/
+├── Cargo.toml
+├── common.rs           # crate root
+├── fs_utils.rs         # module
+└── xdg.rs              # module
+```
+
+### Cargo.toml for Flattened Layout
+
+```toml
+[package]
+name = "myapp-lib-common"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "myapp_lib_common"
+path = "common.rs"
+
+[dependencies]
+# path = "../other" for sibling crates
+```
+
+**Key points:**
+- Root file is explicitly declared: `path = "common.rs"` (or whatever the TLD is)
+- No `src/` directory structure
+- All source files at crate root level
+
+## Binary Crate (Uses src/)
+
+The binary front door uses `src/` because it is the public entry point and may have additional structure:
+
+```
+bin/
+├── Cargo.toml
+└── src/
+    ├── myapp.rs        # orchestrator (or your binary name)
+    └── main.rs         # optional redirect
+```
+
+### Binary Cargo.toml
+
+```toml
+[package]
+name = "myapp-bin"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "myapp"
+path = "src/myapp.rs"
+```
+
+The binary path points to the orchestrator file, not `main.rs`.
+
+## Optional: Command Microcrates
+
+For CLI tools with multiple verbs (install, fix, status), command crates can live under `command/`. Each is a flattened microcrate.
+
+### Directory Layout
+
+```
+command/install/
+├── Cargo.toml
+├── install.rs              # crate root, orchestrator
+├── install_config.rs       # module
+└── install_steps.rs        # module
+```
+
+### Module Declaration (orchestrator)
+
+```rust
+// install.rs
+
+mod install_config;
+mod install_steps;
+
+pub use install_config::Config;
+pub use install_steps::execute;
+
+pub fn run(config: Config) -> Result<(), Error> {
+    // orchestration logic
+}
+```
+
+## Library Microcrate Layout
+
+Shared logic lives under `lib/<name>/`. Code moves here when it is needed by more than one consumer (binary or other libs).
+
+```
+lib/common/
+├── Cargo.toml
+├── common.rs                # crate root
+├── fs_utils.rs
+└── xdg.rs
+```
+
+## Nested Microcrates
+
+r2025t allows microcrates inside microcrates when they are implementation details of the parent.
+
+### Nested Layout
+
+```
+command/install/
+├── Cargo.toml
+├── install.rs
+└── migration/                   # nested microcrate
+    ├── Cargo.toml               # e.g. myapp-command-install-migration
+    └── migration.rs
+```
+
+### Constraints
+
+- Each nested crate has its own Cargo.toml
+- Each nested crate follows the TLD X/X.rs rule (flattened)
+- Dependencies are explicit and acyclic at the crate level
+
+### Promotion Rule
+
+Promote a nested microcrate when:
+- **Cross-reference**: It is needed by sibling crates, not just its parent
+- **Independent identity**: It has versioning or feature needs distinct from its parent
+- **Conceptual graduation**: It is no longer an implementation detail
+
+Promotion: move to `lib/<name>/`, rename package to `<project>-lib-<name>`, update dependents.
+
+## Enforcement
+
+- All microcrates must use flattened layout (no `src/` except in bin/)
+- Package names must follow `<project>-<kind>-<tld>`
+- Root source files must be explicitly declared in Cargo.toml
+- Nested microcrates must be implementation details only

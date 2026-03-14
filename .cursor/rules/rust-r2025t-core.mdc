@@ -1,0 +1,106 @@
+---
+description: Core r2025t principles and workspace structure for Rust microcrate convention. Applies when working in Rust workspaces following the rust-2025-Trahloc convention.
+alwaysApply: false
+---
+
+# Rust r2025t Core Principles
+
+## Convention Overview
+
+The **rust-2025-Trahloc Microcrate Convention (r2025t)** defines a strict directory and naming standard for Rust workspaces designed to:
+1. **Eliminate File Ambiguity**: Prevent AI context hallucinations from multiple `lib.rs`, `main.rs`, or `mod.rs` files
+2. **Optimize Compilation**: Enforce boundaries for sub-2-second incremental builds
+3. **Structure for AI Agents**: Provide deterministic mapping where file location equals logical responsibility
+4. **Minimize Path Noise**: Flatten microcrate structure by eliminating unnecessary `src/` directories
+
+This is a **layout and naming spec only**. It does not change Rust semantics, editions, or compiler behavior. It applies to **any** Rust workspace adopting the convention (CLI tools, libraries, games, services).
+
+**Related r2025t rules** (same directory): `rust-r2025t-crate-structure.mdc`, `rust-r2025t-features.mdc`, `rust-r2025t-file-naming.mdc`, `rust-r2025t-microcrate-splitting.mdc`, `rust-r2025t-testing.mdc`, `rust-r2025t-tooling.mdc`.
+
+## Core Principles
+
+### 1. Uniqueness by Top-Level Directory (TLD)
+
+For every logical component X, there is exactly one directory X/ containing exactly one crate whose root source file is X.rs.
+
+### 2. Banned Filenames
+
+- `mod.rs` is **strictly forbidden**. Use the Rust 2018 `foo.rs` + `foo/` pattern instead.
+- `lib.rs` and `main.rs` are **forbidden as logic containers**. They exist only as optional tooling redirects containing zero logic (max 5 lines).
+
+### 3. Flattened Microcrates
+
+Microcrates omit the `src/` directory. The `Cargo.toml` lives alongside the root X.rs file. The `src/` directory is reserved for the workspace binary crate only.
+
+### 4. One Binary Front Door
+
+There is exactly one primary binary crate responsible for the main executable. All other crates are libraries (or the integration test crate).
+
+### 5. Workspace Root (Optional Convention)
+
+Some projects prefix the workspace root with an underscore (e.g. `_myapp/`) to distinguish the workspace container from logical crates. Others use the repository root directly. Either is valid; pick one and keep it consistent.
+
+### 6. Backwards Compatibility over Ideological Purity
+
+When tooling requires `lib.rs` or `main.rs`, those files exist as redirects. The convention adapts to the ecosystem, not the reverse.
+
+## Workspace Structure
+
+A minimal r2025t workspace (e.g. app with one binary and libs):
+
+```
+<workspace-root>/
+├── Cargo.toml               # workspace root
+├── bin/                     # binary front door (uses src/)
+├── lib/                     # shared library microcrates (flattened)
+│   ├── common/
+│   └── other/
+├── tests/                   # integration test crate (flattened, optional)
+└── docs/                    # documentation (optional)
+```
+
+With optional CLI subcommands (command crates):
+
+```
+<workspace-root>/
+├── Cargo.toml
+├── bin/
+├── command/                 # optional: CLI verb crates (flattened)
+│   ├── install/
+│   └── status/
+├── lib/
+├── tests/
+└── docs/
+```
+
+### Workspace Cargo.toml
+
+```toml
+[workspace]
+members = [
+    "bin",
+    "lib/*",
+    "tests",
+]
+# Optional: "command/*" if you have command crates
+resolver = "2"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 2  # optimize dependencies, keep your code fast to compile
+```
+
+## The Uniqueness Invariant
+
+> For every crate directory X/ under the workspace, there exists exactly one crate whose root module is X.rs (flattened) or src/X.rs (binary only). Files named lib.rs, main.rs, or mod.rs exist only as tooling-compatibility redirects containing no logic. mod.rs is strictly forbidden in all contexts.
+
+## Enforcement
+
+- All Rust workspace code must follow r2025t structure
+- File names must match directory names (X.rs for X/ directory)
+- No `mod.rs` files allowed
+- Microcrates must use flattened layout (no `src/` except in bin/)
