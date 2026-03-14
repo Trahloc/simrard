@@ -107,7 +107,6 @@ An emitter observes a locus byte in a system object and produces a chemical when
 | `source_subsystem` | string | Sub-tissue selector |
 | `reads_field` | string | Namespaced locus path being observed |
 | `emits_chemical` | string | Named chemical produced |
-| `threshold` | f32 | Minimum locus value before emission begins |
 | `rate` | f32 | Emission rate (exponential dynamics) |
 | `gain` | f32 | Scalar multiplier on emission amount |
 | `applicator` | enum | `add` \| `set` |
@@ -122,10 +121,12 @@ A receptor monitors a chemical concentration and writes a locus byte.
 | `target_subsystem` | string | Sub-tissue selector |
 | `write_field` | string | Namespaced locus path to modify |
 | `monitors_chemical` | string | Named chemical tracked |
-| `threshold` | f32 | Concentration below which receptor is silent |
+| `noise_floor` | f32 | Concentration below which receptor does not write (drift guard, not behavior control) |
 | `nominal` | f32 | Expected concentration at normal state |
 | `gain` | f32 | Scalar multiplier on output signal |
 | `applicator` | enum | `replace` \| `modulate` |
+
+`noise_floor` defaults to `0.001` (0.1% of nominal `1.0`) unless overridden by species content. It exists to prevent slow rest-state drift from near-zero concentrations, not to model event triggers. Behavioral shape belongs in gain/curve design.
 
 ### Reaction Transform Fields
 
@@ -138,6 +139,10 @@ A receptor monitors a chemical concentration and writes a locus byte.
 | `rate` | f32 | Reaction rate (concentration-dependent, exponential) |
 
 All three primitives follow the same naming, versioning, epoch, and tombstone conventions as §2.4. Example path: `biochemistry.receptor.hunger_protein.gain`. This is a namespaced, versioned field — renames create aliases, tombstoned names are blacklisted permanently.
+
+Migration policy for these field changes follows §2.4 directly:
+- `biochemistry.emitter.*.threshold` is deprecated immediately and treated as a no-op alias for backward compatibility; tombstone at the next major version.
+- `biochemistry.receptor.*.threshold` aliases to `biochemistry.receptor.*.noise_floor`; old name deprecated now, tombstoned at next major version.
 
 ### Genome Bytes as Transform-Layer Content
 

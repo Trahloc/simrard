@@ -95,7 +95,7 @@ Pack hunting should not be a behavior. It should fall out of: wolves have a soci
 
 The most important implementation rule in the system, elevated here to design philosophy because it is the mechanism that keeps every tier emergent.
 
-**Never write a cross-tier interaction as a threshold conditional.** Any time you find yourself writing `if concentration > threshold then trigger X`, you have accidentally scripted an event. Replace it with a receptor whose gain makes the interaction naturally proportional.
+**Never write a cross-tier interaction as an event threshold conditional.** Any time you find yourself writing `if concentration > threshold then trigger X`, you have accidentally scripted an event. Replace it with a receptor whose gain makes the interaction naturally proportional.
 
 ```
 ❌  if soil_nutrient_B > 50 then plant.grow()       ← scripted event
@@ -104,6 +104,8 @@ The most important implementation rule in the system, elevated here to design ph
 
 High concentration → receptor fires strongly → uptake fast. Low → uptake slow. Zero → nothing happens. The depletion cascade is just what receptor gain × near-zero concentration looks like across a region over time. You didn't write a famine — the world wrote it.
 
-This principle applies to every cross-tier boundary. It is not a guideline. It is the mechanism that separates emergent simulation from scripted theater. The moment a cross-tier interaction acquires a hardcoded threshold it becomes a script.
+This principle applies to every cross-tier boundary. It is not a guideline. It is the mechanism that separates emergent simulation from scripted theater. The moment a cross-tier interaction acquires a hardcoded event threshold it becomes a script.
+
+Exception: receptor `noise_floor` is allowed as a numeric stability guard to prevent slow rest-state drift from near-zero concentrations. It is not a behavior-control parameter and should remain close to zero.
 
 The receptor and emitter are implemented as first-class data primitives with versioned, named fields in the transform system (see `02_mod_and_data_architecture §2.8`). The full field specification is in `04_agent_cognition §4.5`.

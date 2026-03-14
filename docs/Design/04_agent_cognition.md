@@ -326,7 +326,6 @@ Four object types compose the system. This is the Grand biochemistry architectur
 | `source_subsystem` | Sub-tissue selector |
 | `reads_field` | Locus byte being observed |
 | `emits_chemical` | Integer label of chemical produced |
-| `threshold` | Minimum locus value before emission begins |
 | `rate` | Emission rate (exponential dynamics) |
 | `gain` | Scalar multiplier on emission amount |
 | `applicator` | Whether output adds to or sets the concentration |
@@ -341,12 +340,14 @@ Four object types compose the system. This is the Grand biochemistry architectur
 | `target_subsystem` | Sub-tissue selector |
 | `write_field` | Locus byte to modify |
 | `monitors_chemical` | Integer label of chemical tracked |
-| `threshold` | Concentration below which receptor is inactive |
+| `noise_floor` | Concentration below which receptor is inactive (drift guard, not behavior control) |
 | `nominal` | Expected concentration at rest |
 | `gain` | Scalar multiplier on output signal |
 | `applicator` | Whether output replaces or modulates the locus |
 
-The receptor/emitter interface is the universal cross-tier interface — see `01_design_philosophy §1.6` for why threshold conditionals must not appear at cross-tier boundaries. These fields are first-class transform targets in the mod architecture (see `02_mod_and_data_architecture §2.8`).
+`noise_floor` defaults to `0.001` unless explicitly overridden by content. It prevents slow rest-state drift from near-zero concentrations; it must not be used as an event trigger.
+
+The receptor/emitter interface is the universal cross-tier interface — see `01_design_philosophy §1.6` for why event threshold conditionals must not appear at cross-tier boundaries. The only allowed floor is receptor `noise_floor`, whose role is numeric/drift stability, not behavioral scripting. These fields are first-class transform targets in the mod architecture (see `02_mod_and_data_architecture §2.8`).
 
 ---
 
