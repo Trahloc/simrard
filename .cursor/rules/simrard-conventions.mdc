@@ -1,24 +1,56 @@
 ---
-description: Project-specific conventions for simrard. Crate layout, warnings, and rule versioning. Applies when working in the simrard repo.
+description: Project-specific conventions for simrard — crate layout, Wolfram tiebreaker, dead code policy, and Observer mode constraints. Applies when working in the simrard repo.
 alwaysApply: false
 ---
 
-# simrard Conventions
+# Simrard Conventions
 
-## Crate Layout
+Simrard is a "true simulation" where emergent Observer-mode drama is the primary success criterion. Every mechanic is expressed as a composable transform.
 
-- simrard uses the **rust-2025-Trahloc (r2025t)** microcrate layout: workspace with `bin/`, `lib/*`, and `tests/`. No `mod.rs`; flattened libs; root entry point is `bin/src/simrard.rs`. See `docs/rust-to-r2025t.md` and the rust-r2025t-* rules.
-- **Edition**: Rust 2024 in all crates.
+## Crate Layout & Edition
 
-## Edition
+Uses **r2026t** microcrate convention (see `rust-r2026t.mdc`).
 
-- simrard uses **Rust edition 2024**. The r2025t standard is built on 2024; keep `edition = "2024"` in `Cargo.toml`.
+```
+simrard/
+├── bin/                # binary: bin/src/simrard.rs
+├── lib/                # flattened microcrates (ai, causal, charter, time, transforms, utility_ai)
+└── tests/              # integration test crate
+```
 
-## Warnings and Dead Code
+**Edition**: Rust 2024 in all crates. Keep `edition = "2024"` in every `Cargo.toml`.
 
-- Warnings are errors (see project `.cargo/config.toml` and warnings-as-errors rule).
-- Planned-but-unimplemented behavior belongs in **TODO comments** (and the code removed or stubbed), not in dead code or `#[allow(unused)]`. Do not leave unused symbols "for later."
+## Wolfram-Alignment Tiebreaker
 
-## Cursor Rules in This Repo
+When multiple design options are viable:
 
-- In simrard, **`.cursor/rules/` is committed to the repo** (exception to the usual "keep rules in .git/info/exclude" practice). Do not add `.cursor/rules/` to `.git/info/exclude` in this project.
+1. **Prefer the option that aligns with Wolfram Physics** — causality is fundamental; space and time are emergent from causal structure; `C` (causal propagation constant) is a property of causal rules, not of space.
+2. **If still tied**, prefer the computationally simpler or faster option.
+
+Do not choose faster/simpler if it treats space as primary and causality as secondary, unless constrained by practical necessity.
+
+## Observer Mode Constraints (Hard Invariants)
+
+- Never hard-code job logic into systems
+- Never use a black-box AI that cannot be expressed as a transform
+- Never ship a sim that dies without player input in Observer mode
+- Never bake a design that blocks future causal propagation or GPU NN upgrade
+
+## Dead Code & Warning Policy
+
+Warnings are errors (`-D warnings` enforced). No exceptions without user approval.
+
+- **No** `#[allow(unused)]` or `#![allow(dead_code)]`
+- Unimplemented behavior → `TODO` comment + remove/stub the code. Never leave unused symbols "for later".
+- If suppression is user-approved, document it with a dated `TODO`:
+
+```rust
+// User approved (2026-03-14): Deferred to GPU NN integration.
+// TODO(2026-04-14): Remove once wgpu inference is implemented.
+#[allow(dead_code)]
+pub fn gpu_nn_stub() {}
+```
+
+## Repo Conventions
+
+- `.cursor/rules/` and `.agents/skills/` are **committed** to the repo intentionally. Do not add them to `.gitignore` or `.git/info/exclude`.

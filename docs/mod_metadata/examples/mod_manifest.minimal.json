@@ -1,0 +1,8 @@
+{
+  "id": "slower-hunger",
+  "title": "Slower Hunger",
+  "version": "1.0.0",
+  "authors": ["alice"],
+  "source_url": "https://github.com/alice/simrard-slower-hunger",
+  "simrard_policy": "Simrard-Open-Mod-1.0"
+}

@@ -1,0 +1,18 @@
+[package]
+name = "simrard-utility-ai-derive"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Procedural macros for simrard utility AI (from big-brain)"
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }

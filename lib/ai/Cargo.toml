@@ -1,0 +1,20 @@
+[package]
+name = "simrard-lib-ai"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "simrard_lib_ai"
+path = "ai.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+simrard-lib-utility-ai = { path = "../utility_ai" }
+simrard-lib-causal = { path = "../causal" }
+simrard-lib-charter = { path = "../charter" }
+simrard-lib-pawn = { path = "../pawn" }
+simrard-lib-time = { path = "../time" }

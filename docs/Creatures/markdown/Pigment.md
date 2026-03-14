@@ -1,0 +1,7 @@
+# Pigment
+
+**Pigment** is a [gene](https://creatures.wiki/Gene) that determines what color overlays the original [sprites](https://creatures.wiki/Sprite) that make up a [creature](https://creatures.wiki/Creature)'s body. The pigment system grew more complex and added more visual assets through each game in the [Creatures series](https://creatures.wiki/Creatures_series).
+
+In [Creatures 1](https://creatures.wiki/Creatures_1), pigments were controlled by a single type of gene that controlled red, green and blue pigment values and could not be activated at different [life stages](https://creatures.wiki/Life_stage), despite the gene providing that option. One of the first [genetic breeds](https://creatures.wiki/Genetic_breed), the [American Cardinal Norns](https://creatures.wiki/American_Cardinal_Norn), had [sex-linked](https://creatures.wiki/Sex-linked) pigment genes, leading to males being born with a red pigment, and females being born with a green pigment.
+
+The [Life Kit](https://creatures.wiki/Life_Kit) added an additional [pigment bleed](https://creatures.wiki/Pigment_bleed?action=edit&redlink=1) gene type, which applies [TINT](https://creatures.wiki/TINT) transformations to the creature's sprites. This feature was not documented, and they cannot be inserted into a genome without the use of a [hex editor](https://creatures.wiki/Hex_editor). In the [later games](https://creatures.wiki/Creatures_series), pigment bleed genes are found in the standard creature genome.

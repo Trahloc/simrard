@@ -1,0 +1,18 @@
+[package]
+name = "simrard-lib-transforms"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "simrard_lib_transforms"
+path = "transforms.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simrard-lib-pawn = { path = "../pawn" }

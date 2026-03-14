@@ -1,0 +1,16 @@
+[package]
+name = "simrard-lib-pawn"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "simrard_lib_pawn"
+path = "pawn.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+simrard-lib-charter = { path = "../charter" }

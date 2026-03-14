@@ -1,0 +1,14 @@
+[package]
+name = "simrard-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "simrard_tests"
+path = "integration.rs"
+
+[lints]
+workspace = true
+
+[dependencies]

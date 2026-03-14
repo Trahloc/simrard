@@ -1,0 +1,14 @@
+/target
+
+# Any .old folders (e.g. backups)
+.old/
+
+# Ignore all contents of external repositories
+/external/*
+# Un-ignore the directories themselves so git can traverse into them
+!/external/*/
+# Ignore everything *inside* those subdirectories
+/external/*/*
+# Finally, explicitly un-ignore all README index files
+!/external/README.md
+!/external/*/README.md

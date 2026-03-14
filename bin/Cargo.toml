@@ -1,0 +1,21 @@
+[package]
+name = "simrard-bin"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "simrard"
+path = "src/simrard.rs"
+
+[dependencies]
+bevy = { workspace = true, features = ["default_font", "debug"] }
+simrard-lib-ai = { path = "../lib/ai" }
+simrard-lib-utility-ai = { path = "../lib/utility_ai" }
+simrard-lib-causal = { path = "../lib/causal" }
+simrard-lib-charter = { path = "../lib/charter" }
+simrard-lib-pawn = { path = "../lib/pawn" }
+simrard-lib-time = { path = "../lib/time" }
+simrard-lib-transforms = { path = "../lib/transforms" }

@@ -1,0 +1,21 @@
+[package]
+name = "simrard-lib-utility-ai"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Utility AI for simrard (absorbed from big-brain, Apache-2.0)"
+license = "Apache-2.0"
+
+[lib]
+name = "simrard_lib_utility_ai"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true, features = ["bevy_log"] }
+simrard-utility-ai-derive = { path = "derive" }
+
+[features]
+trace = []

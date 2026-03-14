@@ -1,6 +1,9 @@
 {
-  "installed_at": "2026-03-13T13:12:28Z",
+  "installed_at": "2026-03-14T04:47:01Z",
   "airules_source": "/home/trahloc/code/airules",
-  "base_rules": 6,
-  "env": "rust-r2025t"
+  "systems": {
+    "cursor": { "base_rules": 1, "env": "rust-r2026t" },
+    "agents": { "baseline_skills": 1, "env_skills": 1 },
+    "vscode": { "files": 1 }
+  }
 }

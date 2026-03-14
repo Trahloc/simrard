@@ -1,0 +1,28 @@
+{
+  "id": "better-needs",
+  "title": "Better Needs",
+  "version": "2.1.0",
+  "authors": ["bob", "carol"],
+  "description": "Tweaks hunger, thirst, and fatigue depletion and adds optional comfort scaling.",
+  "body": "See README at source_url for full documentation and changelog.",
+  "source_url": "https://github.com/bob/simrard-better-needs",
+  "issues_url": "https://github.com/bob/simrard-better-needs/issues",
+  "wiki_url": "https://github.com/bob/simrard-better-needs/wiki",
+  "simrard_policy": "Simrard-Open-Mod-1.0",
+  "license": {
+    "id": "MIT",
+    "name": "MIT License",
+    "url": "https://opensource.org/licenses/MIT"
+  },
+  "game_versions": ["0.1.0", "0.2.0"],
+  "dependencies": [
+    {
+      "project_id": "base",
+      "dependency_type": "required"
+    },
+    {
+      "project_id": "comfort-zones",
+      "dependency_type": "optional"
+    }
+  ]
+}

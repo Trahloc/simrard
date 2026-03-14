@@ -1,0 +1,10 @@
+# Fail the build on any compiler warning. See .cursor/rules/warnings-as-errors.mdc
+# and simrard-conventions.mdc (TODO vs dead code).
+# For cached builds: install sccache (cargo install sccache) and set RUSTC_WRAPPER=sccache
+# in your environment (e.g. in .bashrc). Do not set rustc-wrapper here so the project
+# builds without sccache for fresh clones.
+#
+# Faster linker (requires mold and clang, e.g. pacman -S mold clang).
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

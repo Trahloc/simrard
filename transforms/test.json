@@ -1,0 +1,13 @@
+{
+  "base_epoch": 0,
+  "transforms": [
+    {
+      "target": "pawn.needs",
+      "operation": "Modify",
+      "path": "hunger.depletion_rate",
+      "value": "2.0x",
+      "epoch": 1,
+      "author": "TraHloc"
+    }
+  ]
+}
