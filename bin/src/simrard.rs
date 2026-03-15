@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use bevy::ecs::message::{MessageReader, Messages};
 use bevy::input::mouse::MouseWheel;
 use bevy::sprite::Sprite;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 use simrard_lib_utility_ai::{BigBrainPlugin, BigBrainSet};
@@ -17,7 +17,7 @@ use simrard_lib_charter::{
 use simrard_lib_pawn::{
     Capabilities, FoodReservation, ItemHistory, ItemIdAllocator, ItemIdentity, KnownRecipes,
     NeuralNetworkComponent, Position, Quest, QuestBoard, QuestStatus, RestSpot,
-    SimulationLogSettings, SimulationReport, WaterSource,
+    SimulationLogSettings, SimulationReport, WaterSource, WORLD_CHUNK_EXTENT,
 };
 use simrard_lib_time::{
     CausalClock, GlobalTickClock, SimTickAccumulator, SimTimeScale, TimePlugin,
@@ -379,7 +379,7 @@ fn build_headless_report(app: &mut App, termination: &HeadlessTermination, elaps
 
 // ---- Phase 3.5: Chunk grid ----
 fn chunk_grid_gizmo_system(mut gizmos: Gizmos) {
-    let extent = 12; // 0..=11 chunks so (0,0) and (10,10) are inside
+    let extent = CHUNK_EXTENT + 1; // Draw boundaries for chunks in 0..=CHUNK_EXTENT.
     let color = Color::srgba(0.3, 0.3, 0.35, 0.6);
     for i in 0..=extent {
         let p = i as f32 * CHUNK_PIXEL;
@@ -849,9 +849,9 @@ fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
         ));
     }
 
-    // Cluster B: food at (10,10), water at (9,10) — never same chunk.
-    let chunk_b = ChunkId(10, 10);
-    let water_b_chunk = ChunkId(9, 10);
+    // Cluster B near far corner to exercise large-grid propagation and long-range behavior.
+    let chunk_b = ChunkId(CHUNK_EXTENT - 1, CHUNK_EXTENT - 1);
+    let water_b_chunk = ChunkId(CHUNK_EXTENT - 2, CHUNK_EXTENT - 1);
     let id_food_b = allocator.alloc();
     commands.spawn((
         FoodReservation { portions: 8 },
@@ -999,7 +999,7 @@ fn curiosity_discovery_system(
 }
 
 /// Chunk grid extent (0..=CHUNK_EXTENT). Used for respawn bounds.
-const CHUNK_EXTENT: u32 = 11;
+const CHUNK_EXTENT: u32 = WORLD_CHUNK_EXTENT;
 
 /// Target counts for respawn: maintain at least this many food and water entities in the world.
 const TARGET_FOOD_COUNT: usize = 2;
@@ -1062,8 +1062,30 @@ fn simlife_tick_system(
     advance_simlife_grass(global_clock.causal_seq(), &mut simlife);
 }
 
-/// Spawns food and water at random empty chunks when below target. Food and water never share a chunk.
-/// Deterministic from causal_seq (no rand crate). Run after sim_tick_driver.
+/// Deterministically pick an empty chunk without materializing a full-grid empty list.
+fn select_empty_chunk(seed: u64, occupied: &HashSet<ChunkId>) -> Option<ChunkId> {
+    let side = CHUNK_EXTENT as u64 + 1;
+    let total = side * side;
+    if occupied.len() as u64 >= total {
+        return None;
+    }
+
+    let start = seed % total;
+    for offset in 0..total {
+        let idx = (start + offset) % total;
+        let x = (idx / side) as u32;
+        let y = (idx % side) as u32;
+        let chunk = ChunkId(x, y);
+        if !occupied.contains(&chunk) {
+            return Some(chunk);
+        }
+    }
+
+    None
+}
+
+/// Spawns food and water at deterministic empty chunks when below target. Food and water never share a chunk.
+/// Run after sim_tick_driver.
 fn resource_respawn_system(
     global_clock: Res<GlobalTickClock>,
     mut state: ResMut<RespawnState>,
@@ -1079,27 +1101,15 @@ fn resource_respawn_system(
     }
     state.last_tick = current;
 
-    let food_chunks: std::collections::HashSet<_> =
-        food_query.iter().map(|p| p.chunk).collect();
-    let water_chunks: std::collections::HashSet<_> =
-        water_query.iter().map(|p| p.chunk).collect();
-    let occupied: std::collections::HashSet<_> =
-        food_chunks.union(&water_chunks).copied().collect();
-    let empty: Vec<ChunkId> = (0..=CHUNK_EXTENT)
-        .flat_map(|x| (0..=CHUNK_EXTENT).map(move |y| ChunkId(x, y)))
-        .filter(|c| !occupied.contains(c))
-        .collect();
-
-    if empty.is_empty() {
-        return;
-    }
+    let food_chunks: HashSet<_> = food_query.iter().map(|p| p.chunk).collect();
+    let water_chunks: HashSet<_> = water_query.iter().map(|p| p.chunk).collect();
+    let occupied: HashSet<_> = food_chunks.union(&water_chunks).copied().collect();
 
     let need_food = food_chunks.len() < TARGET_FOOD_COUNT;
     let need_water = water_chunks.len() < TARGET_WATER_COUNT;
 
     let food_chunk = if need_food {
-        let idx = (current as usize) % empty.len();
-        Some(empty[idx])
+        select_empty_chunk(current, &occupied)
     } else {
         None
     };
@@ -1120,25 +1130,21 @@ fn resource_respawn_system(
     }
 
     if need_water {
-        let occupied_after: std::collections::HashSet<_> = food_chunks
+        let occupied_after: HashSet<_> = food_chunks
             .iter()
             .copied()
             .chain(water_chunks.iter().copied())
             .chain(food_chunk)
             .collect();
-        let empty_after: Vec<ChunkId> = (0..=CHUNK_EXTENT)
-            .flat_map(|x| (0..=CHUNK_EXTENT).map(move |y| ChunkId(x, y)))
-            .filter(|c| !occupied_after.contains(c))
-            .collect();
-        if let Some(chunk) = empty_after.get((current.wrapping_add(1) as usize) % empty_after.len().max(1)) {
+        if let Some(chunk) = select_empty_chunk(current.wrapping_add(1), &occupied_after) {
             let id = allocator.alloc();
             commands.spawn((
                 WaterSource { portions: 8 },
-                Position { chunk: *chunk },
+                Position { chunk },
                 ItemIdentity { item_id: id, created_at_causal_seq: current },
                 ItemHistory::default(),
                 Sprite::from_color(Color::srgb(0.2, 0.85, 0.95), Vec2::splat(SPRITE_WATER)),
-                Transform::from_translation(chunk_to_translation(chunk, 0.0)),
+                Transform::from_translation(chunk_to_translation(&chunk, 0.0)),
                 Name::new("Water_respawn"),
             ));
         }

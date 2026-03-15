@@ -2,6 +2,10 @@ use bevy::prelude::*;
 use simrard_lib_charter::ChunkId;
 use std::collections::{BTreeMap, HashSet};
 
+/// Shared world chunk extent (0..=WORLD_CHUNK_EXTENT).
+/// `255` means a 256x256 chunk grid.
+pub const WORLD_CHUNK_EXTENT: u32 = 255;
+
 /// Stable identity for items across the simulation. Used for history and trade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ItemId(pub u64);

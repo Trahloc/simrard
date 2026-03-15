@@ -10,7 +10,7 @@ use simrard_lib_charter::{
 use simrard_lib_pawn::{
     ActiveLeaseHandle, Capabilities, FoodReservation, ItemHistory, MovementTarget,
     KnownRecipes, NeuralNetworkComponent, Position, Quest, QuestBoard, QuestStatus,
-    RestSpot, SimulationLogSettings, SimulationReport, WaterSource,
+    RestSpot, SimulationLogSettings, SimulationReport, WaterSource, WORLD_CHUNK_EXTENT,
 };
 use simrard_lib_time::{CausalClock, GlobalTickClock};
 use std::any::TypeId;
@@ -57,8 +57,8 @@ pub struct NeedsToMoveScorer;
 #[derive(Component, Debug, Clone, ActionBuilder)]
 pub struct MoveToChunkAction;
 
-/// Chunk grid extent (0..=CHUNK_EXTENT). Matches bin visualizer; movement is clamped to this range.
-const CHUNK_EXTENT: u32 = 11;
+/// Chunk grid extent (0..=WORLD_CHUNK_EXTENT). Matches bin visualizer; movement is clamped to this range.
+const CHUNK_EXTENT: u32 = WORLD_CHUNK_EXTENT;
 
 pub struct PawnAIPlugin;
 

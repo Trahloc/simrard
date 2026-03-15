@@ -98,3 +98,12 @@
 - Verification:
   - `cargo test -p simrard-lib-utility-ai` passed.
   - `cargo test -p simrard-lib-ai` passed.
+
+### 2026-03-15T19:42:58+08:00
+- Began game-scale uplift for visualization/simulation projection:
+  - Added shared `WORLD_CHUNK_EXTENT = 255` (256x256) in `simrard-lib-pawn` and wired bin/ai to use it.
+  - Moved cluster B spawn to far-corner coordinates derived from world extent to exercise large-grid behavior.
+  - Replaced respawn's full-grid empty-vector materialization with deterministic empty-chunk selection to reduce large-grid allocation overhead.
+- Verification:
+  - `cargo test -p simrard-bin` passed.
+  - `cargo test -p simrard-lib-ai` passed.
