@@ -8,3 +8,8 @@
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[build]
+# Auto-enable compiler caching when `sccache` is installed. If `sccache` is not
+# present, the wrapper emits a loud warning and then invokes plain rustc.
+rustc-wrapper = "scripts/rustc-wrapper.sh"

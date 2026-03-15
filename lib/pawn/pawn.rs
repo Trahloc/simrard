@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use simrard_lib_charter::ChunkId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Stable identity for items across the simulation. Used for history and trade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,6 +138,12 @@ impl Capabilities {
     pub fn has(&self, capability: &str) -> bool {
         self.can_do.iter().any(|c| c == capability)
     }
+}
+
+/// Minimal per-pawn recipe knowledge for discovery/teaching flow.
+#[derive(Component, Debug, Clone, Default)]
+pub struct KnownRecipes {
+    pub recipes: HashSet<String>,
 }
 
 /// Controls whether simulation systems print per-event lines to stdout/stderr.

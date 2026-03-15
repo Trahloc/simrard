@@ -1,0 +1,3 @@
+.unwrap_or_else(|_| format!("{:?}", provider));
+let grass = *simlife.grass_per_chunk.get(&chunk).unwrap_or(&0);
+.unwrap_or_else(|| format!("{:?}", quest.requester));

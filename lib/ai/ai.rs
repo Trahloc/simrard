@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy::ecs::message::MessageWriter;
+use simrard_lib_mirror::{rank_provider_candidates_for_need, ProviderCandidateInput};
 use simrard_lib_utility_ai::prelude::*;
 use simrard_lib_causal::{CausalEventKind, CausalEventQueue, DriveType};
 use simrard_lib_charter::{
@@ -7,13 +8,13 @@ use simrard_lib_charter::{
     SpatialLease,
 };
 use simrard_lib_pawn::{
-    ActiveLeaseHandle, FoodReservation, ItemHistory, MovementTarget, NeuralNetworkComponent,
-    Position, QuestBoard, Quest, QuestStatus, RestSpot, SimulationLogSettings,
-    SimulationReport, WaterSource,
+    ActiveLeaseHandle, Capabilities, FoodReservation, ItemHistory, MovementTarget,
+    KnownRecipes, NeuralNetworkComponent, Position, Quest, QuestBoard, QuestStatus,
+    RestSpot, SimulationLogSettings, SimulationReport, WaterSource,
 };
 use simrard_lib_time::{CausalClock, GlobalTickClock};
 use std::any::TypeId;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 fn stdout_enabled(settings: Option<&SimulationLogSettings>) -> bool {
     settings.map(|settings| settings.stdout_enabled).unwrap_or(true)
@@ -25,6 +26,7 @@ fn stdout_enabled(settings: Option<&SimulationLogSettings>) -> bool {
 pub struct ActivityLog(pub VecDeque<String>);
 
 const ACTIVITY_LOG_MAX: usize = 32;
+const QUEST_ACCEPTANCE_MIN_DRIVE: f32 = 0.3;
 
 impl ActivityLog {
     pub fn push(&mut self, s: String) {
@@ -129,6 +131,8 @@ pub fn pawn_event_dispatcher_step(
     event_queue: &mut CausalEventQueue,
     quest_board: &mut QuestBoard,
     pawn_query: &mut Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+    capabilities_query: &Query<&Capabilities>,
+    known_recipes_query: &mut Query<&mut KnownRecipes>,
     mut activity: Option<&mut ActivityLog>,
     mut report: Option<&mut SimulationReport>,
     stdout_enabled: bool,
@@ -145,6 +149,10 @@ pub fn pawn_event_dispatcher_step(
                         DriveType::Fatigue => (&mut nn.fatigue, "Fatigue", "rest"),
                         DriveType::Curiosity => continue,
                     };
+                    // #scheduler-debt: clamp the triggered drive down to force near-term
+                    // re-scoring in the current utility-ai scheduler model.
+                    // TODO(2026-03-15): replace this mutation with event-reactive
+                    // thinker wakeups once scheduler support exists.
                     *val = (*val).min(0.15);
                     quest_board.active_quests.push(Quest {
                         need: need.to_string(),
@@ -189,8 +197,207 @@ pub fn pawn_event_dispatcher_step(
                     eprintln!("[dispatcher:{}] ResourceDepleted at chunk({:?})", current_seq, chunk);
                 }
             }
+            CausalEventKind::DiscoveryPropagated { recipe, from, to } => {
+                if let Ok(mut known) = known_recipes_query.get_mut(to) {
+                    if known.recipes.insert(recipe.clone()) {
+                        if let Some(ref mut log) = activity {
+                            log.push(format!("{:?} learned {} from {:?}", to, recipe, from));
+                        }
+                        if let Some(report) = report.as_deref_mut() {
+                            report.bump("dispatcher_discovery_propagated");
+                        }
+                        if stdout_enabled {
+                            eprintln!(
+                                "[dispatcher:{}] DiscoveryPropagated recipe={} from={:?} to={:?}",
+                                current_seq, recipe, from, to
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
+
+    quest_acceptance_step(
+        current_seq,
+        quest_board,
+        pawn_query,
+        capabilities_query,
+        activity,
+        report,
+        stdout_enabled,
+    );
+}
+
+fn need_capability_and_drive(need: &str, nn: &NeuralNetworkComponent) -> Option<(&'static str, f32)> {
+    match need {
+        "food" => Some(("Eat", (1.0 - nn.hunger).clamp(0.0, 1.0))),
+        "water" => Some(("Drink", (1.0 - nn.thirst).clamp(0.0, 1.0))),
+        "rest" => Some(("Rest", (1.0 - nn.fatigue).clamp(0.0, 1.0))),
+        _ => None,
+    }
+}
+
+fn chebyshev_distance(a: ChunkId, b: ChunkId) -> u32 {
+    a.0.abs_diff(b.0).max(a.1.abs_diff(b.1))
+}
+
+pub fn quest_acceptance_step(
+    current_seq: u64,
+    quest_board: &mut QuestBoard,
+    pawn_query: &mut Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+    capabilities_query: &Query<&Capabilities>,
+    mut activity: Option<&mut ActivityLog>,
+    mut report: Option<&mut SimulationReport>,
+    stdout_enabled: bool,
+) {
+    // Keep completed quests visible until next tick, then clear them.
+    let completed_before = quest_board
+        .active_quests
+        .iter()
+        .filter(|q| matches!(q.status, QuestStatus::Completed))
+        .count();
+    if completed_before > 0 {
+        quest_board
+            .active_quests
+            .retain(|q| !matches!(q.status, QuestStatus::Completed));
+    }
+
+    let mut pawns: Vec<(Entity, String, ChunkId, Option<Capabilities>, f32, f32, f32)> = Vec::new();
+    let mut pawn_name_by_entity: HashMap<Entity, String> = HashMap::new();
+    for (entity, name, position, nn) in pawn_query.iter_mut() {
+        let name_string = name.to_string();
+        pawn_name_by_entity.insert(entity, name_string.clone());
+        let capabilities = capabilities_query.get(entity).ok().cloned();
+        pawns.push((
+            entity,
+            name_string,
+            position.chunk,
+            capabilities,
+            (1.0 - nn.hunger).clamp(0.0, 1.0),
+            (1.0 - nn.thirst).clamp(0.0, 1.0),
+            (1.0 - nn.fatigue).clamp(0.0, 1.0),
+        ));
+    }
+
+    let mut providers_in_progress: HashSet<Entity> = quest_board
+        .active_quests
+        .iter()
+        .filter_map(|q| match q.status {
+            QuestStatus::InProgress { provider } => Some(provider),
+            _ => None,
+        })
+        .collect();
+
+    for quest in quest_board.active_quests.iter_mut() {
+        if !matches!(quest.status, QuestStatus::Open) {
+            continue;
+        }
+
+        let Some((required_capability, _)) = need_capability_and_drive(&quest.need, &NeuralNetworkComponent::default()) else {
+            continue;
+        };
+
+        let mut eligible_candidates: Vec<(u32, Entity, String, f32)> = Vec::new();
+        let mut rank_inputs: Vec<ProviderCandidateInput> = Vec::new();
+        for (entity, name, chunk, capabilities, food_drive, water_drive, rest_drive) in &pawns {
+            if *entity == quest.requester || providers_in_progress.contains(entity) {
+                continue;
+            }
+            let Some(caps) = capabilities.as_ref() else {
+                continue;
+            };
+            if !caps.has(required_capability) {
+                continue;
+            }
+
+            let drive = match quest.need.as_str() {
+                "food" => *food_drive,
+                "water" => *water_drive,
+                "rest" => *rest_drive,
+                _ => 0.0,
+            };
+            if drive < QUEST_ACCEPTANCE_MIN_DRIVE {
+                continue;
+            }
+
+            let dist = chebyshev_distance(*chunk, quest.chunk);
+            let candidate_id = eligible_candidates.len() as u32;
+            eligible_candidates.push((candidate_id, *entity, name.clone(), drive));
+            rank_inputs.push(ProviderCandidateInput {
+                candidate_id,
+                drive,
+                proximity: 1.0 / (dist + 1) as f32,
+                distance: dist,
+                can_eat: caps.has("Eat"),
+                can_drink: caps.has("Drink"),
+                can_rest: caps.has("Rest"),
+            });
+        }
+
+        let Some(selected_candidate_id) = rank_provider_candidates_for_need(
+            &quest.need,
+            QUEST_ACCEPTANCE_MIN_DRIVE,
+            &rank_inputs,
+        )
+        .expect("Quest acceptance provider ranking via DuckDB failed") else {
+            continue;
+        };
+
+        let Some((_, provider, provider_name, drive)) = eligible_candidates
+            .iter()
+            .find(|(candidate_id, _, _, _)| *candidate_id == selected_candidate_id)
+            .cloned()
+        else {
+            panic!(
+                "Quest acceptance ranked candidate id {} missing from eligible set",
+                selected_candidate_id
+            );
+        };
+
+            quest.provider = Some(provider);
+            quest.status = QuestStatus::InProgress { provider };
+            providers_in_progress.insert(provider);
+            if let Some(ref mut log) = activity {
+                let requester = pawn_name_by_entity
+                    .get(&quest.requester)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", quest.requester));
+                log.push(format!(
+                    "{} accepted {} quest for {}",
+                    provider_name, quest.need, requester
+                ));
+            }
+            if let Some(report) = report.as_deref_mut() {
+                report.bump("quest_acceptances");
+            }
+            if stdout_enabled {
+                eprintln!(
+                    "[dispatcher:{}] Quest accepted: need={} provider={:?} drive={:.2}",
+                    current_seq, quest.need, provider, drive
+                );
+            }
+    }
+}
+
+pub fn complete_quest_for_action(
+    quest_board: &mut QuestBoard,
+    provider: Entity,
+    need: &str,
+    chunk: ChunkId,
+) -> bool {
+    for quest in quest_board.active_quests.iter_mut() {
+        if let QuestStatus::InProgress {
+            provider: quest_provider,
+        } = quest.status
+        {
+            if quest_provider == provider && quest.need == need && quest.chunk == chunk {
+                quest.status = QuestStatus::Completed;
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// System that runs every frame; drains events at current clock.
@@ -199,6 +406,8 @@ pub fn pawn_event_dispatcher_system(
     mut quest_board: ResMut<QuestBoard>,
     global_clock: Res<GlobalTickClock>,
     mut pawn_query: Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+    capabilities_query: Query<&Capabilities>,
+    mut known_recipes_query: Query<&mut KnownRecipes>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
@@ -208,6 +417,8 @@ pub fn pawn_event_dispatcher_system(
         &mut event_queue,
         &mut quest_board,
         &mut pawn_query,
+        &capabilities_query,
+        &mut known_recipes_query,
         activity.as_deref_mut(),
         report.as_deref_mut(),
         stdout_enabled(log_settings.as_deref()),
@@ -324,6 +535,7 @@ pub fn eat_action_system(
     mut flash: MessageWriter<CharterFlashEvent>,
     global_clock: Res<GlobalTickClock>,
     mut food_query: Query<(Entity, &Position, &mut FoodReservation, Option<&mut ItemHistory>)>,
+    mut quest_board: ResMut<QuestBoard>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
@@ -409,6 +621,20 @@ pub fn eat_action_system(
                                 nn.hunger += 0.5;
                                 nn.hunger = nn.hunger.min(1.0);
 
+                                if complete_quest_for_action(
+                                    &mut quest_board,
+                                    *actor,
+                                    "food",
+                                    pawn_pos.chunk,
+                                ) {
+                                    if let Some(ref mut log) = activity {
+                                        log.push(format!("{} completed food quest", name));
+                                    }
+                                    if let Some(ref mut report) = report {
+                                        report.bump("quest_completed_food");
+                                    }
+                                }
+
                                 if food_res.portions == 0 {
                                     if let Some(ref mut log) = activity {
                                         log.push("Food depleted".into());
@@ -463,6 +689,7 @@ pub fn drink_action_system(
     mut flash: MessageWriter<CharterFlashEvent>,
     global_clock: Res<GlobalTickClock>,
     mut water_query: Query<(Entity, &Position, &mut WaterSource, Option<&mut ItemHistory>)>,
+    mut quest_board: ResMut<QuestBoard>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
@@ -549,6 +776,21 @@ pub fn drink_action_system(
                                 water_src.portions -= 1;
                                 nn.thirst += 0.5;
                                 nn.thirst = nn.thirst.min(1.0);
+
+                                if complete_quest_for_action(
+                                    &mut quest_board,
+                                    *actor,
+                                    "water",
+                                    pawn_pos.chunk,
+                                ) {
+                                    if let Some(ref mut log) = activity {
+                                        log.push(format!("{} completed water quest", name));
+                                    }
+                                    if let Some(ref mut report) = report {
+                                        report.bump("quest_completed_water");
+                                    }
+                                }
+
                                 if water_src.portions == 0 {
                                     if let Some(ref mut report) = report {
                                         report.bump("water_depleted");
@@ -594,6 +836,7 @@ pub fn rest_action_system(
     mut flash: MessageWriter<CharterFlashEvent>,
     global_clock: Res<GlobalTickClock>,
     rest_query: Query<(&Position, &RestSpot)>,
+    mut quest_board: ResMut<QuestBoard>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
@@ -653,6 +896,19 @@ pub fn rest_action_system(
                         nn.fatigue += REST_RECOVERY_PER_STEP;
                         nn.fatigue = nn.fatigue.min(1.0);
                         if nn.fatigue >= REST_FATIGUE_TARGET {
+                            if complete_quest_for_action(
+                                &mut quest_board,
+                                *actor,
+                                "rest",
+                                pawn_pos.chunk,
+                            ) {
+                                if let Some(ref mut log) = activity {
+                                    log.push(format!("{} completed rest quest", name));
+                                }
+                                if let Some(ref mut report) = report {
+                                    report.bump("quest_completed_rest");
+                                }
+                            }
                             if let Some(ref mut log) = activity {
                                 log.push(format!("{} rested", name));
                             }
@@ -688,9 +944,139 @@ pub fn rest_action_system(
 pub fn build_pawn_brain() -> ThinkerBuilder {
     Thinker::build()
         .label("Pawn Brain")
+        .repeat_action_cooldown_ticks(3)
         .picker(FirstToScore { threshold: 0.8 })
         .when(NeedsToMoveScorer, MoveToChunkAction)
         .when(HungerScorer, EatAction)
         .when(ThirstScorer, DrinkAction)
         .when(FatigueScorer, RestAction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::system::SystemState;
+
+    #[test]
+    fn move_to_chunk_action_advances_one_chebyshev_step_per_run() {
+        let mut world = World::new();
+        let pawn = world
+            .spawn((
+                Position {
+                    chunk: ChunkId(0, 0),
+                },
+                MovementTarget(ChunkId(3, 0)),
+            ))
+            .id();
+
+        let action = world
+            .spawn((Actor(pawn), MoveToChunkAction, ActionState::Requested))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(move_to_chunk_action_system);
+
+        schedule.run(&mut world);
+        assert_eq!(world.entity(pawn).get::<Position>().unwrap().chunk, ChunkId(0, 0));
+        assert!(matches!(
+            *world.entity(action).get::<ActionState>().unwrap(),
+            ActionState::Executing
+        ));
+
+        schedule.run(&mut world);
+        assert_eq!(world.entity(pawn).get::<Position>().unwrap().chunk, ChunkId(1, 0));
+
+        schedule.run(&mut world);
+        assert_eq!(world.entity(pawn).get::<Position>().unwrap().chunk, ChunkId(2, 0));
+
+        schedule.run(&mut world);
+        assert_eq!(world.entity(pawn).get::<Position>().unwrap().chunk, ChunkId(3, 0));
+        assert!(world.entity(pawn).contains::<MovementTarget>());
+
+        schedule.run(&mut world);
+        assert!(!world.entity(pawn).contains::<MovementTarget>());
+        assert!(matches!(
+            *world.entity(action).get::<ActionState>().unwrap(),
+            ActionState::Success
+        ));
+    }
+
+    #[test]
+    fn quest_acceptance_sets_in_progress_provider() {
+        let mut world = World::new();
+        world.insert_resource(QuestBoard::default());
+
+        let requester = world
+            .spawn((
+                Name::new("Requester"),
+                Position {
+                    chunk: ChunkId(0, 0),
+                },
+                NeuralNetworkComponent {
+                    hunger: 0.8,
+                    ..default()
+                },
+                Capabilities {
+                    can_do: vec!["Eat".into()],
+                },
+            ))
+            .id();
+
+        let provider = world
+            .spawn((
+                Name::new("Provider"),
+                Position {
+                    chunk: ChunkId(1, 0),
+                },
+                NeuralNetworkComponent {
+                    hunger: 0.1,
+                    ..default()
+                },
+                Capabilities {
+                    can_do: vec!["Eat".into()],
+                },
+            ))
+            .id();
+
+        {
+            let mut board = world.resource_mut::<QuestBoard>();
+            board.active_quests.push(Quest {
+                need: "food".to_string(),
+                requester,
+                chunk: ChunkId(0, 0),
+                provider: None,
+                status: QuestStatus::Open,
+            });
+        }
+
+        let mut system_state: SystemState<(
+            ResMut<QuestBoard>,
+            Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+            Query<&Capabilities>,
+        )> = SystemState::new(&mut world);
+
+        {
+            let (mut quest_board, mut pawn_query, capabilities_query) =
+                system_state.get_mut(&mut world);
+            quest_acceptance_step(
+                1,
+                &mut quest_board,
+                &mut pawn_query,
+                &capabilities_query,
+                None,
+                None,
+                false,
+            );
+        }
+        system_state.apply(&mut world);
+
+        let board = world.resource::<QuestBoard>();
+        assert_eq!(board.active_quests.len(), 1);
+        let quest = &board.active_quests[0];
+        assert_eq!(quest.provider, Some(provider));
+        assert!(matches!(
+            quest.status,
+            QuestStatus::InProgress { provider: p } if p == provider
+        ));
+    }
 }

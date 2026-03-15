@@ -29,7 +29,8 @@ pub enum CausalEventKind {
     DriveThresholdCrossed { entity: Entity, drive: DriveType },
     LeaseReleased { chunk: ChunkId, component: TypeId },
     ResourceDepleted { chunk: ChunkId },
-    // Phase 4+: DiscoveryPropagated, AnsibleBroadcast, etc.
+    DiscoveryPropagated { recipe: String, from: Entity, to: Entity },
+    // Phase 4+: AnsibleBroadcast, etc.
 }
 
 // ── Causal Event ──────────────────────────────────────────────────────────────

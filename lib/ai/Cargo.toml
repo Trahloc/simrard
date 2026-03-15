@@ -16,5 +16,6 @@ bevy = { workspace = true }
 simrard-lib-utility-ai = { path = "../utility_ai" }
 simrard-lib-causal = { path = "../causal" }
 simrard-lib-charter = { path = "../charter" }
+simrard-lib-mirror = { path = "../mirror" }
 simrard-lib-pawn = { path = "../pawn" }
 simrard-lib-time = { path = "../time" }

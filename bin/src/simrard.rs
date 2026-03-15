@@ -1,24 +1,30 @@
 use bevy::prelude::*;
 use bevy::ecs::message::{MessageReader, Messages};
+use bevy::input::mouse::MouseWheel;
 use bevy::sprite::Sprite;
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 use simrard_lib_utility_ai::{BigBrainPlugin, BigBrainSet};
 use simrard_lib_ai::{self as ai, build_pawn_brain, ActivityLog, PawnAIPlugin};
-use simrard_lib_causal::{heartbeat, CausalEventQueue, CausalPlugin};
+use simrard_lib_causal::{
+    heartbeat, chebyshev_distance, propagation_delay, CausalEventKind, CausalEventQueue,
+    CausalPlugin,
+};
 use simrard_lib_charter::{
     charter_watchguard_system, CharterFlashEvent, ChunkId, FrameWriteLog, SpatialCharter,
 };
 use simrard_lib_pawn::{
-    Capabilities, FoodReservation, ItemHistory, ItemIdAllocator, ItemIdentity, NeuralNetworkComponent,
-    Position, Quest, QuestBoard, QuestStatus, RestSpot, SimulationLogSettings,
-    SimulationReport, WaterSource,
+    Capabilities, FoodReservation, ItemHistory, ItemIdAllocator, ItemIdentity, KnownRecipes,
+    NeuralNetworkComponent, Position, Quest, QuestBoard, QuestStatus, RestSpot,
+    SimulationLogSettings, SimulationReport, WaterSource,
 };
 use simrard_lib_time::{
     CausalClock, GlobalTickClock, SimTickAccumulator, SimTimeScale, TimePlugin,
     SIM_TICKS_PER_SECOND_AT_1X,
 };
 use simrard_lib_transforms::TransformsPlugin;
+use simrard_lib_mirror::{push_ecs_snapshot_system, MirrorPlugin};
 
 const HEADLESS_TARGET_TICKS: u64 = 10_000;
 
@@ -77,7 +83,9 @@ fn run_interactive() {
         .init_resource::<FrameWriteLog>()
         .init_resource::<Messages<CharterFlashEvent>>()
         .init_resource::<ActivityLog>()
-        .init_resource::<RespawnState>();
+        .init_resource::<RespawnState>()
+        .init_resource::<SimLifeState>()
+        .add_plugins(MirrorPlugin);
     // Alpha: panic on any ECS error in every Bevy world, including plugin-created sub-apps.
     // Some plugins create or reconfigure sub-app worlds during build, so overwrite all handlers
     // only after plugin registration is complete and before any schedule runs.
@@ -95,6 +103,8 @@ fn run_interactive() {
                 ai::pawn_death_system,
                 ApplyDeferred,
                 sim_tick_driver,
+                simlife_tick_system,
+                curiosity_discovery_system,
                 resource_respawn_system,
             )
                 .chain()
@@ -105,7 +115,9 @@ fn run_interactive() {
             (
                 sync_position_to_transform,
                 time_scale_input,
+                camera_pan_zoom_input,
                 chunk_grid_gizmo_system,
+                resource_level_bar_system,
                 pawn_dominant_drive_color_system,
                 charter_flash_spawn_system,
                 charter_flash_tick_system,
@@ -113,6 +125,10 @@ fn run_interactive() {
             )
                 .chain(),
         );
+
+    // Phase 4.D1: Push ECS snapshot to DuckDB mirror after Update (post visual sync).
+    // Runs in its own add_systems call so it is not constrained by the Update chain tuple limit.
+    app.add_systems(Update, push_ecs_snapshot_system);
 
     #[cfg(debug_assertions)]
     app.add_systems(Update, charter_watchguard_system);
@@ -144,8 +160,10 @@ fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
         .init_resource::<Messages<CharterFlashEvent>>()
         .init_resource::<ActivityLog>()
         .init_resource::<RespawnState>()
+        .init_resource::<SimLifeState>()
         .init_resource::<SimulationReport>()
         .insert_resource(SimulationLogSettings { stdout_enabled: false })
+        .add_plugins(MirrorPlugin)
         .add_systems(Startup, (setup, initialize_report_baseline).chain())
         .add_systems(
             PreUpdate,
@@ -153,11 +171,15 @@ fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
                 ai::pawn_death_system,
                 ApplyDeferred,
                 headless_tick_driver,
+                simlife_tick_system,
+                curiosity_discovery_system,
                 resource_respawn_system,
             )
                 .chain()
                 .before(BigBrainSet::Scorers),
-        );
+        )
+        // Phase 4.D1: Push ECS snapshot to DuckDB mirror after each headless update.
+        .add_systems(Update, push_ecs_snapshot_system);
     force_panic_error_handlers(&mut app);
 
     let started = Instant::now();
@@ -204,6 +226,8 @@ fn advance_simulation_one_tick(
     quest_board: &mut QuestBoard,
     activity: &mut ActivityLog,
     pawn_query: &mut Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+    capabilities_query: &Query<&Capabilities>,
+    known_recipes_query: &mut Query<&mut KnownRecipes>,
     report: Option<&mut SimulationReport>,
     stdout_enabled: bool,
 ) {
@@ -222,6 +246,8 @@ fn advance_simulation_one_tick(
         event_queue,
         quest_board,
         pawn_query,
+        capabilities_query,
+        known_recipes_query,
         Some(activity),
         report.as_deref_mut(),
         stdout_enabled,
@@ -229,7 +255,6 @@ fn advance_simulation_one_tick(
     if let Some(report) = report.as_deref_mut() {
         report.bump("sim_ticks_advanced");
     }
-    run_curiosity_step(quest_board, pawn_query);
 }
 
 fn headless_tick_driver(
@@ -238,6 +263,8 @@ fn headless_tick_driver(
     mut quest_board: ResMut<QuestBoard>,
     mut activity: ResMut<ActivityLog>,
     mut pawn_query: Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+    capabilities_query: Query<&Capabilities>,
+    mut known_recipes_query: Query<&mut KnownRecipes>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
 ) {
@@ -247,6 +274,8 @@ fn headless_tick_driver(
         &mut quest_board,
         &mut activity,
         &mut pawn_query,
+        &capabilities_query,
+        &mut known_recipes_query,
         report.as_deref_mut(),
         log_settings
             .as_deref()
@@ -365,6 +394,9 @@ fn chunk_grid_gizmo_system(mut gizmos: Gizmos) {
 // Pawns use DisplayOffset so multiple pawns on the same chunk don't stack; other entities use chunk center.
 #[derive(Component, Clone, Copy)]
 struct DisplayOffset(pub Vec3);
+
+#[derive(Component)]
+struct ResourceLevelBarVisual;
 
 fn sync_position_to_transform(
     mut query: Query<(&Position, &mut Transform, Option<&DisplayOffset>), With<Sprite>>,
@@ -517,7 +549,8 @@ fn setup_quest_ui(mut commands: Commands) {
 #[cfg(test)]
 mod tests {
     use super::{
-        force_panic_error_handlers, run_headless_with_target_ticks, HeadlessTermination,
+        advance_simlife_grass, food_portions_from_grass, force_panic_error_handlers,
+        run_headless_with_target_ticks, HeadlessTermination, SimLifeState, SIMLIFE_GRASS_MAX,
     };
     use bevy::app::{AppLabel, SubApp};
     use bevy::prelude::*;
@@ -553,6 +586,25 @@ mod tests {
         assert!(result.report.contains("Pawns: 8 alive / 8 started / 0 dead."));
         assert!(result.report.contains("sim_ticks_advanced = 1"));
     }
+
+    #[test]
+    fn simlife_grass_advances_over_ticks() {
+        let mut state = SimLifeState::default();
+        advance_simlife_grass(1, &mut state);
+        let sum_after_first: u32 = state.grass_per_chunk.values().copied().sum();
+        advance_simlife_grass(25, &mut state);
+        let sum_after_second: u32 = state.grass_per_chunk.values().copied().sum();
+
+        assert!(sum_after_second >= sum_after_first);
+        assert!(state.grass_per_chunk.values().all(|v| *v <= SIMLIFE_GRASS_MAX));
+    }
+
+    #[test]
+    fn food_portions_increase_with_grass_signal() {
+        let low = food_portions_from_grass(0);
+        let high = food_portions_from_grass(8);
+        assert!(high > low);
+    }
 }
 
 fn ui_panel_update_system(
@@ -560,6 +612,7 @@ fn ui_panel_update_system(
     scale: Res<SimTimeScale>,
     quest_board: Res<QuestBoard>,
     activity: Res<ActivityLog>,
+    pawn_names: Query<&Name>,
     food_query: Query<(&Position, &FoodReservation)>,
     water_query: Query<(&Position, &WaterSource)>,
     mut writer: bevy::ui::widget::TextUiWriter,
@@ -572,7 +625,7 @@ fn ui_panel_update_system(
     let seq = global_clock.causal_seq();
     let pause = if scale.0 == 0.0 { " [PAUSED]" } else { "" };
     let sim_status = format!(
-        "Sim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause",
+        "Sim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  Arrows/WASD pan  Wheel zoom",
         seq,
         scale.0,
         pause
@@ -599,7 +652,20 @@ fn ui_panel_update_system(
                     .active_quests
                     .iter()
                     .take(10)
-                    .map(|q| format!("  {} @ {:?} – {:?}", q.need, q.chunk, q.status)),
+                    .map(|q| {
+                        let status = match q.status {
+                            QuestStatus::Open => "Open".to_string(),
+                            QuestStatus::Completed => "Completed".to_string(),
+                            QuestStatus::InProgress { provider } => {
+                                let provider_name = pawn_names
+                                    .get(provider)
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|_| format!("{:?}", provider));
+                                format!("InProgress({})", provider_name)
+                            }
+                        };
+                        format!("  {} @ {:?} – {}", q.need, q.chunk, status)
+                    }),
             )
             .collect::<Vec<_>>()
             .join("\n")
@@ -638,6 +704,14 @@ const SPRITE_FOOD: f32 = 18.0;
 /// Water = medium cyan so clearly distinct from blue/purple thirst pawns.
 const SPRITE_WATER: f32 = 14.0;
 const SPRITE_PAWN: f32 = 10.0;
+const RESOURCE_BAR_HEIGHT: f32 = 3.0;
+const RESOURCE_BAR_MAX_WIDTH: f32 = 18.0;
+const RESOURCE_BAR_Y_OFFSET: f32 = 13.0;
+const RESOURCE_BAR_MAX_PORTIONS: f32 = 8.0;
+const CAMERA_PAN_SPEED: f32 = 500.0;
+const CAMERA_MIN_ZOOM: f32 = 0.4;
+const CAMERA_MAX_ZOOM: f32 = 4.0;
+const CAMERA_ZOOM_STEP: f32 = 0.12;
 
 fn chunk_to_translation(chunk: &ChunkId, z: f32) -> Vec3 {
     Vec3::new(
@@ -645,6 +719,84 @@ fn chunk_to_translation(chunk: &ChunkId, z: f32) -> Vec3 {
         chunk.1 as f32 * CHUNK_PIXEL,
         z,
     )
+}
+
+fn resource_level_bar_system(
+    mut commands: Commands,
+    existing_bars: Query<Entity, With<ResourceLevelBarVisual>>,
+    food_query: Query<(&Position, &FoodReservation)>,
+    water_query: Query<(&Position, &WaterSource)>,
+) {
+    // Keep implementation simple: rebuild tiny bar overlays each frame from current resource state.
+    for entity in existing_bars.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    for (position, food) in food_query.iter() {
+        let normalized = (food.portions as f32 / RESOURCE_BAR_MAX_PORTIONS).clamp(0.0, 1.0);
+        let width = RESOURCE_BAR_MAX_WIDTH * normalized.max(0.1);
+        let mut bar_pos = chunk_to_translation(&position.chunk, 2.0);
+        bar_pos.y += RESOURCE_BAR_Y_OFFSET;
+        commands.spawn((
+            ResourceLevelBarVisual,
+            Sprite::from_color(Color::srgb(0.95, 0.8, 0.2), Vec2::new(width, RESOURCE_BAR_HEIGHT)),
+            Transform::from_translation(bar_pos),
+        ));
+    }
+
+    for (position, water) in water_query.iter() {
+        let normalized = (water.portions as f32 / RESOURCE_BAR_MAX_PORTIONS).clamp(0.0, 1.0);
+        let width = RESOURCE_BAR_MAX_WIDTH * normalized.max(0.1);
+        let mut bar_pos = chunk_to_translation(&position.chunk, 2.0);
+        bar_pos.y += RESOURCE_BAR_Y_OFFSET;
+        commands.spawn((
+            ResourceLevelBarVisual,
+            Sprite::from_color(Color::srgb(0.45, 0.9, 1.0), Vec2::new(width, RESOURCE_BAR_HEIGHT)),
+            Transform::from_translation(bar_pos),
+        ));
+    }
+}
+
+fn camera_pan_zoom_input(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut mouse_wheel: MessageReader<MouseWheel>,
+    mut camera_query: Query<(&mut Transform, &mut Projection), With<Camera2d>>,
+) {
+    let Ok((mut transform, mut projection)) = camera_query.single_mut() else {
+        return;
+    };
+
+    let mut pan = Vec2::ZERO;
+    if keys.pressed(KeyCode::ArrowLeft) || keys.pressed(KeyCode::KeyA) {
+        pan.x -= 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD) {
+        pan.x += 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW) {
+        pan.y += 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowDown) || keys.pressed(KeyCode::KeyS) {
+        pan.y -= 1.0;
+    }
+
+    if pan != Vec2::ZERO {
+        let delta = pan.normalize() * CAMERA_PAN_SPEED * time.delta_secs();
+        transform.translation.x += delta.x;
+        transform.translation.y += delta.y;
+    }
+
+    let mut wheel_delta = 0.0f32;
+    for evt in mouse_wheel.read() {
+        wheel_delta += evt.y;
+    }
+    if wheel_delta.abs() > f32::EPSILON {
+        if let Projection::Orthographic(ref mut ortho) = *projection {
+            let scale = ortho.scale * (1.0 - wheel_delta * CAMERA_ZOOM_STEP);
+            ortho.scale = scale.clamp(CAMERA_MIN_ZOOM, CAMERA_MAX_ZOOM);
+        }
+    }
 }
 
 fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
@@ -689,6 +841,7 @@ fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
             Position { chunk: chunk_a },
             DisplayOffset(offset),
             Capabilities { can_do: vec!["Eat".into(), "Drink".into(), "Rest".into()] },
+            KnownRecipes::default(),
             Sprite::from_color(Color::srgb(0.2, 0.75, 0.3), Vec2::splat(SPRITE_PAWN)),
             Transform::from_translation(chunk_to_translation(&chunk_a, 0.0) + offset),
             Name::new(format!("Pawn_A_{}", i)),
@@ -734,6 +887,7 @@ fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
             Position { chunk: chunk_b },
             DisplayOffset(offset),
             Capabilities { can_do: vec!["Eat".into(), "Drink".into(), "Rest".into()] },
+            KnownRecipes::default(),
             Sprite::from_color(Color::srgb(0.2, 0.75, 0.3), Vec2::splat(SPRITE_PAWN)),
             Transform::from_translation(chunk_to_translation(&chunk_b, 0.0) + offset),
             Name::new(format!("Pawn_B_{}", i)),
@@ -742,12 +896,41 @@ fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
     }
 }
 
-fn run_curiosity_step(
-    quest_board: &mut QuestBoard,
-    pawn_query: &mut Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+const DISCOVERY_RECIPE_FIRE: &str = "Fire";
+const DISCOVERY_CURIOSITY_THRESHOLD: f32 = 4.5;
+const DISCOVERY_SOCIAL_THRESHOLD: f32 = 0.7;
+
+fn curiosity_discovery_system(
+    global_clock: Res<GlobalTickClock>,
+    mut quest_board: ResMut<QuestBoard>,
+    mut event_queue: ResMut<CausalEventQueue>,
+    mut pawns: Query<(
+        Entity,
+        &Name,
+        &Position,
+        &mut NeuralNetworkComponent,
+        &mut KnownRecipes,
+    )>,
+    food_query: Query<&Position, With<FoodReservation>>,
+    rest_query: Query<&Position, With<RestSpot>>,
+    mut activity: ResMut<ActivityLog>,
+    mut report: Option<ResMut<SimulationReport>>,
+    mut last_tick: Local<u64>,
 ) {
-    for (entity, _name, position, mut nn) in pawn_query.iter_mut() {
+    let seq = global_clock.causal_seq();
+    if seq <= *last_tick {
+        return;
+    }
+    *last_tick = seq;
+
+    let food_chunks: std::collections::HashSet<_> = food_query.iter().map(|p| p.chunk).collect();
+    let rest_chunks: std::collections::HashSet<_> = rest_query.iter().map(|p| p.chunk).collect();
+
+    let mut snapshot: Vec<(Entity, String, ChunkId, f32, bool)> = Vec::new();
+
+    for (entity, name, position, mut nn, mut known) in pawns.iter_mut() {
         nn.curiosity += 0.001;
+        let curiosity_now = nn.curiosity;
         if nn.curiosity > 5.0 {
             nn.curiosity = 0.0;
             quest_board.active_quests.push(Quest {
@@ -758,6 +941,60 @@ fn run_curiosity_step(
                 status: QuestStatus::Open,
             });
         }
+
+        let has_fire = known.recipes.contains(DISCOVERY_RECIPE_FIRE);
+        let can_discover_here = food_chunks.contains(&position.chunk) && rest_chunks.contains(&position.chunk);
+        if !has_fire && can_discover_here && curiosity_now >= DISCOVERY_CURIOSITY_THRESHOLD {
+            known.recipes.insert(DISCOVERY_RECIPE_FIRE.to_string());
+            activity.push(format!("{} discovered {}", name, DISCOVERY_RECIPE_FIRE));
+            if let Some(ref mut report) = report {
+                report.bump("recipe_discoveries");
+            }
+        }
+
+        snapshot.push((
+            entity,
+            name.to_string(),
+            position.chunk,
+            nn.social,
+            known.recipes.contains(DISCOVERY_RECIPE_FIRE),
+        ));
+    }
+
+    let mut taught_this_tick = std::collections::HashSet::new();
+    for (teacher_entity, teacher_name, teacher_chunk, teacher_social, teacher_has_fire) in &snapshot {
+        if !*teacher_has_fire || *teacher_social < DISCOVERY_SOCIAL_THRESHOLD {
+            continue;
+        }
+        for (learner_entity, learner_name, learner_chunk, _learner_social, learner_has_fire) in &snapshot {
+            if *learner_entity == *teacher_entity || *learner_has_fire {
+                continue;
+            }
+            if !taught_this_tick.insert(*learner_entity) {
+                continue;
+            }
+            let dist = chebyshev_distance(teacher_chunk, learner_chunk);
+            if dist > 1 {
+                continue;
+            }
+            let deliver_at = seq + propagation_delay(teacher_chunk, learner_chunk, heartbeat::C);
+            event_queue.push_at(
+                CausalEventKind::DiscoveryPropagated {
+                    recipe: DISCOVERY_RECIPE_FIRE.to_string(),
+                    from: *teacher_entity,
+                    to: *learner_entity,
+                },
+                *teacher_chunk,
+                deliver_at,
+            );
+            activity.push(format!(
+                "{} teaching {} to {}",
+                teacher_name, DISCOVERY_RECIPE_FIRE, learner_name
+            ));
+            if let Some(ref mut report) = report {
+                report.bump("recipe_teaching_events");
+            }
+        }
     }
 }
 
@@ -767,11 +1004,62 @@ const CHUNK_EXTENT: u32 = 11;
 /// Target counts for respawn: maintain at least this many food and water entities in the world.
 const TARGET_FOOD_COUNT: usize = 2;
 const TARGET_WATER_COUNT: usize = 2;
+const SIMLIFE_GRASS_MAX: u32 = 10;
+const SIMLIFE_GRASS_GROWTH_PERIOD: u64 = 10;
+const SIMLIFE_BASE_FOOD_PORTIONS: u32 = 4;
+const SIMLIFE_GRASS_TO_FOOD_DIVISOR: u32 = 2;
+const SIMLIFE_MAX_FOOD_PORTIONS: u32 = 12;
 
 /// Tracks last sim tick we ran respawn. Ensures we run respawn once per tick.
 #[derive(Resource, Default)]
 struct RespawnState {
     last_tick: u64,
+}
+
+/// SimLife placeholder: per-chunk grass pressure read by surface resource systems.
+#[derive(Resource, Debug, Clone)]
+struct SimLifeState {
+    last_tick: u64,
+    grass_per_chunk: HashMap<ChunkId, u32>,
+}
+
+impl Default for SimLifeState {
+    fn default() -> Self {
+        Self {
+            last_tick: 0,
+            grass_per_chunk: HashMap::new(),
+        }
+    }
+}
+
+fn advance_simlife_grass(current_seq: u64, simlife: &mut SimLifeState) {
+    if current_seq <= simlife.last_tick {
+        return;
+    }
+    simlife.last_tick = current_seq;
+
+    for x in 0..=CHUNK_EXTENT {
+        for y in 0..=CHUNK_EXTENT {
+            let chunk = ChunkId(x, y);
+            let entry = simlife.grass_per_chunk.entry(chunk).or_insert(0);
+            if (current_seq + x as u64 + y as u64) % SIMLIFE_GRASS_GROWTH_PERIOD == 0 {
+                *entry = (*entry + 1).min(SIMLIFE_GRASS_MAX);
+            }
+        }
+    }
+}
+
+fn food_portions_from_grass(grass: u32) -> u32 {
+    (SIMLIFE_BASE_FOOD_PORTIONS + grass / SIMLIFE_GRASS_TO_FOOD_DIVISOR)
+        .min(SIMLIFE_MAX_FOOD_PORTIONS)
+}
+
+fn simlife_tick_system(
+    global_clock: Res<GlobalTickClock>,
+    mut simlife: ResMut<SimLifeState>,
+) {
+    // Causal ordering: run after sim_tick_driver, then respawn reads same-tick SimLife state.
+    advance_simlife_grass(global_clock.causal_seq(), &mut simlife);
 }
 
 /// Spawns food and water at random empty chunks when below target. Food and water never share a chunk.
@@ -781,6 +1069,7 @@ fn resource_respawn_system(
     mut state: ResMut<RespawnState>,
     mut commands: Commands,
     mut allocator: ResMut<ItemIdAllocator>,
+    simlife: Res<SimLifeState>,
     food_query: Query<&Position, With<FoodReservation>>,
     water_query: Query<&Position, With<WaterSource>>,
 ) {
@@ -817,8 +1106,10 @@ fn resource_respawn_system(
 
     if let Some(chunk) = food_chunk {
         let id = allocator.alloc();
+        let grass = *simlife.grass_per_chunk.get(&chunk).unwrap_or(&0);
+        let portions = food_portions_from_grass(grass);
         commands.spawn((
-            FoodReservation { portions: 8 },
+            FoodReservation { portions },
             Position { chunk },
             ItemIdentity { item_id: id, created_at_causal_seq: current },
             ItemHistory::default(),
@@ -863,6 +1154,8 @@ fn sim_tick_driver(
     mut quest_board: ResMut<QuestBoard>,
     mut activity: ResMut<ActivityLog>,
     mut pawn_query: Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
+    capabilities_query: Query<&Capabilities>,
+    mut known_recipes_query: Query<&mut KnownRecipes>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
 ) {
@@ -878,6 +1171,8 @@ fn sim_tick_driver(
             &mut quest_board,
             &mut activity,
             &mut pawn_query,
+            &capabilities_query,
+            &mut known_recipes_query,
             report.as_deref_mut(),
             stdout_enabled,
         );

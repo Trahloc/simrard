@@ -67,18 +67,27 @@ Verification and stability so the sim actually runs in both headless and headed 
 - [x] **Score clamp**: Clamp scorer outputs to `[0.0, 1.0]` so `Score::set()` never panics when needs exceed 1.0 (e.g. after eating) in headed mode.
 - [x] **Headless 10k run**: `cargo run -p simrard-bin -- --headless-test` reaches 10k ticks with all pawns alive; eat/drink/rest and resource consumption confirmed via report counters.
 
-## 🟥 Phase 4 (Deferred): Sub-Simulations & Polish
-- [ ] Implement Maxis sub-layers (SimEarth, SimLife, etc.).
-- [ ] Implement DuckDB vector index for pawn-task matching.
-- [ ] Implement "Narrative Energy" / god power mechanics (if kept).
-- [ ] Implement Multiplayer capabilities.
-- [ ] Rendering pass / UI / UX / Visual Polish.
-- [ ] GPU NN upgrade: Scale to 64–256 drives via wgpu/Torch inference.
-- [ ] Replace demo pawn wander with proper "go to resource" movement (MoveToChunk or path toward action target).
+## 🟥 Phase 4 (Active, Ordered In ImplementationPlan)
+Canonical checklist and execution order live in `ImplementationPlan.md`.
+
+- [x] Run Phase 4 prerequisite gates (C constant confirmation, The System precondition graph task, DuckDB sync strategy decision, narrative-energy scope tie-in).
+- [x] Implement Thinker stability improvements before quest acceptance (hysteresis + picker-default decision).
+- [x] Implement Quest Acceptance & Economy lifecycle.
+- [x] Add targeted observer UI verification slice (resource levels + quest states/providers).
+- [x] Implement minimal SimLife pressure layer before recipe discovery.
+- [x] Implement recipe discovery + teaching propagation.
+- [ ] DuckDB staged rollout:
+  - [x] D1 foundation now (ECS mirror + sync tests, no behavior coupling).
+  - [x] D2 provider-ranking integration after economy baseline verification.
+- [ ] Implement "Narrative Energy" / god power mechanics only if The System is in active scope for this phase.
+- [ ] Implement Multiplayer capabilities (deferred; explicit entry criteria required).
+- [ ] GPU NN upgrade: Scale to 64–256 drives via wgpu/Torch inference (deferred; explicit entry criteria required).
+- [x] Goal-directed movement status: verified against code/tests and reclassified complete.
 
 ## ⚙️ Engine Tech Debt (Utility AI)
-- [ ] **Hysteresis**: Implement oscillation protection in `Thinker` so actors don't bounce between equally-scored actions (see `lib/utility_ai/src/thinker.rs:511`).
-- [ ] **Picker Defaults**: Evaluate if `ThinkerBuilder` should provide a default `Picker` (see `lib/utility_ai/src/thinker.rs:231`).
+- [x] **Hysteresis**: Implemented in `Thinker` (Phase 4.3.1 in `ImplementationPlan.md`).
+- [x] **Repeat-action cooldown**: Added configurable `repeat_action_cooldown_ticks` in `Thinker`; pawn brain set to `3` ticks (Phase 4.3.2 in `ImplementationPlan.md`).
+- [x] **Picker Defaults**: Resolved as explicit "Picker is required" contract with assertive build-time panic message (Phase 4.3.4 in `ImplementationPlan.md`).
 
 ## 📝 Release Checklist
 - [ ] **Toolchain Compatibility**: Verify `rust-toolchain.toml` is compatible with current Bevy version before bumping major versions.

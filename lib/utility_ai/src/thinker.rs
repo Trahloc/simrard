@@ -2,7 +2,7 @@
 //! Thinker picks the right Action to run based on the resulting Scores.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,6 +21,10 @@ use crate::{
     pickers::Picker,
     scorers::{Score, ScorerBuilder},
 };
+
+/// Hysteresis: prefer the currently running action when a newly picked action
+/// only beats it by a tiny margin. This prevents action flapping.
+const HYSTERESIS_EPSILON: f32 = 0.05;
 
 /// Wrapper for Actor entities. In terms of Scorers, Thinkers, and Actions,
 /// this is the [`Entity`] actually _performing_ the action, rather than the
@@ -144,6 +148,10 @@ pub struct Thinker {
     span: Span,
     #[reflect(ignore)]
     scheduled_actions: VecDeque<ActionBuilderWrapper>,
+    decision_tick: u64,
+    repeat_action_cooldown_ticks: u64,
+    #[reflect(ignore)]
+    completed_action_tick: HashMap<usize, u64>,
 }
 
 impl Thinker {
@@ -167,6 +175,7 @@ pub struct ThinkerBuilder {
     otherwise: Option<ActionBuilderWrapper>,
     choices: Vec<ChoiceBuilder>,
     label: Option<String>,
+    repeat_action_cooldown_ticks: u64,
 }
 
 impl ThinkerBuilder {
@@ -176,6 +185,7 @@ impl ThinkerBuilder {
             otherwise: None,
             choices: Vec::new(),
             label: None,
+            repeat_action_cooldown_ticks: 0,
         }
     }
 
@@ -209,6 +219,13 @@ impl ThinkerBuilder {
         self.label = Some(label.as_ref().to_string());
         self
     }
+
+    /// Prevent immediate reselection of the same action after completion.
+    /// Measured in thinker decision ticks; `0` disables cooldown.
+    pub fn repeat_action_cooldown_ticks(mut self, ticks: u64) -> Self {
+        self.repeat_action_cooldown_ticks = ticks;
+        self
+    }
 }
 
 impl ActionBuilder for ThinkerBuilder {
@@ -228,17 +245,19 @@ impl ActionBuilder for ThinkerBuilder {
         std::mem::drop(_guard);
         cmd.entity(action_ent)
             .insert(Thinker {
-                // TODO(2026-03-14): Provide a reasonable default for Picker?
                 picker: self
                     .picker
                     .clone()
-                    .expect("ThinkerBuilder must have a Picker"),
+                    .expect("ThinkerBuilder requires an explicit Picker via .picker(...)."),
                 otherwise: self.otherwise.clone(),
                 choices,
                 current_action: None,
                 current_action_label: None,
                 span,
                 scheduled_actions: VecDeque::new(),
+                decision_tick: 0,
+                repeat_action_cooldown_ticks: self.repeat_action_cooldown_ticks,
+                completed_action_tick: HashMap::new(),
             })
             .insert(Name::new("Thinker"))
             .insert(ActionState::Requested);
@@ -348,28 +367,35 @@ pub fn thinker_system(
             ActionState::Success | ActionState::Failure => {}
             ActionState::Cancelled => {
                 debug!("Thinker cancelled. Cleaning up.");
-                if let Some(current) = &mut thinker.current_action {
-                    let action_span = action_spans.get(current.0 .0).expect("Where is it?");
+                if let Some((current_action, current_builder)) = thinker.current_action.take() {
+                    let action_span = action_spans.get(current_action.0).expect("Where is it?");
                     debug!("Cancelling current action because thinker was cancelled.");
-                    let state = action_states.get_mut(current.0.0).expect("Couldn't find a component corresponding to the current action. This is definitely a bug.").clone();
+                    let state = action_states
+                        .get_mut(current_action.0)
+                        .expect("Couldn't find a component corresponding to the current action. This is definitely a bug.")
+                        .clone();
                     match state {
                         ActionState::Success | ActionState::Failure => {
                             debug!("Action already wrapped up on its own. Cleaning up action in Thinker.");
-                            if let Ok(mut ent) = cmd.get_entity(current.0 .0) {
+                            record_completed_action_tick(&mut thinker, &current_builder);
+                            if let Ok(mut ent) = cmd.get_entity(current_action.0) {
                                 ent.despawn();
                             }
-                            thinker.current_action = None;
                         }
                         ActionState::Cancelled => {
                             debug!("Current action already cancelled.");
+                            thinker.current_action = Some((current_action, current_builder));
                         }
                         _ => {
-                            let mut state = action_states.get_mut(current.0.0).expect("Couldn't find a component corresponding to the current action. This is definitely a bug.");
+                            let mut state = action_states
+                                .get_mut(current_action.0)
+                                .expect("Couldn't find a component corresponding to the current action. This is definitely a bug.");
                             debug!( "Action is still executing. Attempting to cancel it before wrapping up Thinker cancellation.");
                             action_span.span.in_scope(|| {
                                 debug!("Parent thinker was cancelled. Cancelling action.");
                             });
                             *state = ActionState::Cancelled;
+                            thinker.current_action = Some((current_action, current_builder));
                         }
                     }
                 } else {
@@ -379,9 +405,16 @@ pub fn thinker_system(
                 }
             }
             ActionState::Executing => {
+                thinker.decision_tick = thinker.decision_tick.saturating_add(1);
                 #[cfg(feature = "trace")]
                 trace!("Thinker is executing. Thinking...");
-                if let Some(choice) = thinker.picker.pick(&thinker.choices, &scores) {
+                let candidate_choices: Vec<Choice> = thinker
+                    .choices
+                    .iter()
+                    .filter(|choice| !is_action_on_cooldown(&thinker, &choice.action))
+                    .cloned()
+                    .collect();
+                if let Some(choice) = thinker.picker.pick(&candidate_choices, &scores) {
                     // Think about what action we're supposed to be taking. We do this
                     // every tick, because we might change our mind.
                     // ...and then execute it (details below).
@@ -390,6 +423,21 @@ pub fn thinker_system(
                     let action = choice.action.clone();
                     let scorer = choice.scorer;
                     let score = scores.get(choice.scorer.0).expect("Where is it?");
+                    if should_keep_current_action_for_hysteresis(
+                        &thinker,
+                        &action,
+                        score.get(),
+                        &scores,
+                        &mut action_states,
+                    ) {
+                        #[cfg(feature = "trace")]
+                        trace!(
+                            "Hysteresis retained current action (new score {:.3} within {:.3}).",
+                            score.get(),
+                            HYSTERESIS_EPSILON
+                        );
+                        continue;
+                    }
                     exec_picked_action(
                         &mut cmd,
                         *actor,
@@ -424,10 +472,14 @@ pub fn thinker_system(
                         &scorer_spans,
                         false,
                     );
-                } else if let Some((action_ent, _)) = &thinker.current_action {
-                    let action_span = action_spans.get(action_ent.0).expect("Where is it?");
+                } else if let Some((action_ent, action_builder)) = thinker
+                    .current_action
+                    .as_ref()
+                    .map(|(action, builder)| (action.0, builder.clone()))
+                {
+                    let action_span = action_spans.get(action_ent).expect("Where is it?");
                     let _guard = action_span.span.enter();
-                    let mut curr_action_state = action_states.get_mut(action_ent.0).expect("Couldn't find a component corresponding to the current action. This is definitely a bug.");
+                    let mut curr_action_state = action_states.get_mut(action_ent).expect("Couldn't find a component corresponding to the current action. This is definitely a bug.");
                     let previous_done = matches!(
                         *curr_action_state,
                         ActionState::Success | ActionState::Failure
@@ -436,8 +488,9 @@ pub fn thinker_system(
                         debug!(
                             "Action completed and nothing was picked. Despawning action entity.",
                         );
+                        record_completed_action_tick(&mut thinker, &action_builder);
                         // Despawn the action itself.
-                        if let Ok(mut ent) = cmd.get_entity(action_ent.0) {
+                        if let Ok(mut ent) = cmd.get_entity(action_ent) {
                             ent.despawn();
                         }
                         thinker.current_action = None;
@@ -489,6 +542,67 @@ fn should_schedule_action(
     }
 }
 
+fn should_keep_current_action_for_hysteresis(
+    thinker: &Thinker,
+    picked_action: &ActionBuilderWrapper,
+    picked_score: f32,
+    scores: &Query<&Score>,
+    states: &mut Query<&mut ActionState>,
+) -> bool {
+    let Some((current_action_ent, current_action)) = thinker.current_action.as_ref() else {
+        return false;
+    };
+
+    if Arc::ptr_eq(&current_action.0, &picked_action.0) {
+        return false;
+    }
+
+    let Ok(current_state) = states.get_mut(current_action_ent.entity()) else {
+        return false;
+    };
+
+    if !matches!(*current_state, ActionState::Requested | ActionState::Executing) {
+        return false;
+    }
+
+    let Some(current_choice_score) = thinker
+        .choices
+        .iter()
+        .find(|choice| Arc::ptr_eq(&choice.action.0, &current_action.0))
+        .map(|choice| choice.calculate(scores))
+    else {
+        return false;
+    };
+
+    picked_score <= current_choice_score + HYSTERESIS_EPSILON
+}
+
+fn action_key(action: &ActionBuilderWrapper) -> usize {
+    Arc::as_ptr(&action.0) as usize
+}
+
+fn is_action_on_cooldown(thinker: &Thinker, action: &ActionBuilderWrapper) -> bool {
+    if thinker.repeat_action_cooldown_ticks == 0 {
+        return false;
+    }
+
+    let key = action_key(action);
+    let Some(last_completed_tick) = thinker.completed_action_tick.get(&key) else {
+        return false;
+    };
+
+    thinker.decision_tick.saturating_sub(*last_completed_tick) < thinker.repeat_action_cooldown_ticks
+}
+
+fn record_completed_action_tick(thinker: &mut Thinker, action: &ActionBuilderWrapper) {
+    if thinker.repeat_action_cooldown_ticks == 0 {
+        return;
+    }
+    thinker
+        .completed_action_tick
+        .insert(action_key(action), thinker.decision_tick);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exec_picked_action(
     cmd: &mut Commands,
@@ -506,13 +620,11 @@ fn exec_picked_action(
     // is just a newtype for an Entity.
     //
 
-    // Now we check the current action. We need to check if we picked the same one as the previous tick.
-    //
-    // TODO(2026-03-14): Implement oscillation protection (hysteresis) so actors 
-    // aren't bouncing back and forth between the same couple of equally-scored actions.
+    // Hysteresis is handled at pick time in thinker_system. This function applies the chosen transition.
     let thinker_span = thinker.span.clone();
     let _thinker_span_guard = thinker_span.enter();
-    if let Some((action_ent, ActionBuilderWrapper(current_id, _))) = &mut thinker.current_action {
+    if let Some((action_ent, current_builder)) = thinker.current_action.take() {
+        let current_id = &current_builder.0;
         let mut curr_action_state = states.get_mut(action_ent.0).expect("Couldn't find a component corresponding to the current action. This is definitely a bug.");
         let previous_done = matches!(
             *curr_action_state,
@@ -539,9 +651,11 @@ fn exec_picked_action(
                 ActionState::Executing | ActionState::Requested => {
                     debug!("Previous action is still executing. Requesting action cancellation.",);
                     *curr_action_state = ActionState::Cancelled;
+                    thinker.current_action = Some((action_ent, current_builder));
                 }
                 ActionState::Init | ActionState::Success | ActionState::Failure => {
                     debug!("Previous action already completed. Despawning action entity.",);
+                    record_completed_action_tick(thinker, &current_builder);
                     // Despawn the action itself.
                     if let Ok(mut ent) = cmd.get_entity(action_ent.0) {
                         ent.despawn();
@@ -562,7 +676,8 @@ fn exec_picked_action(
                     #[cfg(feature = "trace")]
                     trace!(
                     "Cancellation already requested. Waiting for action to be marked as completed.",
-                )
+                );
+                    thinker.current_action = Some((action_ent, current_builder));
                 }
             };
         } else {
@@ -574,6 +689,7 @@ fn exec_picked_action(
             if *curr_action_state == ActionState::Init {
                 *curr_action_state = ActionState::Requested;
             }
+            thinker.current_action = Some((action_ent, current_builder));
             #[cfg(feature = "trace")]
             trace!("Continuing execution of current action.",)
         }
@@ -594,5 +710,60 @@ fn exec_picked_action(
         let new_action = actions::spawn_action(picked_action.1.as_ref(), cmd, actor);
         thinker.current_action = Some((Action(new_action), picked_action.clone()));
         thinker.current_action_label = Some(picked_action.1.label().map(|s| s.into()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pickers::Highest;
+
+    #[derive(Debug)]
+    struct DummyAction;
+
+    impl ActionBuilder for DummyAction {
+        fn build(&self, _cmd: &mut Commands, _action: Entity, _actor: Entity) {}
+    }
+
+    fn test_thinker(cooldown_ticks: u64) -> Thinker {
+        Thinker {
+            picker: Arc::new(Highest),
+            otherwise: None,
+            choices: Vec::new(),
+            current_action: None,
+            current_action_label: None,
+            span: span!(Level::DEBUG, "test_thinker"),
+            scheduled_actions: VecDeque::new(),
+            decision_tick: 0,
+            repeat_action_cooldown_ticks: cooldown_ticks,
+            completed_action_tick: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn repeat_action_cooldown_blocks_recently_completed_action() {
+        let action = ActionBuilderWrapper::new(Arc::new(DummyAction));
+        let mut thinker = test_thinker(3);
+
+        thinker.decision_tick = 10;
+        record_completed_action_tick(&mut thinker, &action);
+
+        thinker.decision_tick = 12;
+        assert!(is_action_on_cooldown(&thinker, &action));
+
+        thinker.decision_tick = 13;
+        assert!(!is_action_on_cooldown(&thinker, &action));
+    }
+
+    #[test]
+    fn repeat_action_cooldown_zero_disables_cooldown() {
+        let action = ActionBuilderWrapper::new(Arc::new(DummyAction));
+        let mut thinker = test_thinker(0);
+
+        thinker.decision_tick = 5;
+        record_completed_action_tick(&mut thinker, &action);
+        thinker.decision_tick = 6;
+
+        assert!(!is_action_on_cooldown(&thinker, &action));
     }
 }

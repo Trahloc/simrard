@@ -54,6 +54,40 @@ Scope (implemented in `bin/src/simrard.rs`, `lib/charter`, `lib/ai`):
 
 Execute sub-phases in order. Each checkbox is a concrete task an AI agent can complete. Do not skip a sub-phase; dependencies are intentional.
 
+### Phase 4 Status Policy
+
+- If a task is suspected incomplete, mark it `Needs Review` and verify before reclassifying.
+- Do not assume incomplete from stale docs alone; confirm against code/tests/manual verification.
+- Do not assume complete from a checkbox alone when implementation evidence is uncertain; use engineering judgment and require verification evidence.
+- Keep this file as canonical status, and make TODO.md a summary pointer.
+
+### Phase 4 Prerequisite Gates (Before Remaining Work)
+
+- [x] **G1** Confirm C constant remains `C=8` for current phase scope (or document change rationale). Decision: keep `C=8` (validated by existing causal layer and current pacing).
+- [x] **G2** Add The System precondition-graph design task (world-state + agent-history triggers). Decision: tracked as new task `TS1` below.
+- [x] **G3** Decide and document DuckDB sync strategy for ECS mirror (`push` vs `pull`) before behavioral coupling. Decision: `push` sync for Phase 4.D1 foundation.
+- [x] **G4** If The System is in active scope, define a minimal narrative-energy formula and spend semantics; otherwise defer both together. Decision: defer narrative energy together with The System deepening beyond current Phase 4 implementation.
+
+#### The System Gate Task (TS1)
+
+- [x] **TS1** Draft The System precondition graph for neolithic-to-early-industrial legibility transitions, with triggers defined as world-state + agent-history predicates.
+
+### Ordered Execution For Remaining Phase 4 Work
+
+Historical numbering is preserved for continuity, but execute in this order:
+
+1. **4.3 — Thinker Improvements** (stabilize decisions before economy acceptance).
+2. **4.2 — Quest Acceptance & Economy** (drive-weighted provider assignment, lifecycle).
+3. **4.5 — Visualization & UI Polish (targeted observability slice first)**.
+4. **4.6 — SimLife Sub-Simulation (minimal pressure layer)**.
+5. **4.4 — Recipe Discovery & Knowledge** (validate discovery + teaching under SimLife pressure).
+6. **4.7 / 4.8** remain deferred until entry criteria are satisfied.
+
+### DuckDB Split Plan (Do Now, But Bounded)
+
+- **Phase 4.D1 (Foundation Now)**: ECS mirror schema/resource contract + sync strategy + tests, without changing quest-provider selection logic.
+- **Phase 4.D2 (Behavioral Integration Later)**: use vector matching for provider ranking only after baseline economy behavior is verified.
+
 ---
 
 ### Phase 4.0 — Goal-Directed Movement
@@ -121,11 +155,11 @@ Execute sub-phases in order. Each checkbox is a concrete task an AI agent can co
 
 **Checkboxes**:
 
-- [ ] **4.2.1** Add a system `quest_acceptance_system` that runs each sim tick (after heartbeat and dispatcher). It queries `QuestBoard`, finds quests with `QuestStatus::Open`, then for each open quest finds pawns that (a) have a matching capability (`Capabilities::has(need)` or similar — map "food" to "Eat", "water" to "Drink", "rest" to "Rest"), (b) are in a state where they could fulfill it (e.g. hunger high for "food"), and (c) are not already the requester. Select one pawn per quest (e.g. highest drive or first match) and set the quest's `status` to `QuestStatus::InProgress { provider: that_pawn }`. Optionally insert a component on the provider, e.g. `AcceptedQuest(QuestId)` or store the quest index. Document how "drive-weighted" is implemented (e.g. sort candidates by drive value for that need).
-- [ ] **4.2.2** When a pawn completes an eat/drink/rest action that satisfies a quest (requester is the pawn or the quest need matches), mark that quest as `QuestStatus::Completed` and remove it from `active_quests` after a tick, or move to a "completed" list for UI. Ensure the accepting pawn (provider) is the one who performs the action; the requester is the one who had the need. Clarify in code: acceptance means "provider will go fulfill this need for the requester" or "provider will fulfill their own need that was posted as a quest". Current design: requester posts their own need; so the provider that accepts is actually going to fulfill the requester's need — that implies going to the requester's chunk or the resource. For simplicity, first implement: acceptance means "a pawn with matching capability commits to fulfilling this need"; fulfillment is when that pawn completes the action (e.g. eats at the chunk). So the quest's `chunk` is where the need was posted (requester's location) or where the resource is. Align with existing `Quest { need, requester, chunk, provider, status }`: when a pawn accepts, set `provider: Some(acceptor_entity)` and `status: InProgress`. When that pawn eats/drinks/rests at the relevant chunk, mark quest completed.
-- [ ] **4.2.3** Limit one accepted quest per pawn if needed (e.g. component `AcceptedQuest(pub usize)` indexing into quest board, or store entity of the quest). Ensure the same quest is not accepted by two pawns (status is InProgress with one provider).
-- [ ] **4.2.4** Expose accepted quests in the UI: in `ui_panel_update_system`, show which quests are Open vs InProgress (with provider name if available) vs Completed. Optionally trim "Completed" after N entries or one tick.
-- [ ] **4.2.5** Add a unit test or integration test: post one quest, run acceptance system, assert one quest has InProgress and provider set (when at least one pawn has the capability and high drive).
+- [x] **4.2.1** Add a system `quest_acceptance_system` that runs each sim tick (after heartbeat and dispatcher). It queries `QuestBoard`, finds quests with `QuestStatus::Open`, then for each open quest finds pawns that (a) have a matching capability (`Capabilities::has(need)` or similar — map "food" to "Eat", "water" to "Drink", "rest" to "Rest"), (b) are in a state where they could fulfill it (e.g. hunger high for "food"), and (c) are not already the requester. Select one pawn per quest (e.g. highest drive or first match) and set the quest's `status` to `QuestStatus::InProgress { provider: that_pawn }`. Optionally insert a component on the provider, e.g. `AcceptedQuest(QuestId)` or store the quest index. Document how "drive-weighted" is implemented (e.g. sort candidates by drive value for that need).
+- [x] **4.2.2** When a pawn completes an eat/drink/rest action that satisfies a quest (requester is the pawn or the quest need matches), mark that quest as `QuestStatus::Completed` and remove it from `active_quests` after a tick, or move to a "completed" list for UI. Ensure the accepting pawn (provider) is the one who performs the action; the requester is the one who had the need. Clarify in code: acceptance means "provider will go fulfill this need for the requester" or "provider will fulfill their own need that was posted as a quest". Current design: requester posts their own need; so the provider that accepts is actually going to fulfill the requester's need — that implies going to the requester's chunk or the resource. For simplicity, first implement: acceptance means "a pawn with matching capability commits to fulfilling this need"; fulfillment is when that pawn completes the action (e.g. eats at the chunk). So the quest's `chunk` is where the need was posted (requester's location) or where the resource is. Align with existing `Quest { need, requester, chunk, provider, status }`: when a pawn accepts, set `provider: Some(acceptor_entity)` and `status: InProgress`. When that pawn eats/drinks/rests at the relevant chunk, mark quest completed.
+- [x] **4.2.3** Limit one accepted quest per pawn if needed (e.g. component `AcceptedQuest(pub usize)` indexing into quest board, or store entity of the quest). Ensure the same quest is not accepted by two pawns (status is InProgress with one provider).
+- [x] **4.2.4** Expose accepted quests in the UI: in `ui_panel_update_system`, show which quests are Open vs InProgress (with provider name if available) vs Completed. Optionally trim "Completed" after N entries or one tick.
+- [x] **4.2.5** Add a unit test or integration test: post one quest, run acceptance system, assert one quest has InProgress and provider set (when at least one pawn has the capability and high drive).
 
 **Verification**:
 - Build and test pass. In-game, when a need is posted, within a few ticks a pawn should accept it (shown in UI) and then fulfill it (quest disappears or shows completed).
@@ -146,10 +180,10 @@ Execute sub-phases in order. Each checkbox is a concrete task an AI agent can co
 
 **Checkboxes**:
 
-- [ ] **4.3.1** Implement oscillation protection in the Thinker. In `lib/utility_ai/src/thinker.rs`, when the current action's score is within a small epsilon of another choice (e.g. difference < 0.05), prefer the current action (do not switch). Add a constant e.g. `HYSTERESIS_EPSILON: f32 = 0.05` and apply in the picker or in the thinker loop that selects the next action. Document: "Hysteresis: avoid flipping between equally-scored actions."
+- [x] **4.3.1** Implement oscillation protection in the Thinker. In `lib/utility_ai/src/thinker.rs`, when the current action's score is within a small epsilon of another choice (e.g. difference < 0.05), prefer the current action (do not switch). Add a constant e.g. `HYSTERESIS_EPSILON: f32 = 0.05` and apply in the picker or in the thinker loop that selects the next action. Document: "Hysteresis: avoid flipping between equally-scored actions."
 - [ ] **4.3.2** Optionally add a "cooldown" so that after finishing an action, the same action cannot be re-selected for N ticks (to avoid eat-eat-eat in place). If added, make N configurable (e.g. 3–5 ticks) and document.
-- [ ] **4.3.3** #scheduler-debt: Document in `lib/ai/ai.rs` at the dispatcher site exactly why we mutate the drive (e.g. "Force re-evaluation so Thinker re-scores; TODO(YYYY-MM-DD): replace with event-reactive re-trigger when BigBrain supports it."). Do not remove the mutation until event-reactive integration exists; ensure one comment references #scheduler-debt.
-- [ ] **4.3.4** Evaluate default Picker: in `lib/utility_ai/src/thinker.rs`, check whether `ThinkerBuilder` should provide a default `Picker` if none is set (see existing TODO around line 231). Either add a default (e.g. `FirstToScore { threshold: 0.8 }`) or document "Picker is required" and panic/assert if missing.
+- [x] **4.3.3** #scheduler-debt: Document in `lib/ai/ai.rs` at the dispatcher site exactly why we mutate the drive (e.g. "Force re-evaluation so Thinker re-scores; TODO(YYYY-MM-DD): replace with event-reactive re-trigger when BigBrain supports it."). Do not remove the mutation until event-reactive integration exists; ensure one comment references #scheduler-debt.
+- [x] **4.3.4** Evaluate default Picker: in `lib/utility_ai/src/thinker.rs`, check whether `ThinkerBuilder` should provide a default `Picker` if none is set (see existing TODO around line 231). Either add a default (e.g. `FirstToScore { threshold: 0.8 }`) or document "Picker is required" and panic/assert if missing.
 
 **Verification**:
 - Build and test pass. In-game, pawns should not visibly flicker between eat/drink/rest every frame when two drives are close.
@@ -170,12 +204,12 @@ Execute sub-phases in order. Each checkbox is a concrete task an AI agent can co
 
 **Checkboxes**:
 
-- [ ] **4.4.1** Add a component `KnownRecipes` (e.g. `pub recipes: std::collections::HashSet<String>` or a newtype `RecipeId`). Add to pawns in `bin/src/simrard.rs` at spawn. Initially empty or with one starter recipe.
-- [ ] **4.4.2** Define at least one "recipe" that can be discovered (e.g. "Fire" or "Cook"). In `run_curiosity_step` (or a dedicated `discovery_system`), when a pawn's curiosity is above a threshold and the pawn is on a chunk that has certain resources (e.g. food + rest spot), with some probability or deterministically add "Fire" to that pawn's `KnownRecipes`. Log to ActivityLog: "Pawn X discovered Fire."
-- [ ] **4.4.3** Teaching: when pawn A has discovered a recipe and pawn B does not, and A and B are on the same chunk (or within 1 chunk), and social drive is high, emit a causal event `DiscoveryPropagated { recipe, from: A, to: B }` with `deliver_at = current_seq + propagation_delay(A.chunk, B.chunk, C)`. In the dispatcher (or a new handler), when this event is ready, add the recipe to B's `KnownRecipes`. Log: "Pawn B learned Fire from Pawn A."
-- [ ] **4.4.4** Add `CausalEventKind::DiscoveryPropagated { recipe: String, from: Entity, to: Entity }` in `lib/causal/causal.rs`. Extend `pawn_event_dispatcher_step` (or a separate system that reads the queue) to handle it and update `KnownRecipes` for the `to` entity.
+- [x] **4.4.1** Add a component `KnownRecipes` (e.g. `pub recipes: std::collections::HashSet<String>` or a newtype `RecipeId`). Add to pawns in `bin/src/simrard.rs` at spawn. Initially empty or with one starter recipe.
+- [x] **4.4.2** Define at least one "recipe" that can be discovered (e.g. "Fire" or "Cook"). In `run_curiosity_step` (or a dedicated `discovery_system`), when a pawn's curiosity is above a threshold and the pawn is on a chunk that has certain resources (e.g. food + rest spot), with some probability or deterministically add "Fire" to that pawn's `KnownRecipes`. Log to ActivityLog: "Pawn X discovered Fire."
+- [x] **4.4.3** Teaching: when pawn A has discovered a recipe and pawn B does not, and A and B are on the same chunk (or within 1 chunk), and social drive is high, emit a causal event `DiscoveryPropagated { recipe, from: A, to: B }` with `deliver_at = current_seq + propagation_delay(A.chunk, B.chunk, C)`. In the dispatcher (or a new handler), when this event is ready, add the recipe to B's `KnownRecipes`. Log: "Pawn B learned Fire from Pawn A."
+- [x] **4.4.4** Add `CausalEventKind::DiscoveryPropagated { recipe: String, from: Entity, to: Entity }` in `lib/causal/causal.rs`. Extend `pawn_event_dispatcher_step` (or a separate system that reads the queue) to handle it and update `KnownRecipes` for the `to` entity.
 - [ ] **4.4.5** Zone formation: optional. If "Fire" is known, a pawn could post a quest or place a "campfire zone" marker. Defer to a single checkbox: "If time permits, add a placeholder Zone or Quest type for 'build campfire' when a pawn knows Fire; otherwise leave a TODO."
-- [ ] **4.4.6** Expose discovery in UI: in the activity feed, show "X discovered Y" and "X learned Y from Z". Optionally show per-pawn known recipes in a debug panel.
+- [x] **4.4.6** Expose discovery in UI: in the activity feed, show "X discovered Y" and "X learned Y from Z". Optionally show per-pawn known recipes in a debug panel.
 
 **Verification**:
 - Build and test pass. Over a long run, at least one pawn discovers the recipe and at least one other pawn can learn it via proximity (teaching event).
@@ -195,10 +229,10 @@ Execute sub-phases in order. Each checkbox is a concrete task an AI agent can co
 
 **Checkboxes**:
 
-- [ ] **4.5.1** Show resource levels on food/water entities: if `FoodReservation` or `WaterSource` has `portions`, render a small text label above the sprite (e.g. "3") or a bar. Use Bevy UI or `Text2d`/gizmo; keep it minimal.
+- [x] **4.5.1** Show resource levels on food/water entities: if `FoodReservation` or `WaterSource` has `portions`, render a small text label above the sprite (e.g. "3") or a bar. Use Bevy UI or `Text2d`/gizmo; keep it minimal.
 - [ ] **4.5.2** Optionally show pawn name or a compact ID on hover or as a small label (configurable or behind a debug flag) so that activity log lines can be matched to on-screen pawns.
-- [ ] **4.5.3** Camera: add simple pan (e.g. arrow keys or middle-drag) and optional zoom so large grids are navigable. If not already present, ensure the camera covers the chunk grid (0..=11) by default.
-- [ ] **4.5.4** Speed and pause keys: already R / [ ] / P. Ensure the UI panel text reflects current keys and shows speed with 2 decimal places or integer when large. No functional change if already done.
+- [x] **4.5.3** Camera: add simple pan (e.g. arrow keys or middle-drag) and optional zoom so large grids are navigable. If not already present, ensure the camera covers the chunk grid (0..=11) by default.
+- [x] **4.5.4** Speed and pause keys: already R / [ ] / P. Ensure the UI panel text reflects current keys and shows speed with 2 decimal places or integer when large. No functional change if already done.
 - [ ] **4.5.5** Optional: brief movement trail (e.g. last 3–5 chunk positions as dim dots) for one "selected" pawn to make pathfinding visible. Defer if time-constrained with a TODO.
 
 **Verification**:
@@ -220,10 +254,10 @@ Execute sub-phases in order. Each checkbox is a concrete task an AI agent can co
 
 **Checkboxes**:
 
-- [ ] **4.6.1** Create a minimal SimLife model: e.g. a 2D grid of "biome" or "population" counts (grass, prey, predator). No need for full ecology; just a placeholder that updates each sim tick (e.g. grass += 1 every 10 ticks in some chunks, capped). Document: "SimLife placeholder: provides pressure signals for surface layer."
-- [ ] **4.6.2** Expose a read-only view: e.g. a resource `SimLifeState { grass_per_chunk: HashMap<ChunkId, u32> }` or similar that the surface simulation can query. Surface logic: e.g. "food regeneration rate in a chunk is proportional to SimLife grass there." Wire one surface mechanic to SimLife (e.g. food regen in `lib/pawn` or `lib/ai` reads `SimLifeState`).
-- [ ] **4.6.3** Run SimLife step in the same sim tick (e.g. after heartbeat, before or after dispatcher). Ensure causal ordering is documented (SimLife runs at current_seq, surface reads it in the same tick).
-- [ ] **4.6.4** Add a test that SimLife state advances (e.g. grass increases over ticks) and that surface food regen (if wired) is non-zero when grass > 0.
+- [x] **4.6.1** Create a minimal SimLife model: e.g. a 2D grid of "biome" or "population" counts (grass, prey, predator). No need for full ecology; just a placeholder that updates each sim tick (e.g. grass += 1 every 10 ticks in some chunks, capped). Document: "SimLife placeholder: provides pressure signals for surface layer."
+- [x] **4.6.2** Expose a read-only view: e.g. a resource `SimLifeState { grass_per_chunk: HashMap<ChunkId, u32> }` or similar that the surface simulation can query. Surface logic: e.g. "food regeneration rate in a chunk is proportional to SimLife grass there." Wire one surface mechanic to SimLife (e.g. food regen in `lib/pawn` or `lib/ai` reads `SimLifeState`).
+- [x] **4.6.3** Run SimLife step in the same sim tick (e.g. after heartbeat, before or after dispatcher). Ensure causal ordering is documented (SimLife runs at current_seq, surface reads it in the same tick).
+- [x] **4.6.4** Add a test that SimLife state advances (e.g. grass increases over ticks) and that surface food regen (if wired) is non-zero when grass > 0.
 
 **Verification**:
 - Build and test pass. SimLife runs and at least one surface mechanic (e.g. food regen) depends on it.

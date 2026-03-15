@@ -1,0 +1,25 @@
+[package]
+name = "simrard-lib-mirror"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "simrard_lib_mirror"
+path = "mirror.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+duckdb = "1.10500.0"
+simrard-lib-charter = { path = "../charter" }
+simrard-lib-pawn = { path = "../pawn" }
+simrard-lib-time = { path = "../time" }
+
+[build-dependencies]
+# Used by build.rs to verify that system libduckdb is installed before any
+# DuckDB API is added in Phase 4.D2.  Never add duckdb with features =
+# ["bundled"] — that recompiles all of DuckDB from C++ on every clean build.
+pkg-config = "0.3"

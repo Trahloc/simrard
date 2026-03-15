@@ -1,10 +1,8 @@
 use bevy::prelude::*;
-use simrard_lib_pawn::{
-    NeuralNetworkComponent, Position, SimulationLogSettings, SimulationReport,
-};
+use simrard_lib_pawn::{NeuralNetworkComponent, Position, SimulationLogSettings, SimulationReport};
 use simrard_lib_time::{CausalClock, GlobalTickClock};
 
-use crate::{CausalEventKind, CausalEventQueue, DriveType, propagation_delay};
+use crate::{propagation_delay, CausalEventKind, CausalEventQueue, DriveType};
 
 /// Threshold below which a drive fires a DriveThresholdCrossed event.
 const HUNGER_THRESHOLD: f32 = 0.2;
@@ -48,7 +46,10 @@ pub fn drive_decay_heartbeat_pulse(
             }
             let deliver_at = current_seq + propagation_delay(&position.chunk, &position.chunk, C);
             event_queue.push_at(
-                CausalEventKind::DriveThresholdCrossed { entity, drive: DriveType::Hunger },
+                CausalEventKind::DriveThresholdCrossed {
+                    entity,
+                    drive: DriveType::Hunger,
+                },
                 position.chunk,
                 deliver_at,
             );
@@ -70,7 +71,10 @@ pub fn drive_decay_heartbeat_pulse(
             }
             let deliver_at = current_seq + propagation_delay(&position.chunk, &position.chunk, C);
             event_queue.push_at(
-                CausalEventKind::DriveThresholdCrossed { entity, drive: DriveType::Thirst },
+                CausalEventKind::DriveThresholdCrossed {
+                    entity,
+                    drive: DriveType::Thirst,
+                },
                 position.chunk,
                 deliver_at,
             );
@@ -92,7 +96,10 @@ pub fn drive_decay_heartbeat_pulse(
             }
             let deliver_at = current_seq + propagation_delay(&position.chunk, &position.chunk, C);
             event_queue.push_at(
-                CausalEventKind::DriveThresholdCrossed { entity, drive: DriveType::Fatigue },
+                CausalEventKind::DriveThresholdCrossed {
+                    entity,
+                    drive: DriveType::Fatigue,
+                },
                 position.chunk,
                 deliver_at,
             );
