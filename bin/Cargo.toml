@@ -20,3 +20,4 @@ simrard-lib-pawn = { path = "../lib/pawn" }
 simrard-lib-time = { path = "../lib/time" }
 simrard-lib-transforms = { path = "../lib/transforms" }
 simrard-lib-mirror = { path = "../lib/mirror" }
+simrard-lib-hypergraph = { path = "../lib/hypergraph" }

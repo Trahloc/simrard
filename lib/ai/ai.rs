@@ -9,12 +9,14 @@ use simrard_lib_charter::{
 };
 use simrard_lib_pawn::{
     ActiveLeaseHandle, Capabilities, FoodReservation, ItemHistory, MovementTarget,
-    KnownRecipes, NeuralNetworkComponent, Position, Quest, QuestBoard, QuestStatus,
-    RestSpot, SimulationLogSettings, SimulationReport, WaterSource, WORLD_CHUNK_EXTENT,
+    KnownRecipes, MortalityCause, NeuralNetworkComponent, PawnDeathRecord, Position, Quest,
+    QuestBoard, QuestStatus, RestSpot, SimulationLogSettings, SimulationReport, WaterSource,
+    WORLD_CHUNK_EXTENT,
 };
 use simrard_lib_time::{CausalClock, GlobalTickClock};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 fn stdout_enabled(settings: Option<&SimulationLogSettings>) -> bool {
     settings.map(|settings| settings.stdout_enabled).unwrap_or(true)
@@ -93,35 +95,93 @@ impl Plugin for PawnAIPlugin {
 /// Death is failure: pawns must move to food/water or they die.
 pub fn pawn_death_system(
     mut commands: Commands,
-    query: Query<(Entity, &Name, &NeuralNetworkComponent)>,
+    query: Query<(Entity, &Name, &Position, &NeuralNetworkComponent)>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut quest_board: Option<ResMut<QuestBoard>>,
     global_clock: Option<Res<GlobalTickClock>>,
     mut report: Option<ResMut<SimulationReport>>,
 ) {
-    let to_despawn: Vec<(Entity, String)> = query
+    let to_despawn: Vec<(Entity, String, ChunkId, NeuralNetworkComponent)> = query
         .iter()
-        .filter(|(_, _, nn)| nn.hunger <= 0.0 || nn.thirst <= 0.0)
-        .map(|(e, name, _)| (e, format!("{}", name)))
+        .filter(|(_, _, _, nn)| nn.hunger <= 0.0 || nn.thirst <= 0.0)
+        .map(|(e, name, pos, nn)| (e, format!("{}", name), pos.chunk, nn.clone()))
         .collect();
-    let dead: std::collections::HashSet<_> = to_despawn.iter().map(|(e, _)| *e).collect();
+    let dead: std::collections::HashSet<_> = to_despawn.iter().map(|(e, _, _, _)| *e).collect();
     if let Some(ref mut board) = quest_board {
         board.active_quests.retain(|q| !dead.contains(&q.requester));
     }
-    for (entity, name) in to_despawn {
+    for (entity, name, chunk, nn) in to_despawn {
+        let (cause, primary_drive) = classify_mortality(&nn);
         if let Some(ref mut log) = activity {
             log.push(format!("{} died (hunger/thirst zero)", name));
         }
         if let Some(ref mut report) = report {
             report.bump("pawn_deaths");
+            match cause {
+                MortalityCause::Hunger => report.bump("deaths_hunger"),
+                MortalityCause::Thirst => report.bump("deaths_thirst"),
+                MortalityCause::Other => report.bump("deaths_other"),
+            }
             let tick = global_clock
                 .as_deref()
                 .map(CausalClock::causal_seq)
                 .unwrap_or_default();
-            report.note(format!("tick {}: {} died", tick, name));
+            report.record_death(PawnDeathRecord {
+                tick,
+                pawn_name: name.clone(),
+                cause,
+                primary_drive,
+                hunger: nn.hunger,
+                thirst: nn.thirst,
+                fatigue: nn.fatigue,
+                curiosity: nn.curiosity,
+                social: nn.social,
+                fear: nn.fear,
+                industriousness: nn.industriousness,
+                comfort: nn.comfort,
+                chunk,
+            });
+            report.note(format!(
+                "tick {}: {} died cause={:?} primary={} @ {:?}",
+                tick, name, cause, primary_drive, chunk
+            ));
         }
         commands.entity(entity).despawn();
     }
+}
+
+fn classify_mortality(nn: &NeuralNetworkComponent) -> (MortalityCause, &'static str) {
+    let drives = [
+        ("hunger", nn.hunger),
+        ("thirst", nn.thirst),
+        ("fatigue", nn.fatigue),
+        ("curiosity", nn.curiosity),
+        ("social", nn.social),
+        ("fear", nn.fear),
+        ("industriousness", nn.industriousness),
+        ("comfort", nn.comfort),
+    ];
+    let primary_drive = drives
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).expect("drive values must be finite"))
+        .map(|(name, _)| *name)
+        .expect("drive vector must not be empty");
+
+    let cause = if nn.hunger <= 0.0 && nn.thirst <= 0.0 {
+        if nn.hunger <= nn.thirst {
+            MortalityCause::Hunger
+        } else {
+            MortalityCause::Thirst
+        }
+    } else if nn.hunger <= 0.0 {
+        MortalityCause::Hunger
+    } else if nn.thirst <= 0.0 {
+        MortalityCause::Thirst
+    } else {
+        MortalityCause::Other
+    };
+
+    (cause, primary_drive)
 }
 
 /// One dispatcher step: drain events ready at `current_seq` and apply them.
@@ -137,9 +197,16 @@ pub fn pawn_event_dispatcher_step(
     mut report: Option<&mut SimulationReport>,
     stdout_enabled: bool,
 ) {
+    let collect_started = Instant::now();
     let ready_events = event_queue.drain_ready(current_seq);
+    let collect_elapsed = collect_started.elapsed();
+
+    let mut drive_updates_us: u64 = 0;
+    let mut lease_request_path_us: u64 = 0;
+    let mut other_event_us: u64 = 0;
 
     for event in ready_events {
+        let event_started = Instant::now();
         match event.kind {
             CausalEventKind::DriveThresholdCrossed { entity, drive } => {
                 if let Ok((e, name, position, mut nn)) = pawn_query.get_mut(entity) {
@@ -174,6 +241,7 @@ pub fn pawn_event_dispatcher_step(
                         );
                     }
                 }
+                drive_updates_us += event_started.elapsed().as_micros() as u64;
             }
             CausalEventKind::LeaseReleased { chunk, .. } => {
                 if let Some(ref mut log) = activity {
@@ -185,6 +253,7 @@ pub fn pawn_event_dispatcher_step(
                 if stdout_enabled {
                     eprintln!("[dispatcher:{}] LeaseReleased on chunk({:?})", current_seq, chunk);
                 }
+                lease_request_path_us += event_started.elapsed().as_micros() as u64;
             }
             CausalEventKind::ResourceDepleted { chunk } => {
                 if let Some(ref mut log) = activity {
@@ -196,6 +265,7 @@ pub fn pawn_event_dispatcher_step(
                 if stdout_enabled {
                     eprintln!("[dispatcher:{}] ResourceDepleted at chunk({:?})", current_seq, chunk);
                 }
+                other_event_us += event_started.elapsed().as_micros() as u64;
             }
             CausalEventKind::DiscoveryPropagated { recipe, from, to } => {
                 if let Ok(mut known) = known_recipes_query.get_mut(to) {
@@ -214,19 +284,34 @@ pub fn pawn_event_dispatcher_step(
                         }
                     }
                 }
+                other_event_us += event_started.elapsed().as_micros() as u64;
             }
         }
     }
 
+    let action_started = Instant::now();
     quest_acceptance_step(
         current_seq,
         quest_board,
         pawn_query,
         capabilities_query,
         activity,
-        report,
+        report.as_deref_mut(),
         stdout_enabled,
     );
+    let action_elapsed = action_started.elapsed();
+
+    if let Some(report) = report.as_deref_mut() {
+        report.bump("dispatcher_phase_samples");
+        report.add_counter(
+            "dispatcher_event_collection_us",
+            collect_elapsed.as_micros() as u64,
+        );
+        report.add_counter("dispatcher_drive_updates_us", drive_updates_us);
+        report.add_counter("dispatcher_lease_requests_us", lease_request_path_us);
+        report.add_counter("dispatcher_action_resolution_us", action_elapsed.as_micros() as u64);
+        report.add_counter("dispatcher_other_event_us", other_event_us);
+    }
 }
 
 fn need_capability_and_drive(need: &str, nn: &NeuralNetworkComponent) -> Option<(&'static str, f32)> {
