@@ -54,6 +54,54 @@ struct VisualDebug {
     enabled: bool,
 }
 
+fn live_stats_overlay_system(
+    mut commands: Commands,
+    tier4: Res<Tier4State>,
+    simlife: Res<SimLifeState>,
+    thermal: Res<ThermalState>,
+    global_clock: Res<GlobalTickClock>,
+    time: Res<Time>,
+    existing: Query<Entity, With<LiveStatsOverlay>>,
+    mut last_update: Local<f32>,
+) {
+    // Update once per second to avoid excessive text updates
+    *last_update += time.delta_secs();
+    if *last_update < 1.0 {
+        return;
+    }
+    *last_update = 0.0;
+
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    let stats_font = TextFont { font_size: 120.0, ..default() };
+    let stats_color = TextColor(Color::srgba(0.92, 0.94, 0.98, 0.88));
+
+    let insect_count = tier4.insects.len();
+    let gs_active = simlife.gs_active.len();
+    let peak_temp = thermal
+        .local_temperature_by_chunk
+        .values()
+        .copied()
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(thermal.sink_temperature_k);
+    let tick = global_clock.causal_seq();
+
+    let stats_text = format!(
+        "Insects: {}  GS: {}  Peak: {:.1}K  Ticks: {}",
+        insect_count, gs_active, peak_temp, tick
+    );
+
+    commands.spawn((
+        LiveStatsOverlay,
+        Text2d::new(stats_text),
+        stats_font,
+        stats_color,
+        Transform::from_translation(Vec3::new(-4900.0, 4900.0, 10.0)),
+    ));
+}
+
 #[derive(Resource, Default)]
 struct VisualDebugThermalCache {
     prev_temp_by_chunk: HashMap<ChunkId, f32>,
@@ -244,6 +292,7 @@ fn run_interactive() {
                 visual_debug_gs_overlay_system,
                 visual_debug_thermal_overlay_system,
                 visual_debug_hypergraph_overlay_system,
+                live_stats_overlay_system,
             )
                 .chain(),
         );
@@ -1730,11 +1779,11 @@ fn chunk_grid_gizmo_system(
         let p = i as f32 * CHUNK_PIXEL;
         let major = i % 32 == 0;
         let color = if major {
-            Color::srgba(0.40, 0.45, 0.58, 0.80)
+            Color::srgba(0.42, 0.48, 0.62, 0.85)
         } else if i % 8 == 0 {
-            Color::srgba(0.34, 0.38, 0.48, 0.65)
+            Color::srgba(0.36, 0.40, 0.52, 0.72)
         } else {
-            Color::srgba(0.26, 0.28, 0.34, 0.45)
+            Color::srgba(0.30, 0.32, 0.40, 0.65)
         };
         gizmos.line_2d(Vec2::new(p, vis_min_y), Vec2::new(p, vis_max_y), color);
     }
@@ -1742,11 +1791,11 @@ fn chunk_grid_gizmo_system(
         let p = j as f32 * CHUNK_PIXEL;
         let major = j % 32 == 0;
         let color = if major {
-            Color::srgba(0.40, 0.45, 0.58, 0.80)
+            Color::srgba(0.42, 0.48, 0.62, 0.85)
         } else if j % 8 == 0 {
-            Color::srgba(0.34, 0.38, 0.48, 0.65)
+            Color::srgba(0.36, 0.40, 0.52, 0.72)
         } else {
-            Color::srgba(0.26, 0.28, 0.34, 0.45)
+            Color::srgba(0.30, 0.32, 0.40, 0.65)
         };
         gizmos.line_2d(Vec2::new(vis_min_x, p), Vec2::new(vis_max_x, p), color);
     }
@@ -1760,6 +1809,9 @@ struct VisualDebugGsSprite;
 
 #[derive(Component)]
 struct VisualDebugThermalSprite;
+
+#[derive(Component)]
+struct LiveStatsOverlay;
 
 const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 200;
 const VISUAL_DEBUG_MAX_GS_SPRITES: usize = 30;
