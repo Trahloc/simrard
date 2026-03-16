@@ -312,9 +312,13 @@ fn advance_simulation_one_tick(
     event_queue: &mut CausalEventQueue,
     quest_board: &mut QuestBoard,
     activity: &mut ActivityLog,
+    evaluation_state: &mut ai::DispatcherEvaluationState,
     pawn_query: &mut Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
     capabilities_query: &Query<&Capabilities>,
     known_recipes_query: &mut Query<&mut KnownRecipes>,
+    food_query: &Query<(&Position, &FoodReservation)>,
+    water_query: &Query<(&Position, &WaterSource)>,
+    hypergraph: &HypergraphSubstrate,
     report: Option<&mut SimulationReport>,
     stdout_enabled: bool,
 ) {
@@ -334,6 +338,35 @@ fn advance_simulation_one_tick(
     );
     perf_record("heartbeat_decay", heartbeat_started.elapsed());
 
+    let mut region_signatures: HashMap<Entity, u64> = HashMap::new();
+    for (entity, _, position, _) in pawn_query.iter_mut() {
+        let food_sum: u64 = food_query
+            .iter()
+            .filter(|(food_pos, _)| food_pos.chunk == position.chunk)
+            .map(|(_, food)| food.portions as u64)
+            .sum();
+        let water_sum: u64 = water_query
+            .iter()
+            .filter(|(water_pos, _)| water_pos.chunk == position.chunk)
+            .map(|(_, water)| water.portions as u64)
+            .sum();
+        let (clustering_q, causal_q) = match hypergraph.output_for_chunk(position.chunk.0, position.chunk.1) {
+            Some(output) => (
+                (output.clustering.clamp(0.0, 1.0) * 1024.0).round() as u64,
+                (output.causal_volume.clamp(0.0, 1.0) * 1024.0).round() as u64,
+            ),
+            None => (0, 0),
+        };
+
+        let signature = (position.chunk.0 as u64)
+            | ((position.chunk.1 as u64) << 10)
+            | ((food_sum & 0x3ff) << 20)
+            | ((water_sum & 0x3ff) << 30)
+            | ((clustering_q & 0x7ff) << 40)
+            | ((causal_q & 0x1fff) << 51);
+        region_signatures.insert(entity, signature);
+    }
+
     let dispatch_started = Instant::now();
     ai::pawn_event_dispatcher_step(
         seq,
@@ -342,8 +375,10 @@ fn advance_simulation_one_tick(
         pawn_query,
         capabilities_query,
         known_recipes_query,
+        &region_signatures,
         Some(activity),
         report.as_deref_mut(),
+        evaluation_state,
         stdout_enabled,
     );
     perf_record("pawn_event_dispatcher", dispatch_started.elapsed());
@@ -360,9 +395,13 @@ fn headless_tick_driver(
     mut event_queue: ResMut<CausalEventQueue>,
     mut quest_board: ResMut<QuestBoard>,
     mut activity: ResMut<ActivityLog>,
+    mut evaluation_state: ResMut<ai::DispatcherEvaluationState>,
     mut pawn_query: Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
     capabilities_query: Query<&Capabilities>,
     mut known_recipes_query: Query<&mut KnownRecipes>,
+    food_query: Query<(&Position, &FoodReservation)>,
+    water_query: Query<(&Position, &WaterSource)>,
+    hypergraph: Res<HypergraphSubstrate>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
 ) {
@@ -372,9 +411,13 @@ fn headless_tick_driver(
         &mut event_queue,
         &mut quest_board,
         &mut activity,
+        &mut evaluation_state,
         &mut pawn_query,
         &capabilities_query,
         &mut known_recipes_query,
+        &food_query,
+        &water_query,
+        &hypergraph,
         report.as_deref_mut(),
         log_settings
             .as_deref()
@@ -578,25 +621,25 @@ fn build_headless_report(
         Some(value) => *value,
         None => 0,
     };
-    let action_resolution_us = match report.counters.get("dispatcher_action_resolution_us") {
+    let score_calc_us = match report.counters.get("dispatcher_score_calc_us") {
         Some(value) => *value,
         None => 0,
     };
-    let drive_updates_us = match report.counters.get("dispatcher_drive_updates_us") {
+    let best_action_select_us = match report.counters.get("dispatcher_best_action_select_us") {
         Some(value) => *value,
         None => 0,
     };
-    let other_event_us = match report.counters.get("dispatcher_other_event_us") {
+    let action_execute_us = match report.counters.get("dispatcher_action_execute_us") {
         Some(value) => *value,
         None => 0,
     };
 
     let mut dispatcher_phases: Vec<(&str, u64)> = vec![
         ("event collection", event_collection_us),
+        ("utility score calculation", score_calc_us),
+        ("best-action selection", best_action_select_us),
+        ("action execution/effect", action_execute_us),
         ("lease requests", lease_requests_us),
-        ("action resolution", action_resolution_us),
-        ("drive updates", drive_updates_us),
-        ("other event handling", other_event_us),
     ];
     dispatcher_phases.retain(|(_, us)| *us > 0);
     if !dispatcher_phases.is_empty() {
@@ -1759,6 +1802,7 @@ fn resource_respawn_system(
     mut state: ResMut<RespawnState>,
     mut commands: Commands,
     mut allocator: ResMut<ItemIdAllocator>,
+    mut evaluation_state: ResMut<ai::DispatcherEvaluationState>,
     simlife: Res<SimLifeState>,
     food_query: Query<&Position, With<FoodReservation>>,
     water_query: Query<&Position, With<WaterSource>>,
@@ -1787,6 +1831,8 @@ fn resource_respawn_system(
         None
     };
 
+    let mut region_changed = false;
+
     if let Some(chunk) = food_chunk {
         let id = allocator.alloc();
         let grass = *simlife.grass_per_chunk.get(&chunk).unwrap_or(&0);
@@ -1800,6 +1846,7 @@ fn resource_respawn_system(
             Transform::from_translation(chunk_to_translation(&chunk, 0.0)),
             Name::new("Food_respawn"),
         ));
+        region_changed = true;
     }
 
     if need_water {
@@ -1824,7 +1871,12 @@ fn resource_respawn_system(
                 Transform::from_translation(chunk_to_translation(&chunk, 0.0)),
                 Name::new("Water_respawn"),
             ));
+            region_changed = true;
         }
+    }
+    if region_changed {
+        // Charter-region change trigger (food/water topology changed).
+        evaluation_state.mark_all_dirty();
     }
     perf_record("resource_respawn", started.elapsed());
 }
@@ -1837,9 +1889,13 @@ fn sim_tick_driver(
     mut event_queue: ResMut<CausalEventQueue>,
     mut quest_board: ResMut<QuestBoard>,
     mut activity: ResMut<ActivityLog>,
+    mut evaluation_state: ResMut<ai::DispatcherEvaluationState>,
     mut pawn_query: Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
     capabilities_query: Query<&Capabilities>,
     mut known_recipes_query: Query<&mut KnownRecipes>,
+    food_query: Query<(&Position, &FoodReservation)>,
+    water_query: Query<(&Position, &WaterSource)>,
+    hypergraph: Res<HypergraphSubstrate>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
 ) {
@@ -1854,9 +1910,13 @@ fn sim_tick_driver(
             &mut event_queue,
             &mut quest_board,
             &mut activity,
+            &mut evaluation_state,
             &mut pawn_query,
             &capabilities_query,
             &mut known_recipes_query,
+            &food_query,
+            &water_query,
+            &hypergraph,
             report.as_deref_mut(),
             stdout_enabled,
         );
