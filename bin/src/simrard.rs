@@ -1692,54 +1692,63 @@ fn chunk_grid_gizmo_system(
 
     let half_w = 640.0 * ortho.scale;
     let half_h = 360.0 * ortho.scale;
-    let viewport_min_x = transform.translation.x - half_w - CHUNK_PIXEL;
-    let viewport_max_x = transform.translation.x + half_w + CHUNK_PIXEL;
-    let viewport_min_y = transform.translation.y - half_h - CHUNK_PIXEL;
-    let viewport_max_y = transform.translation.y + half_h + CHUNK_PIXEL;
+    let viewport_min_x = transform.translation.x - half_w;
+    let viewport_max_x = transform.translation.x + half_w;
+    let viewport_min_y = transform.translation.y - half_h;
+    let viewport_max_y = transform.translation.y + half_h;
 
-    // Always render grid from 0 to 256 chunks (world bounds)
-    let world_min_x = 0.0;
+    // World runs from 0 to 256*CHUNK_PIXEL on each axis
+    let world_min_x = 0.0_f32;
     let world_max_x = 256.0 * CHUNK_PIXEL;
-    let world_min_y = 0.0;
+    let world_min_y = 0.0_f32;
     let world_max_y = 256.0 * CHUNK_PIXEL;
 
-    // Clamp viewport to world bounds for line endpoints
-    let min_x = viewport_min_x.max(world_min_x);
-    let max_x = viewport_max_x.min(world_max_x);
-    let min_y = viewport_min_y.max(world_min_y);
-    let max_y = viewport_max_y.min(world_max_y);
+    // Visible region clamped to world bounds
+    let vis_min_x = viewport_min_x.max(world_min_x);
+    let vis_max_x = viewport_max_x.min(world_max_x);
+    let vis_min_y = viewport_min_y.max(world_min_y);
+    let vis_max_y = viewport_max_y.min(world_max_y);
 
-    // Always render all grid lines from 0 to 256 (but skip if not visible)
-    let start_i = 0;
-    let end_i = 256;
-    let start_j = 0;
-    let end_j = 256;
+    if vis_min_x >= vis_max_x || vis_min_y >= vis_max_y {
+        return; // world not in viewport
+    }
+
+    // Draw world boundary as a bright outline
+    let border_color = Color::srgba(0.55, 0.65, 0.80, 0.90);
+    gizmos.line_2d(Vec2::new(world_min_x, world_min_y), Vec2::new(world_max_x, world_min_y), border_color);
+    gizmos.line_2d(Vec2::new(world_max_x, world_min_y), Vec2::new(world_max_x, world_max_y), border_color);
+    gizmos.line_2d(Vec2::new(world_max_x, world_max_y), Vec2::new(world_min_x, world_max_y), border_color);
+    gizmos.line_2d(Vec2::new(world_min_x, world_max_y), Vec2::new(world_min_x, world_min_y), border_color);
+
+    // Draw interior grid lines only where visible and within world bounds
+    let start_i = ((vis_min_x / CHUNK_PIXEL).floor() as i32).max(0);
+    let end_i = ((vis_max_x / CHUNK_PIXEL).ceil() as i32).min(256);
+    let start_j = ((vis_min_y / CHUNK_PIXEL).floor() as i32).max(0);
+    let end_j = ((vis_max_y / CHUNK_PIXEL).ceil() as i32).min(256);
 
     for i in start_i..=end_i {
         let p = i as f32 * CHUNK_PIXEL;
-        // Only render if within viewport bounds
-        if p >= viewport_min_x && p <= viewport_max_x {
-            let major = i % 8 == 0;
-            let color = if major {
-                Color::srgba(0.36, 0.40, 0.50, 0.72)
-            } else {
-                Color::srgba(0.28, 0.30, 0.36, 0.56)
-            };
-            gizmos.line_2d(Vec2::new(p, min_y), Vec2::new(p, max_y), color);
-        }
+        let major = i % 32 == 0;
+        let color = if major {
+            Color::srgba(0.40, 0.45, 0.58, 0.80)
+        } else if i % 8 == 0 {
+            Color::srgba(0.34, 0.38, 0.48, 0.65)
+        } else {
+            Color::srgba(0.26, 0.28, 0.34, 0.45)
+        };
+        gizmos.line_2d(Vec2::new(p, vis_min_y), Vec2::new(p, vis_max_y), color);
     }
     for j in start_j..=end_j {
         let p = j as f32 * CHUNK_PIXEL;
-        // Only render if within viewport bounds
-        if p >= viewport_min_y && p <= viewport_max_y {
-            let major = j % 8 == 0;
-            let color = if major {
-                Color::srgba(0.36, 0.40, 0.50, 0.72)
-            } else {
-                Color::srgba(0.28, 0.30, 0.36, 0.56)
-            };
-            gizmos.line_2d(Vec2::new(min_x, p), Vec2::new(max_x, p), color);
-        }
+        let major = j % 32 == 0;
+        let color = if major {
+            Color::srgba(0.40, 0.45, 0.58, 0.80)
+        } else if j % 8 == 0 {
+            Color::srgba(0.34, 0.38, 0.48, 0.65)
+        } else {
+            Color::srgba(0.26, 0.28, 0.34, 0.45)
+        };
+        gizmos.line_2d(Vec2::new(vis_min_x, p), Vec2::new(vis_max_x, p), color);
     }
 }
 
@@ -2432,10 +2441,12 @@ const RESOURCE_BAR_HEIGHT: f32 = 3.0;
 const RESOURCE_BAR_MAX_WIDTH: f32 = 18.0;
 const RESOURCE_BAR_Y_OFFSET: f32 = 13.0;
 const RESOURCE_BAR_MAX_PORTIONS: f32 = 8.0;
-const CAMERA_PAN_SPEED: f32 = 500.0;
-const CAMERA_MIN_ZOOM: f32 = 0.4;
-const CAMERA_MAX_ZOOM: f32 = 4.0;
+const CAMERA_PAN_SPEED: f32 = 4000.0;
+const CAMERA_MIN_ZOOM: f32 = 0.25;
+const CAMERA_MAX_ZOOM: f32 = 20.0;
 const CAMERA_ZOOM_STEP: f32 = 0.12;
+// Initial camera scale to show the full 256x256 world (~10240 px) in window
+const CAMERA_INITIAL_SCALE: f32 = 10.0;
 #[cfg(debug_assertions)]
 const HYPERGRAPH_DEBUG_CHAOS_STEP: f32 = 0.05;
 const HYPERGRAPH_NOISE_FLOOR_MULTIPLIER: f32 = 0.25;
@@ -2530,7 +2541,38 @@ fn camera_pan_zoom_input(
 }
 
 fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
-    commands.spawn(Camera2d);
+    // Center camera on world and zoom to show full 256x256 extent
+    let world_cx = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
+    let world_cy = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
+    commands.spawn((
+        Camera2d,
+        Transform::from_xyz(world_cx, world_cy, 999.9),
+        Projection::Orthographic(OrthographicProjection {
+            scale: CAMERA_INITIAL_SCALE,
+            ..OrthographicProjection::default_2d()
+        }),
+    ));
+
+    // Axis coordinate labels every 32 chunks
+    let axis_font = TextFont { font_size: 280.0, ..default() };
+    let axis_color = TextColor(Color::srgba(0.72, 0.78, 0.92, 0.68));
+    for ci in (0u32..=256).step_by(32) {
+        let wx = ci as f32 * CHUNK_PIXEL;
+        // X-axis labels below grid
+        commands.spawn((
+            Text2d::new(format!("{}", ci)),
+            axis_font.clone(),
+            axis_color,
+            Transform::from_translation(Vec3::new(wx, -280.0, 5.0)),
+        ));
+        // Y-axis labels left of grid
+        commands.spawn((
+            Text2d::new(format!("{}", ci)),
+            axis_font.clone(),
+            axis_color,
+            Transform::from_translation(Vec3::new(-280.0, ci as f32 * CHUNK_PIXEL, 5.0)),
+        ));
+    }
 
     // Food and water never share a chunk. Cluster A: food at (0,0), water at (1,0).
     // Enough portions per cluster so 10 pawns can eat/drink and sustain 10k ticks with respawn.
