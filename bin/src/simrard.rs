@@ -1692,35 +1692,54 @@ fn chunk_grid_gizmo_system(
 
     let half_w = 640.0 * ortho.scale;
     let half_h = 360.0 * ortho.scale;
-    let min_x = transform.translation.x - half_w - CHUNK_PIXEL;
-    let max_x = transform.translation.x + half_w + CHUNK_PIXEL;
-    let min_y = transform.translation.y - half_h - CHUNK_PIXEL;
-    let max_y = transform.translation.y + half_h + CHUNK_PIXEL;
+    let viewport_min_x = transform.translation.x - half_w - CHUNK_PIXEL;
+    let viewport_max_x = transform.translation.x + half_w + CHUNK_PIXEL;
+    let viewport_min_y = transform.translation.y - half_h - CHUNK_PIXEL;
+    let viewport_max_y = transform.translation.y + half_h + CHUNK_PIXEL;
 
-    let start_i = (min_x / CHUNK_PIXEL).floor() as i32;
-    let end_i = (max_x / CHUNK_PIXEL).ceil() as i32;
-    let start_j = (min_y / CHUNK_PIXEL).floor() as i32;
-    let end_j = (max_y / CHUNK_PIXEL).ceil() as i32;
+    // Always render grid from 0 to 256 chunks (world bounds)
+    let world_min_x = 0.0;
+    let world_max_x = 256.0 * CHUNK_PIXEL;
+    let world_min_y = 0.0;
+    let world_max_y = 256.0 * CHUNK_PIXEL;
+
+    // Clamp viewport to world bounds for line endpoints
+    let min_x = viewport_min_x.max(world_min_x);
+    let max_x = viewport_max_x.min(world_max_x);
+    let min_y = viewport_min_y.max(world_min_y);
+    let max_y = viewport_max_y.min(world_max_y);
+
+    // Always render all grid lines from 0 to 256 (but skip if not visible)
+    let start_i = 0;
+    let end_i = 256;
+    let start_j = 0;
+    let end_j = 256;
 
     for i in start_i..=end_i {
         let p = i as f32 * CHUNK_PIXEL;
-        let major = i % 8 == 0;
-        let color = if major {
-            Color::srgba(0.36, 0.40, 0.50, 0.72)
-        } else {
-            Color::srgba(0.28, 0.30, 0.36, 0.56)
-        };
-        gizmos.line_2d(Vec2::new(p, min_y), Vec2::new(p, max_y), color);
+        // Only render if within viewport bounds
+        if p >= viewport_min_x && p <= viewport_max_x {
+            let major = i % 8 == 0;
+            let color = if major {
+                Color::srgba(0.36, 0.40, 0.50, 0.72)
+            } else {
+                Color::srgba(0.28, 0.30, 0.36, 0.56)
+            };
+            gizmos.line_2d(Vec2::new(p, min_y), Vec2::new(p, max_y), color);
+        }
     }
     for j in start_j..=end_j {
         let p = j as f32 * CHUNK_PIXEL;
-        let major = j % 8 == 0;
-        let color = if major {
-            Color::srgba(0.36, 0.40, 0.50, 0.72)
-        } else {
-            Color::srgba(0.28, 0.30, 0.36, 0.56)
-        };
-        gizmos.line_2d(Vec2::new(min_x, p), Vec2::new(max_x, p), color);
+        // Only render if within viewport bounds
+        if p >= viewport_min_y && p <= viewport_max_y {
+            let major = j % 8 == 0;
+            let color = if major {
+                Color::srgba(0.36, 0.40, 0.50, 0.72)
+            } else {
+                Color::srgba(0.28, 0.30, 0.36, 0.56)
+            };
+            gizmos.line_2d(Vec2::new(min_x, p), Vec2::new(max_x, p), color);
+        }
     }
 }
 
@@ -1798,6 +1817,7 @@ fn visual_debug_insect_overlay_system(
         let mut pos = chunk_to_translation(&insect.chunk, 3.2);
         pos.x += ((insect.age as f32).sin() * 0.35).clamp(-0.4, 0.4);
         pos.y += ((insect.age as f32 * 0.73).cos() * 0.35).clamp(-0.4, 0.4);
+        pos = clip_to_world_bounds(pos);
         let leg_wobble = 0.28 * (t * (6.0 + hunger * 4.0) + phase * 0.7).sin();
         let alpha = (0.82 + 0.14 * energy_norm + 0.06 * pulse).clamp(0.55, 1.0);
         commands.spawn((
@@ -1876,7 +1896,7 @@ fn visual_debug_gs_overlay_system(
         let w = (CHUNK_PIXEL - 1.2 + u * 0.6).max(1.0);
         let tilt = 0.12 * ny;
         let color = Color::srgba(r, g, b, alpha);
-        let pos = chunk_to_translation(&cell, 2.2);
+        let pos = clip_to_world_bounds(chunk_to_translation(&cell, 2.2));
         commands.spawn((
             VisualDebugGsSprite,
             Sprite::from_color(color, Vec2::new(w, h)),
@@ -1969,7 +1989,7 @@ fn visual_debug_thermal_overlay_system(
             1.0 - intensity * 0.95,
             alpha,
         );
-        let pos = chunk_to_translation(&chunk, 2.0);
+        let pos = clip_to_world_bounds(chunk_to_translation(&chunk, 2.0));
         commands.spawn((
             VisualDebugThermalSprite,
             Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 1.0 + pulse_boost * 4.0).max(1.0))),
@@ -2392,6 +2412,17 @@ fn ui_panel_update_system(
 
 /// Pixels per chunk for 2D display. Chunk (0,0) at origin; (10,10) at (400, 400).
 const CHUNK_PIXEL: f32 = 40.0;
+const WORLD_EXTENT_PIXELS: f32 = 256.0 * CHUNK_PIXEL; // 10240.0
+
+/// Clip a world position to the valid world bounds [0, WORLD_EXTENT_PIXELS]²
+fn clip_to_world_bounds(pos: Vec3) -> Vec3 {
+    Vec3::new(
+        pos.x.clamp(0.0, WORLD_EXTENT_PIXELS),
+        pos.y.clamp(0.0, WORLD_EXTENT_PIXELS),
+        pos.z,
+    )
+}
+
 /// Food = large orange so clearly distinct from water and pawns.
 const SPRITE_FOOD: f32 = 18.0;
 /// Water = medium cyan so clearly distinct from blue/purple thirst pawns.
