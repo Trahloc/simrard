@@ -38,6 +38,7 @@ const HEADLESS_MIN_SURVIVORS: usize = 8;
 
 static HEADLESS_PERF: OnceLock<Mutex<PerfAudit>> = OnceLock::new();
 static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
+static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
 
 #[derive(Default)]
 struct PerfAudit {
@@ -75,10 +76,20 @@ fn tier10_enabled_from_args() -> bool {
     *TIER10_ENABLED.get_or_init(|| !std::env::args().skip(1).any(|arg| arg == "--disable-tier10"))
 }
 
+fn headless_substrate_from_args() -> bool {
+    *HEADLESS_SUBSTRATE.get_or_init(|| std::env::args().skip(1).any(|arg| arg == "--headless-substrate"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SimulationMode {
     Interactive,
     Headless,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadlessProfile {
+    Full,
+    SubstrateOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +110,11 @@ pub fn run() {
     match parse_mode() {
         SimulationMode::Interactive => run_interactive(),
         SimulationMode::Headless => {
-            let result = run_headless();
+            let result = if headless_substrate_from_args() {
+                run_headless_substrate()
+            } else {
+                run_headless()
+            };
             println!("{}", result.report);
             if matches!(result.termination, HeadlessTermination::Panic(_)) {
                 std::process::exit(1);
@@ -109,7 +124,7 @@ pub fn run() {
 }
 
 fn parse_mode() -> SimulationMode {
-    if std::env::args().skip(1).any(|arg| arg == "--headless-test") {
+    if std::env::args().skip(1).any(|arg| arg == "--headless-test" || arg == "--headless-substrate") {
         SimulationMode::Headless
     } else {
         SimulationMode::Interactive
@@ -199,19 +214,23 @@ fn run_headless() -> HeadlessRunResult {
     run_headless_with_target_ticks(HEADLESS_TARGET_TICKS)
 }
 
+fn run_headless_substrate() -> HeadlessRunResult {
+    run_headless_with_profile(HEADLESS_TARGET_TICKS, HeadlessProfile::SubstrateOnly)
+}
+
 fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
+    run_headless_with_profile(target_ticks, HeadlessProfile::Full)
+}
+
+fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> HeadlessRunResult {
     perf_reset();
     let tier10_enabled = tier10_enabled_from_args();
 
     let mut app = App::new();
     app.set_error_handler(bevy::ecs::error::panic);
-    // MinimalPlugins ensures Main/PreUpdate/Update run; without it PreUpdate may not run and pawns never eat/drink.
     app.add_plugins(MinimalPlugins)
-        .add_plugins(BigBrainPlugin::new(PreUpdate))
-        .add_plugins(PawnAIPlugin)
         .add_plugins(TimePlugin)
         .add_plugins(CausalPlugin)
-        .init_resource::<QuestBoard>()
         .init_resource::<ItemIdAllocator>()
         .init_resource::<SpatialCharter>()
         .init_resource::<FrameWriteLog>()
@@ -222,25 +241,48 @@ fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
         .init_resource::<RespawnState>()
         .init_resource::<SimLifeState>()
         .init_resource::<SimulationReport>()
-        .insert_resource(SimulationLogSettings { stdout_enabled: false })
-        .add_plugins(MirrorPlugin)
-        .add_systems(Startup, (setup, initialize_report_baseline).chain())
-        .add_systems(
-            PreUpdate,
-            (
-                ai::pawn_death_system,
-                ApplyDeferred,
-                headless_tick_driver,
-                hypergraph_tick_system,
-                simlife_tick_system,
-                curiosity_discovery_system,
-                resource_respawn_system,
-            )
-                .chain()
-                .before(BigBrainSet::Scorers),
-        )
-        // Phase 4.D1: Push ECS snapshot to DuckDB mirror after each headless update.
-        .add_systems(Update, push_ecs_snapshot_system);
+        .insert_resource(SimulationLogSettings { stdout_enabled: false });
+
+    match profile {
+        HeadlessProfile::Full => {
+            app.add_plugins(BigBrainPlugin::new(PreUpdate))
+                .add_plugins(PawnAIPlugin)
+                .init_resource::<QuestBoard>()
+                .add_plugins(MirrorPlugin)
+                .add_systems(Startup, (setup, initialize_report_baseline).chain())
+                .add_systems(
+                    PreUpdate,
+                    (
+                        ai::pawn_death_system,
+                        ApplyDeferred,
+                        headless_tick_driver,
+                        hypergraph_tick_system,
+                        simlife_tick_system,
+                        curiosity_discovery_system,
+                        resource_respawn_system,
+                    )
+                        .chain()
+                        .before(BigBrainSet::Scorers),
+                )
+                .add_systems(Update, push_ecs_snapshot_system);
+        }
+        HeadlessProfile::SubstrateOnly => {
+            app.init_resource::<QuestBoard>()
+                .init_resource::<SubstrateStabilityState>()
+                .add_systems(Startup, initialize_substrate_baseline)
+                .add_systems(
+                    PreUpdate,
+                    (
+                        substrate_tick_driver,
+                        hypergraph_tick_system,
+                        simlife_tick_system,
+                        substrate_stability_probe_system,
+                    )
+                        .chain(),
+                );
+        }
+    }
+
     force_panic_error_handlers(&mut app);
 
     let started = Instant::now();
@@ -254,10 +296,10 @@ fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
                 if tick >= target_ticks {
                     break HeadlessTermination::TickLimitReached;
                 }
-                if started.elapsed().as_secs_f64() >= HEADLESS_MAX_WALL_SECONDS {
+                if profile == HeadlessProfile::Full && started.elapsed().as_secs_f64() >= HEADLESS_MAX_WALL_SECONDS {
                     break HeadlessTermination::WallTimeLimitReached;
                 }
-                if count_living_pawns(app.world_mut()) == 0 {
+                if profile == HeadlessProfile::Full && count_living_pawns(app.world_mut()) == 0 {
                     break HeadlessTermination::AllPawnsDied;
                 }
             }
@@ -270,7 +312,7 @@ fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
     let living_at_end = count_living_pawns(app.world_mut());
     let guarded_termination = match termination {
         HeadlessTermination::TickLimitReached | HeadlessTermination::WallTimeLimitReached
-            if living_at_end < HEADLESS_MIN_SURVIVORS =>
+            if profile == HeadlessProfile::Full && living_at_end < HEADLESS_MIN_SURVIVORS =>
         {
             HeadlessTermination::Panic(format!(
                 "survival regression: {} living pawns at end, require at least {}",
@@ -285,6 +327,7 @@ fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
         &guarded_termination,
         started.elapsed().as_secs_f64(),
         tier10_enabled,
+        profile,
     );
     HeadlessRunResult {
         termination: guarded_termination,
@@ -305,6 +348,86 @@ fn initialize_report_baseline(
     if let Some(ref mut report) = report {
         report.set_initial_pawn_count(pawn_query.iter().count());
     }
+}
+
+fn initialize_substrate_baseline(mut report: Option<ResMut<SimulationReport>>) {
+    if let Some(ref mut report) = report {
+        report.set_initial_pawn_count(0);
+    }
+}
+
+fn substrate_tick_driver(
+    mut global_clock: ResMut<GlobalTickClock>,
+    mut report: Option<ResMut<SimulationReport>>,
+) {
+    let started = Instant::now();
+    global_clock.increment();
+    if let Some(ref mut report) = report {
+        report.bump("sim_ticks_advanced");
+    }
+    perf_record("headless_tick_driver", started.elapsed());
+}
+
+#[derive(Resource, Debug, Clone)]
+struct SubstrateStabilityState {
+    last_tick: u64,
+    start_coverage_pct: Option<f32>,
+    end_coverage_pct: Option<f32>,
+    start_histogram: Option<[u64; 8]>,
+    end_histogram: Option<[u64; 8]>,
+}
+
+impl Default for SubstrateStabilityState {
+    fn default() -> Self {
+        Self {
+            last_tick: 0,
+            start_coverage_pct: None,
+            end_coverage_pct: None,
+            start_histogram: None,
+            end_histogram: None,
+        }
+    }
+}
+
+fn substrate_stability_probe_system(
+    global_clock: Res<GlobalTickClock>,
+    simlife: Res<SimLifeState>,
+    chemistry: Res<ChemistryState>,
+    mut state: ResMut<SubstrateStabilityState>,
+) {
+    let seq = global_clock.causal_seq();
+    if seq <= state.last_tick {
+        return;
+    }
+    state.last_tick = seq;
+
+    let total_cells = ((CHUNK_EXTENT as u64) + 1).pow(2) as f32;
+    let active_cells = simlife
+        .grass_per_chunk
+        .values()
+        .filter(|value| **value > 0)
+        .count() as f32;
+    let coverage_pct = if total_cells > 0.0 {
+        (active_cells / total_cells) * 100.0
+    } else {
+        0.0
+    };
+
+    let mut histogram = [0_u64; 8];
+    for value in chemistry.receptor_noise_floor_by_chunk.values() {
+        let normalized = (*value / HYPERGRAPH_NOISE_FLOOR_MAX).clamp(0.0, 0.9999);
+        let bin = (normalized * histogram.len() as f32).floor() as usize;
+        histogram[bin] += 1;
+    }
+
+    if state.start_coverage_pct.is_none() {
+        state.start_coverage_pct = Some(coverage_pct);
+    }
+    if state.start_histogram.is_none() {
+        state.start_histogram = Some(histogram);
+    }
+    state.end_coverage_pct = Some(coverage_pct);
+    state.end_histogram = Some(histogram);
 }
 
 fn advance_simulation_one_tick(
@@ -447,6 +570,7 @@ fn build_headless_report(
     termination: &HeadlessTermination,
     elapsed_secs: f64,
     tier10_enabled: bool,
+    profile: HeadlessProfile,
 ) -> String {
     let world = app.world_mut();
     let tick = world.resource::<GlobalTickClock>().causal_seq();
@@ -492,8 +616,15 @@ fn build_headless_report(
             elapsed_secs, ticks_per_second
         ),
         format!(
-            "Tier10: {} (use --disable-tier10 for baseline run).",
+            "Tier10: {} (use --disable-tier10 for occasional regression checks).",
             if tier10_enabled { "enabled" } else { "disabled" }
+        ),
+        format!(
+            "Profile: {}.",
+            match profile {
+                HeadlessProfile::Full => "full",
+                HeadlessProfile::SubstrateOnly => "substrate-only",
+            }
         ),
         format!(
             "Pawns: {} alive / {} started / {} dead.",
@@ -572,6 +703,54 @@ fn build_headless_report(
         lines.push("Recent activity:".to_string());
         for entry in activity_entries.iter().rev().take(10) {
             lines.push(format!("  {}", entry));
+        }
+    }
+
+    if profile == HeadlessProfile::SubstrateOnly {
+        if let Some(stability) = world.get_resource::<SubstrateStabilityState>() {
+            let start = match stability.start_coverage_pct {
+                Some(value) => value,
+                None => 0.0,
+            };
+            let end = match stability.end_coverage_pct {
+                Some(value) => value,
+                None => 0.0,
+            };
+            let growth = end - start;
+
+            let start_hist = match stability.start_histogram {
+                Some(value) => value,
+                None => [0; 8],
+            };
+            let end_hist = match stability.end_histogram {
+                Some(value) => value,
+                None => [0; 8],
+            };
+            let l1_delta: u64 = start_hist
+                .iter()
+                .zip(end_hist.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .sum();
+            let end_total: u64 = end_hist.iter().sum();
+            let stability_score = if end_total == 0 {
+                1.0
+            } else {
+                1.0 - (l1_delta as f64 / (2.0 * end_total as f64)).clamp(0.0, 1.0)
+            };
+
+            lines.push("Substrate Stability:".to_string());
+            lines.push(format!(
+                "  fungal coverage: start {:.4}% -> end {:.4}% (delta {:+.4}%).",
+                start, end, growth
+            ));
+            lines.push(format!(
+                "  chemistry histogram stability (L1-normalized): {:.4} (1.0 is perfectly stable).",
+                stability_score
+            ));
+            lines.push(format!(
+                "  chemistry histogram end bins: {:?}.",
+                end_hist
+            ));
         }
     }
 

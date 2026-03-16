@@ -745,7 +745,7 @@ pub fn move_to_chunk_action_system(
     mut commands: Commands,
     mut action_query: Query<(&Actor, &mut ActionState), With<MoveToChunkAction>>,
     mut pawn_query: Query<(&mut Position, &MovementTarget)>,
-    mut evaluation_state: ResMut<DispatcherEvaluationState>,
+    mut evaluation_state: Option<ResMut<DispatcherEvaluationState>>,
 ) {
     for (Actor(actor), mut state) in action_query.iter_mut() {
         match *state {
@@ -768,7 +768,9 @@ pub fn move_to_chunk_action_system(
                         let ny = (position.chunk.1 as i32 + dy).clamp(0, CHUNK_EXTENT as i32) as u32;
                         position.chunk = ChunkId(nx, ny);
                         // Charter-region change trigger: crossing chunk boundary invalidates prior local evaluation.
-                        evaluation_state.mark_dirty(*actor);
+                        if let Some(ref mut evaluation_state) = evaluation_state {
+                            evaluation_state.mark_dirty(*actor);
+                        }
                     }
                 } else {
                     *state = ActionState::Failure;
@@ -1371,6 +1373,8 @@ mod tests {
         {
             let (mut quest_board, mut pawn_query, capabilities_query) =
                 system_state.get_mut(&mut world);
+            let mut evaluation_state = DispatcherEvaluationState::default();
+            evaluation_state.mark_all_dirty();
             quest_acceptance_step(
                 1,
                 &mut quest_board,
@@ -1378,6 +1382,7 @@ mod tests {
                 &capabilities_query,
                 None,
                 None,
+                &mut evaluation_state,
                 false,
             );
         }
