@@ -21,3 +21,4 @@ simrard-lib-time = { path = "../lib/time" }
 simrard-lib-transforms = { path = "../lib/transforms" }
 simrard-lib-mirror = { path = "../lib/mirror" }
 simrard-lib-hypergraph = { path = "../lib/hypergraph" }
+simrard-lib-tier4 = { path = "../lib/tier4" }

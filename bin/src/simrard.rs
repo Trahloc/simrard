@@ -32,6 +32,7 @@ use simrard_lib_time::{
 };
 use simrard_lib_transforms::TransformsPlugin;
 use simrard_lib_mirror::{push_ecs_snapshot_system, MirrorPlugin};
+use simrard_lib_tier4::{advance_tier4, population_growth_summary, Tier4State};
 
 const HEADLESS_TARGET_TICKS: u64 = 10_000;
 const HEADLESS_MAX_WALL_SECONDS: f64 = 60.0;
@@ -298,6 +299,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         HeadlessProfile::SubstrateOnly => {
             app.init_resource::<QuestBoard>()
                 .init_resource::<SubstrateStabilityState>()
+                .init_resource::<Tier4State>()
                 .add_systems(
                     Startup,
                     (initialize_substrate_baseline, initialize_substrate_activation).chain(),
@@ -308,6 +310,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
                         substrate_tick_driver,
                         hypergraph_tick_system,
                         simlife_tick_system,
+                        tier4_tick_system,
                         substrate_stability_probe_system,
                     )
                         .chain(),
@@ -540,8 +543,8 @@ struct SubstrateStabilityState {
     equilibrium_reached: bool,
     equilibrium_tier: Option<&'static str>,
     equilibrium_seconds: Option<f64>,
-    // Per-tier low-activity streak counters: index [0]=T5, [1]=T6, [2]=T7, [3]=T8, [4]=T9, [5]=T10.
-    tier_low_streak: [u64; 6],
+    // Per-tier low-activity streak counters: index [0]=T5, [1]=T6, [2]=T7, [3]=T8, [4]=T9, [5]=T10, [6]=T4.
+    tier_low_streak: [u64; 7],
     debug_line_t0_gray_scott: String,
     debug_line_t0_fungal: String,
     debug_line_t60_hypergraph: Option<String>,
@@ -555,6 +558,8 @@ struct SubstrateSecondSample {
     coverage_pct: f32,
     uv_mass_norm: f32,
     energy_flux: f32,
+    /// Tier-4 insect population at this sample.
+    tier4_population: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -565,6 +570,7 @@ struct TierStabilityScores {
     tier7_chemistry: f64,
     tier6_fungal: f64,
     tier5_vegetable: f64,
+    tier4_reflex: f64,
 }
 
 impl Default for TierStabilityScores {
@@ -576,6 +582,7 @@ impl Default for TierStabilityScores {
             tier7_chemistry: 0.0,
             tier6_fungal: 0.0,
             tier5_vegetable: 0.0,
+            tier4_reflex: 0.0,
         }
     }
 }
@@ -594,7 +601,7 @@ impl Default for SubstrateStabilityState {
             equilibrium_reached: false,
             equilibrium_tier: None,
             equilibrium_seconds: None,
-            tier_low_streak: [0; 6],
+            tier_low_streak: [0; 7],
             debug_line_t0_gray_scott: "t=0 Gray-Scott seed: unavailable".to_string(),
             debug_line_t0_fungal: "t=0 Fungal init: unavailable".to_string(),
             debug_line_t60_hypergraph: None,
@@ -682,6 +689,7 @@ fn max_uv_change_ratio(window: &[SubstrateSecondSample]) -> f64 {
 // Collapse thresholds (calibrated): a tier is in equilibrium when its raw activity stays
 // below the threshold for COLLAPSE_STREAK_REQUIRED consecutive probe seconds.
 const T10_COLLAPSE_THRESHOLD: f64 = 0.001;
+const T4_COLLAPSE_THRESHOLD_POP: usize = 50;
 const T9_COLLAPSE_THRESHOLD: f64 = 0.005;
 const T8_COLLAPSE_THRESHOLD: f64 = 0.02;
 const T7_COLLAPSE_THRESHOLD: f64 = 0.002;
@@ -774,6 +782,16 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
         state.tier_low_streak[0] = 0;
     }
 
+    // Tier 4: insect population vitality (normalised to T4_MAX_POPULATION).
+    let t4_pop = latest.tier4_population;
+    let t4_vitality = (t4_pop as f64 / simrard_lib_tier4::T4_MAX_POPULATION as f64).clamp(0.0, 1.0);
+    state.tier_scores.tier4_reflex = t4_vitality;
+    if t4_pop < T4_COLLAPSE_THRESHOLD_POP {
+        state.tier_low_streak[6] = state.tier_low_streak[6].saturating_add(1);
+    } else {
+        state.tier_low_streak[6] = 0;
+    }
+
     state.overall_vitality = (
         state.tier_scores.tier10_hypergraph
             + state.tier_scores.tier9_energy
@@ -781,7 +799,8 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
             + state.tier_scores.tier7_chemistry
             + state.tier_scores.tier6_fungal
             + state.tier_scores.tier5_vegetable
-    ) / 6.0;
+            + state.tier_scores.tier4_reflex
+    ) / 7.0;
 
     let all_equilibrium = state
         .tier_low_streak
@@ -798,6 +817,7 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
             ("Tier 7", state.tier_scores.tier7_chemistry),
             ("Tier 6", state.tier_scores.tier6_fungal),
             ("Tier 5", state.tier_scores.tier5_vegetable),
+            ("Tier 4", state.tier_scores.tier4_reflex),
         ];
         tiers.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
             Some(ordering) => ordering,
@@ -846,12 +866,13 @@ struct TierTrends {
     tier7: &'static str,
     tier6: &'static str,
     tier5: &'static str,
+    tier4: &'static str,
 }
 
 fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
     if samples.len() < 6 {
         let s = "stable";
-        return TierTrends { tier10: s, tier9: s, tier8: s, tier7: s, tier6: s, tier5: s };
+        return TierTrends { tier10: s, tier9: s, tier8: s, tier7: s, tier6: s, tier5: s, tier4: s };
     }
     let mid = samples.len() / 2;
     let early = &samples[..mid];
@@ -909,6 +930,15 @@ fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
     let early_tier9 = (variance(&early_fluxes) / 0.1).clamp(0.0, 1.0);
     let late_tier9 = (variance(&late_fluxes) / 0.1).clamp(0.0, 1.0);
 
+    // Tier 4 trend: population growth or decline.
+    let early_t4_pop: f64 = early.iter().map(|s| s.tier4_population as f64).sum::<f64>()
+        / early.len().max(1) as f64;
+    let late_t4_pop: f64 = late.iter().map(|s| s.tier4_population as f64).sum::<f64>()
+        / late.len().max(1) as f64;
+    let t4_max = simrard_lib_tier4::T4_MAX_POPULATION as f64;
+    let early_t4_vitality = (early_t4_pop / t4_max).clamp(0.0, 1.0);
+    let late_t4_vitality = (late_t4_pop / t4_max).clamp(0.0, 1.0);
+
     TierTrends {
         tier10: tier_trend(
             window_avg_rewrites_per_sec(early),
@@ -922,6 +952,7 @@ fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
         ),
         tier6: tier_trend(early_cov_change, late_cov_change),
         tier5: tier_trend(max_uv_change_ratio(early), max_uv_change_ratio(late)),
+        tier4: tier_trend(early_t4_vitality, late_t4_vitality),
     }
 }
 
@@ -943,6 +974,7 @@ fn substrate_stability_probe_system(
     chemistry: Res<ChemistryState>,
     report: Res<SimulationReport>,
     substrate: Res<HypergraphSubstrate>,
+    tier4: Res<Tier4State>,
     mut state: ResMut<SubstrateStabilityState>,
 ) {
     let seq = global_clock.causal_seq();
@@ -1004,6 +1036,7 @@ fn substrate_stability_probe_system(
         coverage_pct,
         uv_mass_norm,
         energy_flux: flux_sum,
+        tier4_population: tier4.insects.len(),
     });
     if state.second_samples.len() > 60 {
         state.second_samples.remove(0);
@@ -1384,6 +1417,13 @@ fn build_headless_report(
                 trends.tier5,
                 tier_status(stability.tier_low_streak[0], stability.tier_scores.tier5_vegetable),
             ));
+            lines.push(format!(
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "4",
+                stability.tier_scores.tier4_reflex,
+                trends.tier4,
+                tier_status(stability.tier_low_streak[6], stability.tier_scores.tier4_reflex),
+            ));
 
             let vitality_status = if stability.equilibrium_reached {
                 let tier = match stability.equilibrium_tier {
@@ -1444,6 +1484,18 @@ fn build_headless_report(
                 "  Final chemistry histogram entropy: {:.4}",
                 histogram_entropy_32(&end_hist)
             ));
+        }
+
+        if let Some(tier4) = world.get_resource::<Tier4State>() {
+            lines.push("=== Tier 4 Insect Population ===".to_string());
+            lines.push(format!(
+                "  Final population: {} / {} max",
+                tier4.insects.len(),
+                simrard_lib_tier4::T4_MAX_POPULATION,
+            ));
+            lines.push(format!("  Decomp deposits total: {}", tier4.decomp_total));
+            lines.push("  Growth curve (tick : pop : avg_energy : eat_grants : repro_grants : deaths):".to_string());
+            lines.push(population_growth_summary(tier4));
         }
     }
 
@@ -2679,6 +2731,27 @@ fn simlife_tick_system(
         );
     }
     perf_record("simlife_tick", started.elapsed());
+}
+
+fn tier4_tick_system(
+    global_clock: Res<GlobalTickClock>,
+    hypergraph: Res<HypergraphSubstrate>,
+    mut simlife: ResMut<SimLifeState>,
+    mut chemistry: ResMut<ChemistryState>,
+    mut charter: ResMut<SpatialCharter>,
+    mut tier4: ResMut<Tier4State>,
+) {
+    let started = Instant::now();
+    let seq = global_clock.causal_seq();
+    advance_tier4(
+        seq,
+        &mut simlife.grass_per_chunk,
+        &mut chemistry.receptor_noise_floor_by_chunk,
+        Some(&hypergraph),
+        &mut charter,
+        &mut tier4,
+    );
+    perf_record("tier4_tick", started.elapsed());
 }
 
 fn hypergraph_tick_system(
