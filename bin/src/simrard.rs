@@ -176,6 +176,7 @@ fn run_interactive() {
         .init_resource::<ActivityLog>()
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<ChemistryState>()
+        .init_resource::<ThermalState>()
         .init_resource::<RespawnState>()
         .init_resource::<SimLifeState>()
         .add_plugins(MirrorPlugin);
@@ -271,6 +272,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         .init_resource::<RespawnState>()
         .init_resource::<SimLifeState>()
         .init_resource::<SimulationReport>()
+        .init_resource::<simrard_lib_tier4::Tier4State>()
         .insert_resource(SimulationLogSettings { stdout_enabled: false });
 
     match profile {
@@ -309,6 +311,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
                         substrate_tick_driver,
                         hypergraph_tick_system,
                         simlife_tick_system,
+                        tier4_tick_system,
                         thermal_passive_cooling_system,
                         substrate_stability_probe_system,
                     )
@@ -316,6 +319,45 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
                 );
         }
     }
+// ──────────────────────────────────────────────────────────────────────────
+// Tier 4 tick system integration for substrate-only mode
+// ──────────────────────────────────────────────────────────────────────────
+use simrard_lib_tier4::{advance_tier4, Tier4State};
+fn tier4_tick_system(
+    mut state: ResMut<Tier4State>,
+    mut simlife: ResMut<SimLifeState>,
+    mut chemistry: ResMut<ChemistryState>,
+    mut thermal: ResMut<ThermalState>,
+    hypergraph: Option<Res<HypergraphSubstrate>>,
+    mut charter: ResMut<SpatialCharter>,
+    mut report: Option<ResMut<SimulationReport>>,
+    global_clock: Res<GlobalTickClock>,
+) {
+    let current_seq = global_clock.causal_seq();
+    let sink_temperature_k = thermal.sink_temperature_k;
+    let metrics = advance_tier4(
+        current_seq,
+        &mut simlife.grass_per_chunk,
+        &mut chemistry.receptor_noise_floor_by_chunk,
+        &mut thermal.local_temperature_by_chunk,
+        sink_temperature_k,
+        hypergraph.as_deref(),
+        &mut charter,
+        &mut state,
+    );
+    if let Some(metrics) = metrics {
+        if let Some(ref mut report) = report {
+            report.counters.insert("tier4_population", metrics.population as u64);
+            report.counters.insert("tier4_eat_grants", metrics.eat_grants);
+            report.counters.insert("tier4_eat_denials", metrics.eat_denials);
+            report.counters.insert("tier4_repro_grants", metrics.repro_grants);
+            report.counters.insert("tier4_repro_denials", metrics.repro_denials);
+            report.counters.insert("tier4_deaths", metrics.deaths);
+            report.counters.insert("tier4_avg_energy", metrics.avg_energy as u64);
+            report.counters.insert("tier4_decomp_total", state.decomp_total);
+        }
+    }
+}
 
     force_panic_error_handlers(&mut app);
 
@@ -542,8 +584,8 @@ struct SubstrateStabilityState {
     equilibrium_reached: bool,
     equilibrium_tier: Option<&'static str>,
     equilibrium_seconds: Option<f64>,
-    // Per-tier low-activity streak counters: index [0]=T5, [1]=T6, [2]=T7, [3]=T8, [4]=T9, [5]=T10.
-    tier_low_streak: [u64; 6],
+    // Per-tier low-activity streak counters: index [0]=T5, [1]=T6, [2]=T7, [3]=T8, [4]=T9, [5]=T10, [6]=T4.
+    tier_low_streak: [u64; 7],
     debug_line_t0_gray_scott: String,
     debug_line_t0_fungal: String,
     debug_line_t60_hypergraph: Option<String>,
@@ -558,10 +600,12 @@ struct SubstrateSecondSample {
     uv_mass_norm: f32,
     energy_flux: f32,
     heat_dissipated_total: f32,
+    tier4_population: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct TierStabilityScores {
+    tier4_reflex: f64,
     tier10_hypergraph: f64,
     tier9_energy: f64,
     tier8_mineral: f64,
@@ -573,6 +617,7 @@ struct TierStabilityScores {
 impl Default for TierStabilityScores {
     fn default() -> Self {
         Self {
+            tier4_reflex: 0.0,
             tier10_hypergraph: 0.0,
             tier9_energy: 0.0,
             tier8_mineral: 0.0,
@@ -597,7 +642,7 @@ impl Default for SubstrateStabilityState {
             equilibrium_reached: false,
             equilibrium_tier: None,
             equilibrium_seconds: None,
-            tier_low_streak: [0; 6],
+            tier_low_streak: [0; 7],
             debug_line_t0_gray_scott: "t=0 Gray-Scott seed: unavailable".to_string(),
             debug_line_t0_fungal: "t=0 Fungal init: unavailable".to_string(),
             debug_line_t60_hypergraph: None,
@@ -690,6 +735,7 @@ const T8_COLLAPSE_THRESHOLD: f64 = 0.02;
 const T7_COLLAPSE_THRESHOLD: f64 = 0.002;
 const T6_COLLAPSE_THRESHOLD: f64 = 0.0005;
 const T5_COLLAPSE_THRESHOLD: f64 = 0.001;
+const T4_COLLAPSE_THRESHOLD: f64 = 0.005;
 const COLLAPSE_STREAK_REQUIRED: u64 = 30;
 
 fn compute_tier_scores(state: &mut SubstrateStabilityState) {
@@ -777,6 +823,15 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
         state.tier_low_streak[0] = 0;
     }
 
+    // Tier 4: normalized reflex-insect population vitality.
+    let tier4_population_norm = (latest.tier4_population as f64 / 10_000.0).clamp(0.0, 1.0);
+    state.tier_scores.tier4_reflex = tier4_population_norm;
+    if tier4_population_norm < T4_COLLAPSE_THRESHOLD {
+        state.tier_low_streak[6] = state.tier_low_streak[6].saturating_add(1);
+    } else {
+        state.tier_low_streak[6] = 0;
+    }
+
     state.overall_vitality = (
         state.tier_scores.tier10_hypergraph
             + state.tier_scores.tier9_energy
@@ -784,7 +839,8 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
             + state.tier_scores.tier7_chemistry
             + state.tier_scores.tier6_fungal
             + state.tier_scores.tier5_vegetable
-    ) / 6.0;
+            + state.tier_scores.tier4_reflex
+    ) / 7.0;
 
     let all_equilibrium = state
         .tier_low_streak
@@ -801,6 +857,7 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
             ("Tier 7", state.tier_scores.tier7_chemistry),
             ("Tier 6", state.tier_scores.tier6_fungal),
             ("Tier 5", state.tier_scores.tier5_vegetable),
+            ("Tier 4", state.tier_scores.tier4_reflex),
         ];
         tiers.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
             Some(ordering) => ordering,
@@ -843,6 +900,7 @@ fn window_avg_rewrites_per_sec(samples: &[SubstrateSecondSample]) -> f64 {
 }
 
 struct TierTrends {
+    tier4: &'static str,
     tier10: &'static str,
     tier9: &'static str,
     tier8: &'static str,
@@ -854,7 +912,15 @@ struct TierTrends {
 fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
     if samples.len() < 6 {
         let s = "stable";
-        return TierTrends { tier10: s, tier9: s, tier8: s, tier7: s, tier6: s, tier5: s };
+        return TierTrends {
+            tier4: s,
+            tier10: s,
+            tier9: s,
+            tier8: s,
+            tier7: s,
+            tier6: s,
+            tier5: s,
+        };
     }
     let mid = samples.len() / 2;
     let early = &samples[..mid];
@@ -911,8 +977,19 @@ fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
 
     let early_tier9 = (variance(&early_fluxes) / 0.1).clamp(0.0, 1.0);
     let late_tier9 = (variance(&late_fluxes) / 0.1).clamp(0.0, 1.0);
+    let early_tier4 = early
+        .iter()
+        .map(|s| s.tier4_population as f64 / 10_000.0)
+        .sum::<f64>()
+        / early.len() as f64;
+    let late_tier4 = late
+        .iter()
+        .map(|s| s.tier4_population as f64 / 10_000.0)
+        .sum::<f64>()
+        / late.len() as f64;
 
     TierTrends {
+        tier4: tier_trend(early_tier4, late_tier4),
         tier10: tier_trend(
             window_avg_rewrites_per_sec(early),
             window_avg_rewrites_per_sec(late),
@@ -999,6 +1076,10 @@ fn substrate_stability_probe_system(
         Some(value) => *value,
         None => 0,
     };
+    let tier4_population = match report.counters.get("tier4_population") {
+        Some(value) => *value,
+        None => 0,
+    };
 
     state.second_samples.push(SubstrateSecondSample {
         second: seq / 1000,
@@ -1008,6 +1089,7 @@ fn substrate_stability_probe_system(
         uv_mass_norm,
         energy_flux: flux_sum,
         heat_dissipated_total,
+        tier4_population,
     });
     if state.second_samples.len() > 60 {
         state.second_samples.remove(0);
@@ -1387,6 +1469,13 @@ fn build_headless_report(
                 stability.tier_scores.tier5_vegetable,
                 trends.tier5,
                 tier_status(stability.tier_low_streak[0], stability.tier_scores.tier5_vegetable),
+            ));
+            lines.push(format!(
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "4",
+                stability.tier_scores.tier4_reflex,
+                trends.tier4,
+                tier_status(stability.tier_low_streak[6], stability.tier_scores.tier4_reflex),
             ));
 
             let vitality_status = if stability.equilibrium_reached {
@@ -2298,9 +2387,11 @@ const T9_SINK_TEMPERATURE_K: f32 = 2.7;
 const T9_COOLING_K: f32 = 0.08;
 const THERMAL_HEAT_PER_USABLE_FLUX_CHEMISTRY: f32 = 3.0;
 const THERMAL_HEAT_PER_USABLE_FLUX_SIMLIFE: f32 = 1.8;
+const THERMAL_HEAT_PER_PLANT_DECOMP: f32 = 0.45;
 const THERMAL_CHEMISTRY_FLUX_DRAW: f32 = 0.035;
 const THERMAL_SIMLIFE_FLUX_DRAW_BASE: f32 = 0.012;
 const THERMAL_SIMLIFE_ACTIVITY_HEAT_SCALE: f32 = 0.08;
+const SIMLIFE_DECOMP_TO_CHEMISTRY_SCALE: f32 = 0.035;
 const THERMAL_RUNAWAY_BOIL_K: f32 = 24.0;
 const THERMAL_RUNAWAY_FREEZE_K: f32 = 2.71;
 
@@ -2466,7 +2557,7 @@ fn advance_simlife_grass_with_hypergraph(
     current_seq: u64,
     simlife: &mut SimLifeState,
     hypergraph: Option<&mut HypergraphSubstrate>,
-    chemistry: Option<&ChemistryState>,
+    chemistry: Option<&mut ChemistryState>,
     thermal: Option<&mut ThermalState>,
     charter: &mut SpatialCharter,
     report: Option<&mut SimulationReport>,
@@ -2668,7 +2759,7 @@ fn gs_update(
     current_seq: u64,
     simlife: &mut SimLifeState,
     mut hypergraph: Option<&mut HypergraphSubstrate>,
-    chemistry: Option<&ChemistryState>,
+    mut chemistry: Option<&mut ChemistryState>,
     mut thermal: Option<&mut ThermalState>,
     charter: &mut SpatialCharter,
     mut report: Option<&mut SimulationReport>,
@@ -2679,7 +2770,8 @@ fn gs_update(
     // Compute new (u, v) for every active cell from the *current* (unmodified) field.
     let hypergraph_read = hypergraph.as_deref();
     let thermal_read = thermal.as_deref();
-    let mut updates: Vec<(ChunkId, f32, f32, f32, f32)> = Vec::with_capacity(active_cells.len());
+    let chemistry_read = chemistry.as_deref();
+    let mut updates: Vec<(ChunkId, f32, f32, f32, f32, f32)> = Vec::with_capacity(active_cells.len());
     for &cell in &active_cells {
         let ChunkId(cx, cy) = cell;
         let u = *simlife.u_field.get(&cell).unwrap_or(&1.0); // GS_SPARSE_FIELD_DEFAULT
@@ -2700,7 +2792,7 @@ fn gs_update(
                     * GS_F_CAUSAL_VOLUME_SCALE
                     * GS_CAUSAL_VOLUME_MULTIPLIER;
                 let flux_bias = output.usable_flux.clamp(0.0, 1.0) * GS_F_USABLE_FLUX_SCALE;
-                let chemistry_hotspot_raw = chemistry
+                let chemistry_hotspot_raw = chemistry_read
                     .and_then(|c| c.receptor_noise_floor_by_chunk.get(&cell).copied());
                 let chemistry_hotspot = match chemistry_hotspot_raw {
                     Some(value) => value,
@@ -2724,7 +2816,7 @@ fn gs_update(
         let flux_request = THERMAL_SIMLIFE_FLUX_DRAW_BASE + output_usable_flux_for_cell(hypergraph_read, cx, cy) * 0.05;
         let activity_heat = (uvv.abs() + new_v) * THERMAL_SIMLIFE_ACTIVITY_HEAT_SCALE;
 
-        updates.push((cell, new_u, new_v, flux_request, activity_heat));
+        updates.push((cell, new_u, new_v, v, flux_request, activity_heat));
     }
 
     // ── WRITE PHASE ────────────────────────────────────────────────────────
@@ -2734,7 +2826,7 @@ fn gs_update(
     let mut lease_grants = 0_u64;
     let mut lease_denials = 0_u64;
 
-    for (cell, new_u, new_v, flux_request, activity_heat) in updates {
+    for (cell, new_u, new_v, old_v, flux_request, activity_heat) in updates {
         let ChunkId(cx, cy) = cell;
         let lease_req = SpatialLease {
             primary: cell,
@@ -2743,6 +2835,7 @@ fn gs_update(
                 reads: vec![],
                 writes: vec![
                     TypeId::of::<SimLifeGrayScottWrite>(),
+                    TypeId::of::<ChemistryNoiseFloorWrite>(),
                     TypeId::of::<ThermalFieldWrite>(),
                     TypeId::of::<HypergraphRegionalOutputWrite>(),
                 ],
@@ -2758,12 +2851,30 @@ fn gs_update(
                 }
                 simlife.u_field.insert(cell, new_u);
                 simlife.v_field.insert(cell, new_v);
+                let plant_decay = (old_v - new_v).max(0.0);
+                if let Some(chemistry_state) = chemistry.as_deref_mut() {
+                    let existing_noise = chemistry_state
+                        .receptor_noise_floor_by_chunk
+                        .get(&cell)
+                        .copied();
+                    let existing_noise = match existing_noise {
+                        Some(value) => value,
+                        None => 0.0,
+                    };
+                    let deposit = (plant_decay * SIMLIFE_DECOMP_TO_CHEMISTRY_SCALE).max(0.0);
+                    let next_noise = (existing_noise + deposit).min(HYPERGRAPH_NOISE_FLOOR_MAX);
+                    chemistry_state
+                        .receptor_noise_floor_by_chunk
+                        .insert(cell, next_noise);
+                }
                 if let Some(thermal_state) = thermal.as_deref_mut() {
                     thermal_state.cumulative_flux_consumed += flux_draw as f64;
                     apply_heat_and_cooling_to_chunk(
                         thermal_state,
                         cell,
-                        activity_heat + flux_draw * THERMAL_HEAT_PER_USABLE_FLUX_SIMLIFE,
+                        activity_heat
+                            + flux_draw * THERMAL_HEAT_PER_USABLE_FLUX_SIMLIFE
+                            + plant_decay * THERMAL_HEAT_PER_PLANT_DECOMP,
                     );
                 }
                 // Derive grass from V concentration.
@@ -2837,7 +2948,7 @@ fn simlife_tick_system(
     global_clock: Res<GlobalTickClock>,
     mut simlife: ResMut<SimLifeState>,
     mut hypergraph: ResMut<HypergraphSubstrate>,
-    chemistry: Res<ChemistryState>,
+    mut chemistry: ResMut<ChemistryState>,
     mut thermal: ResMut<ThermalState>,
     mut charter: ResMut<SpatialCharter>,
     mut report: Option<ResMut<SimulationReport>>,
@@ -2849,7 +2960,7 @@ fn simlife_tick_system(
             global_clock.causal_seq(),
             &mut simlife,
             Some(&mut hypergraph),
-            Some(&chemistry),
+            Some(&mut chemistry),
             Some(&mut thermal),
             &mut charter,
             report.as_deref_mut(),

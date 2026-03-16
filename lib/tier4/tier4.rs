@@ -43,8 +43,14 @@ pub const T4_REPRODUCTION_THRESHOLD: f32 = 4.0;
 pub const T4_REPRODUCTION_COST: f32 = 2.5;
 /// Fraction of local biomass consumed per eat event.
 pub const T4_GRASS_CONSUMPTION_FRACTION: f32 = 0.25;
+/// Incidental Tier-6 fruiting-body intake threshold from local nutrient signal.
+pub const T4_FRUITING_SIGNAL_THRESHOLD: f32 = 0.12;
+/// Incidental energy gain from Tier-6 fruiting-body intake.
+pub const T4_FRUITING_ENERGY_GAIN: f32 = 0.12;
 /// Decomposition chemistry deposit per dead insect (normalized 0..1).
 pub const T4_DECOMP_DEPOSIT: f32 = 0.04;
+/// Waste-heat deposit per decomposition event (Kelvin delta).
+pub const T4_DECOMP_HEAT_K: f32 = 0.2;
 /// STW decay rate per update tick (habituation).
 pub const T4_STW_DECAY: f32 = 0.15;
 /// Chunk extent mirror from world constants — used for bounds checking.
@@ -80,6 +86,8 @@ pub struct Insect {
     pub chunk: ChunkId,
     /// Current energy store. Agent dies when energy drops to 0.
     pub energy: f32,
+    /// Hunger drive: 0=sated, 1=starving.
+    pub hunger: f32,
     /// Fear drive: 0=calm, 1=maximal fear.
     pub fear: f32,
     /// Reproduction urgency: increases with surplus energy.
@@ -95,6 +103,7 @@ impl Insect {
         Self {
             chunk,
             energy,
+            hunger: 0.0,
             fear: 0.0,
             repro_urgency: 0.0,
             stw: [0.0; 8],
@@ -198,6 +207,8 @@ pub fn seed_tier4_population(state: &mut Tier4State, current_seq: u64) {
 /// - `current_seq`: current causal clock sequence.
 /// - `grass_per_chunk`: mutable reference to GS-derived biomass map (Tier 5 link).
 /// - `chemistry_noise_floor`: mutable reference to fungal chemistry map (Tier 6 link).
+/// - `thermal_temperature_by_chunk`: mutable local thermal field map (Tier 9 sink link).
+/// - `sink_temperature_k`: baseline Tier-9 sink temperature used for sparse default.
 /// - `hypergraph`: read-only Tier 10 output (clustering → reproduction bias, causal_volume → fear).
 /// - `charter`: mutable SpatialCharter for lease mediation.
 ///
@@ -206,6 +217,8 @@ pub fn advance_tier4(
     current_seq: u64,
     grass_per_chunk: &mut HashMap<ChunkId, u32>,
     chemistry_noise_floor: &mut HashMap<ChunkId, f32>,
+    thermal_temperature_by_chunk: &mut HashMap<ChunkId, f32>,
+    sink_temperature_k: f32,
     hypergraph: Option<&HypergraphSubstrate>,
     charter: &mut SpatialCharter,
     state: &mut Tier4State,
@@ -249,6 +262,8 @@ pub fn advance_tier4(
 
         // ── Metabolic cost ──────────────────────────────────────────────
         insect.energy -= T4_METABOLIC_COST;
+        insect.hunger = (1.0 - (insect.energy / 8.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        insect.stw[3] = (insect.stw[3] * 0.6 + insect.hunger * 0.4).clamp(0.0, 1.0);
         if insect.energy <= 0.0 {
             // Death: deposit decomp trace.
             dead_chunks.push(insect.chunk);
@@ -301,6 +316,21 @@ pub fn advance_tier4(
             }
         }
 
+        // ── Incidental Tier-6 fruiting-body intake (no mycelium damage) ─
+        // We model fruiting-body availability as local nutrient signal and do not decrement
+        // the underlying network state.
+        let nutrient_signal = (chemistry_noise_floor
+            .get(&insect.chunk)
+            .copied()
+            .map_or(0.0, |value| value)
+            / T4_DECOMP_MAX)
+            .clamp(0.0, 1.0);
+        if nutrient_signal >= T4_FRUITING_SIGNAL_THRESHOLD && insect.hunger > 0.2 {
+            let bonus = T4_FRUITING_ENERGY_GAIN * nutrient_signal;
+            insect.energy = (insect.energy + bonus).min(8.0);
+            insect.stw[5] = (insect.stw[5] + 0.25).clamp(0.0, 1.0);
+        }
+
         // ── Movement (fear-biased random walk) ──────────────────────────
         if insect.fear > T4_FEAR_FLEE_THRESHOLD || insect.age % 5 == 0 {
             // Simple deterministic walk: hash position + age to get direction.
@@ -320,6 +350,9 @@ pub fn advance_tier4(
 
         // ── Reproduction (Tier 10 clustering hook) ──────────────────────
         if insect.energy > T4_REPRODUCTION_THRESHOLD {
+            insect.repro_urgency = ((insect.energy - T4_REPRODUCTION_THRESHOLD)
+                / (8.0 - T4_REPRODUCTION_THRESHOLD))
+                .clamp(0.0, 1.0);
             // Clustering increases willingness to reproduce.
             let repro_bias = 1.0 + clustering * T4_REPRO_CLUSTER_SCALE;
             let adjusted_threshold = T4_REPRODUCTION_THRESHOLD / repro_bias;
@@ -376,6 +409,10 @@ pub fn advance_tier4(
                 let existing = *chemistry_noise_floor.get(&chunk).unwrap_or(&0.0); // T4_DECOMP_DEFAULT
                 let new_val = (existing + T4_DECOMP_DEPOSIT).min(T4_DECOMP_MAX);
                 chemistry_noise_floor.insert(chunk, new_val);
+                let current_temp = *thermal_temperature_by_chunk
+                    .get(&chunk)
+                    .map_or(&sink_temperature_k, |value| value);
+                thermal_temperature_by_chunk.insert(chunk, current_temp + T4_DECOMP_HEAT_K);
                 state.decomp_total += 1;
                 charter.release_lease(handle);
             }
@@ -468,11 +505,21 @@ mod tests {
         let mut state = Tier4State::default();
         let mut grass: HashMap<ChunkId, u32> = HashMap::new();
         let mut chem: HashMap<ChunkId, f32> = HashMap::new();
+        let mut thermal: HashMap<ChunkId, f32> = HashMap::new();
         let mut charter = bare_charter();
 
         seed_tier4_population(&mut state, 0);
         // tick=1 should be throttled (interval is T4_UPDATE_INTERVAL_TICKS=100).
-        let result = advance_tier4(1, &mut grass, &mut chem, None, &mut charter, &mut state);
+        let result = advance_tier4(
+            1,
+            &mut grass,
+            &mut chem,
+            &mut thermal,
+            2.7,
+            None,
+            &mut charter,
+            &mut state,
+        );
         assert!(result.is_none(), "advance at tick=1 should be throttled");
     }
 
@@ -481,6 +528,7 @@ mod tests {
         let mut state = Tier4State::default();
         let mut grass: HashMap<ChunkId, u32> = HashMap::new();
         let mut chem: HashMap<ChunkId, f32> = HashMap::new();
+        let mut thermal: HashMap<ChunkId, f32> = HashMap::new();
         let mut charter = bare_charter();
 
         // Seed grass to allow eat grants.
@@ -491,6 +539,8 @@ mod tests {
             T4_UPDATE_INTERVAL_TICKS,
             &mut grass,
             &mut chem,
+            &mut thermal,
+            2.7,
             None,
             &mut charter,
             &mut state,
@@ -512,12 +562,15 @@ mod tests {
         state.seeded = true;
         let mut grass: HashMap<ChunkId, u32> = HashMap::new();
         let mut chem: HashMap<ChunkId, f32> = HashMap::new();
+        let mut thermal: HashMap<ChunkId, f32> = HashMap::new();
         let mut charter = bare_charter();
 
         let result = advance_tier4(
             T4_UPDATE_INTERVAL_TICKS,
             &mut grass,
             &mut chem,
+            &mut thermal,
+            2.7,
             None,
             &mut charter,
             &mut state,
@@ -537,6 +590,7 @@ mod tests {
         let mut grass: HashMap<ChunkId, u32> = HashMap::new();
         grass.insert(ChunkId(5, 5), 10);
         let mut chem: HashMap<ChunkId, f32> = HashMap::new();
+        let mut thermal: HashMap<ChunkId, f32> = HashMap::new();
         let mut charter = bare_charter();
 
         // Hold a conflicting write lease on the same chunk before advancing.
@@ -557,6 +611,8 @@ mod tests {
             T4_UPDATE_INTERVAL_TICKS,
             &mut grass,
             &mut chem,
+            &mut thermal,
+            2.7,
             None,
             &mut charter,
             &mut state,
@@ -579,12 +635,15 @@ mod tests {
         state.seeded = true;
         let mut grass: HashMap<ChunkId, u32> = HashMap::new();
         let mut chem: HashMap<ChunkId, f32> = HashMap::new();
+        let mut thermal: HashMap<ChunkId, f32> = HashMap::new();
         let mut charter = bare_charter();
 
         let result = advance_tier4(
             T4_UPDATE_INTERVAL_TICKS,
             &mut grass,
             &mut chem,
+            &mut thermal,
+            2.7,
             None,
             &mut charter,
             &mut state,
@@ -592,7 +651,15 @@ mod tests {
         let m = result.expect("advance must run");
         assert_eq!(m.deaths, 1, "one insect should have died");
         // Decomposition should have deposited something in chemistry.
-        let dep = chem.get(&ChunkId(10, 10)).copied().unwrap_or(0.0);
+        let dep = match chem.get(&ChunkId(10, 10)).copied() {
+            Some(value) => value,
+            None => 0.0,
+        };
         assert!(dep > 0.0, "decomp deposit must be non-zero after insect death");
+        let heat = match thermal.get(&ChunkId(10, 10)).copied() {
+            Some(value) => value,
+            None => 0.0,
+        };
+        assert!(heat > 2.7, "decomposition should deposit local waste heat into Tier 9 field");
     }
 }

@@ -178,9 +178,9 @@ Stable inorganic structures and elemental matter in all phases. Soil composition
 
 ### Tier 9 — Energy (Abiotic Flux)
 
-Light, heat, radiation. The boundary condition that drives everything. Not a simulation — a map of energy flux that everything else reads from. Day/night cycle, seasons, weather, geothermal variation. Without continuous energy input, the system runs to equilibrium: everything dies, nothing moves.
+Light, heat, radiation. The boundary condition that drives everything. Tier 9 is an active thermal sink with a 2.7 K baseline: waste heat from upper-tier activity drains toward the sink each update under Newton cooling ($k \cdot (T_{local}-2.7)$). Day/night cycle, seasons, weather, and geothermal variation still shape available flux, but thermal dissipation is simulated state rather than a static lookup. Without continuous energy input, the system runs to equilibrium: everything dies, nothing moves.
 
-**Runs on:** CPU. Pre-computed map + time function. Near-zero cost.
+**Runs on:** CPU. Active thermal boundary simulation (sink baseline + per-update cooling), with cumulative dissipation tracked for substrate stability monitoring.
 
 ---
 
