@@ -2191,7 +2191,7 @@ const GS_F_CHEMISTRY_HOTSPOT_SCALE: f32 = 0.03;
 /// Substrate mode target initial GS seeded density in [0.5%, 1.0%].
 const GS_INITIAL_SEED_COVERAGE: f32 = 0.006;
 /// Tier 10 activation tuning for substrate profile.
-const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS: u64 = 1_000;
+const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS: u64 = 40;
 const SUBSTRATE_HYPERGRAPH_CHAOS: f32 = 0.45;
 
 #[derive(Resource, Debug, Clone)]
