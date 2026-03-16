@@ -1678,13 +1678,49 @@ fn build_headless_report(
 }
 
 // ---- Phase 3.5: Chunk grid ----
-fn chunk_grid_gizmo_system(mut gizmos: Gizmos) {
-    let extent = CHUNK_EXTENT + 1; // Draw boundaries for chunks in 0..=CHUNK_EXTENT.
-    let color = Color::srgba(0.3, 0.3, 0.35, 0.6);
-    for i in 0..=extent {
+fn chunk_grid_gizmo_system(
+    camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
+    mut gizmos: Gizmos,
+) {
+    let Ok((transform, projection)) = camera_query.single() else {
+        return;
+    };
+    let ortho = match projection {
+        Projection::Orthographic(value) => value,
+        _ => return,
+    };
+
+    let half_w = 640.0 * ortho.scale;
+    let half_h = 360.0 * ortho.scale;
+    let min_x = transform.translation.x - half_w - CHUNK_PIXEL;
+    let max_x = transform.translation.x + half_w + CHUNK_PIXEL;
+    let min_y = transform.translation.y - half_h - CHUNK_PIXEL;
+    let max_y = transform.translation.y + half_h + CHUNK_PIXEL;
+
+    let start_i = (min_x / CHUNK_PIXEL).floor() as i32;
+    let end_i = (max_x / CHUNK_PIXEL).ceil() as i32;
+    let start_j = (min_y / CHUNK_PIXEL).floor() as i32;
+    let end_j = (max_y / CHUNK_PIXEL).ceil() as i32;
+
+    for i in start_i..=end_i {
         let p = i as f32 * CHUNK_PIXEL;
-        gizmos.line_2d(Vec2::new(p, 0.0), Vec2::new(p, extent as f32 * CHUNK_PIXEL), color);
-        gizmos.line_2d(Vec2::new(0.0, p), Vec2::new(extent as f32 * CHUNK_PIXEL, p), color);
+        let major = i % 8 == 0;
+        let color = if major {
+            Color::srgba(0.36, 0.40, 0.50, 0.72)
+        } else {
+            Color::srgba(0.28, 0.30, 0.36, 0.56)
+        };
+        gizmos.line_2d(Vec2::new(p, min_y), Vec2::new(p, max_y), color);
+    }
+    for j in start_j..=end_j {
+        let p = j as f32 * CHUNK_PIXEL;
+        let major = j % 8 == 0;
+        let color = if major {
+            Color::srgba(0.36, 0.40, 0.50, 0.72)
+        } else {
+            Color::srgba(0.28, 0.30, 0.36, 0.56)
+        };
+        gizmos.line_2d(Vec2::new(min_x, p), Vec2::new(max_x, p), color);
     }
 }
 
@@ -1712,6 +1748,7 @@ fn visual_debug_insect_overlay_system(
     visual: Res<VisualDebug>,
     tier4: Res<Tier4State>,
     time: Res<Time>,
+    camera_query: Query<&Transform, With<Camera2d>>,
     existing: Query<Entity, With<VisualDebugInsectSprite>>,
 ) {
     for entity in existing.iter() {
@@ -1721,9 +1758,28 @@ fn visual_debug_insect_overlay_system(
         return;
     }
 
-    let step = (tier4.insects.len() / VISUAL_DEBUG_MAX_INSECT_SPRITES).max(1);
+    let camera = match camera_query.single() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let cam = Vec2::new(camera.translation.x, camera.translation.y);
+    let mut order: Vec<(usize, f32)> = tier4
+        .insects
+        .iter()
+        .enumerate()
+        .map(|(idx, insect)| {
+            let pos = Vec2::new(insect.chunk.0 as f32 * CHUNK_PIXEL, insect.chunk.1 as f32 * CHUNK_PIXEL);
+            (idx, pos.distance_squared(cam))
+        })
+        .collect();
+    order.sort_by(|a, b| match a.1.partial_cmp(&b.1) {
+        Some(ordering) => ordering,
+        None => Ordering::Equal,
+    });
+
     let t = time.elapsed_secs();
-    for insect in tier4.insects.iter().step_by(step).take(VISUAL_DEBUG_MAX_INSECT_SPRITES) {
+    for (idx, _) in order.into_iter().take(VISUAL_DEBUG_MAX_INSECT_SPRITES) {
+        let insect = &tier4.insects[idx];
         let hunger = insect.hunger.clamp(0.0, 1.0);
         let fear = insect.fear.clamp(0.0, 1.0);
         let sum = (hunger + fear).max(0.001);
@@ -1765,6 +1821,7 @@ fn visual_debug_gs_overlay_system(
     visual: Res<VisualDebug>,
     simlife: Res<SimLifeState>,
     time: Res<Time>,
+    camera_query: Query<&Transform, With<Camera2d>>,
     mut gizmos: Gizmos,
     existing: Query<Entity, With<VisualDebugGsSprite>>,
 ) {
@@ -1775,13 +1832,17 @@ fn visual_debug_gs_overlay_system(
         return;
     }
 
+    let camera = match camera_query.single() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let cam = Vec2::new(camera.translation.x, camera.translation.y);
+
     let mut cells: Vec<ChunkId> = simlife.gs_active.iter().copied().collect();
     cells.sort_by(|a, b| {
-        let av = simlife.v_field.get(a).copied();
-        let bv = simlife.v_field.get(b).copied();
-        let av = match av { Some(value) => value, None => 0.0 };
-        let bv = match bv { Some(value) => value, None => 0.0 };
-        match bv.partial_cmp(&av) {
+        let ap = Vec2::new(a.0 as f32 * CHUNK_PIXEL, a.1 as f32 * CHUNK_PIXEL).distance_squared(cam);
+        let bp = Vec2::new(b.0 as f32 * CHUNK_PIXEL, b.1 as f32 * CHUNK_PIXEL).distance_squared(cam);
+        match ap.partial_cmp(&bp) {
             Some(ordering) => ordering,
             None => Ordering::Equal,
         }
@@ -1840,6 +1901,7 @@ fn visual_debug_thermal_overlay_system(
     thermal: Res<ThermalState>,
     mut cache: ResMut<VisualDebugThermalCache>,
     time: Res<Time>,
+    camera_query: Query<&Transform, With<Camera2d>>,
     existing: Query<Entity, With<VisualDebugThermalSprite>>,
 ) {
     for entity in existing.iter() {
@@ -1850,17 +1912,32 @@ fn visual_debug_thermal_overlay_system(
         return;
     }
 
+    let camera = match camera_query.single() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let cam = Vec2::new(camera.translation.x, camera.translation.y);
+
     let mut hotspots: Vec<(ChunkId, f32)> = thermal
         .local_temperature_by_chunk
         .iter()
         .map(|(chunk, temp)| (*chunk, (*temp - thermal.sink_temperature_k).max(0.0)))
         .collect();
-    hotspots.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
+    hotspots.sort_by(|a, b| {
+        let ad = Vec2::new(a.0 .0 as f32 * CHUNK_PIXEL, a.0 .1 as f32 * CHUNK_PIXEL).distance_squared(cam);
+        let bd = Vec2::new(b.0 .0 as f32 * CHUNK_PIXEL, b.0 .1 as f32 * CHUNK_PIXEL).distance_squared(cam);
+        match ad.partial_cmp(&bd) {
+            Some(ordering) => ordering,
+            None => Ordering::Equal,
+        }
+    });
+    let mut hottest: Vec<(ChunkId, f32)> = hotspots.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES * 3).collect();
+    hottest.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
         Some(ordering) => ordering,
         None => Ordering::Equal,
     });
 
-    let denom = hotspots
+    let denom = hottest
         .first()
         .map(|(_, delta)| *delta);
     let denom = match denom {
@@ -1869,7 +1946,7 @@ fn visual_debug_thermal_overlay_system(
     }
         .max(0.001);
     let time_s = time.elapsed_secs();
-    for (chunk, delta) in hotspots.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES) {
+    for (chunk, delta) in hottest.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES) {
         let intensity = (delta / denom).clamp(0.0, 1.0);
         let current_temp = thermal.local_temperature_by_chunk.get(&chunk).copied();
         let current_temp = match current_temp {
