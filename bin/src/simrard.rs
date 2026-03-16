@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy::ecs::message::{MessageReader, Messages};
 use bevy::input::mouse::MouseWheel;
 use bevy::sprite::Sprite;
+use std::cmp::Ordering;
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -39,6 +40,7 @@ const HEADLESS_MIN_SURVIVORS: usize = 8;
 static HEADLESS_PERF: OnceLock<Mutex<PerfAudit>> = OnceLock::new();
 static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
 static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
+static BENCHMARK_SECONDS: OnceLock<f64> = OnceLock::new();
 
 #[derive(Default)]
 struct PerfAudit {
@@ -80,6 +82,25 @@ fn headless_substrate_from_args() -> bool {
     *HEADLESS_SUBSTRATE.get_or_init(|| std::env::args().skip(1).any(|arg| arg == "--headless-substrate"))
 }
 
+fn benchmark_seconds_from_args() -> f64 {
+    *BENCHMARK_SECONDS.get_or_init(|| {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == "--benchmark-seconds" {
+                let raw = args
+                    .next()
+                    .expect("missing value for --benchmark-seconds; provide a positive number");
+                let parsed: f64 = raw
+                    .parse()
+                    .expect("invalid --benchmark-seconds value; provide a positive number");
+                assert!(parsed > 0.0, "--benchmark-seconds must be > 0");
+                return parsed;
+            }
+        }
+        HEADLESS_MAX_WALL_SECONDS
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SimulationMode {
     Interactive,
@@ -96,6 +117,7 @@ enum HeadlessProfile {
 enum HeadlessTermination {
     TickLimitReached,
     WallTimeLimitReached,
+    SubstrateEquilibriumReached,
     AllPawnsDied,
     Panic(String),
 }
@@ -225,6 +247,7 @@ fn run_headless_with_target_ticks(target_ticks: u64) -> HeadlessRunResult {
 fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> HeadlessRunResult {
     perf_reset();
     let tier10_enabled = tier10_enabled_from_args();
+    let benchmark_seconds = benchmark_seconds_from_args();
 
     let mut app = App::new();
     app.set_error_handler(bevy::ecs::error::panic);
@@ -293,14 +316,21 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         match update_result {
             Ok(()) => {
                 let tick = app.world().resource::<GlobalTickClock>().causal_seq();
-                if tick >= target_ticks {
+                if profile == HeadlessProfile::Full && tick >= target_ticks {
                     break HeadlessTermination::TickLimitReached;
                 }
-                if profile == HeadlessProfile::Full && started.elapsed().as_secs_f64() >= HEADLESS_MAX_WALL_SECONDS {
+                if started.elapsed().as_secs_f64() >= benchmark_seconds {
                     break HeadlessTermination::WallTimeLimitReached;
                 }
                 if profile == HeadlessProfile::Full && count_living_pawns(app.world_mut()) == 0 {
                     break HeadlessTermination::AllPawnsDied;
+                }
+                if profile == HeadlessProfile::SubstrateOnly {
+                    if let Some(stability) = app.world().get_resource::<SubstrateStabilityState>() {
+                        if stability.equilibrium_reached {
+                            break HeadlessTermination::SubstrateEquilibriumReached;
+                        }
+                    }
                 }
             }
             Err(payload) => {
@@ -373,8 +403,48 @@ struct SubstrateStabilityState {
     last_tick: u64,
     start_coverage_pct: Option<f32>,
     end_coverage_pct: Option<f32>,
-    start_histogram: Option<[u64; 8]>,
-    end_histogram: Option<[u64; 8]>,
+    start_histogram: Option<[u64; 32]>,
+    end_histogram: Option<[u64; 32]>,
+    second_samples: Vec<SubstrateSecondSample>,
+    tier_scores: TierStabilityScores,
+    overall_vitality: f64,
+    equilibrium_reached: bool,
+    equilibrium_tier: Option<&'static str>,
+    equilibrium_seconds: Option<f64>,
+    tier10_low_streak_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SubstrateSecondSample {
+    second: u64,
+    rewrites_total: u64,
+    chemistry_hist_32: [u64; 32],
+    coverage_pct: f32,
+    uv_mass_norm: f32,
+    energy_flux: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TierStabilityScores {
+    tier10_hypergraph: f64,
+    tier9_energy: f64,
+    tier8_mineral: f64,
+    tier7_chemistry: f64,
+    tier6_fungal: f64,
+    tier5_vegetable: f64,
+}
+
+impl Default for TierStabilityScores {
+    fn default() -> Self {
+        Self {
+            tier10_hypergraph: 0.0,
+            tier9_energy: 0.0,
+            tier8_mineral: 0.0,
+            tier7_chemistry: 0.0,
+            tier6_fungal: 0.0,
+            tier5_vegetable: 0.0,
+        }
+    }
 }
 
 impl Default for SubstrateStabilityState {
@@ -385,7 +455,195 @@ impl Default for SubstrateStabilityState {
             end_coverage_pct: None,
             start_histogram: None,
             end_histogram: None,
+            second_samples: Vec::new(),
+            tier_scores: TierStabilityScores::default(),
+            overall_vitality: 0.0,
+            equilibrium_reached: false,
+            equilibrium_tier: None,
+            equilibrium_seconds: None,
+            tier10_low_streak_seconds: 0,
         }
+    }
+}
+
+fn histogram_entropy_32(hist: &[u64; 32]) -> f64 {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let total_f = total as f64;
+    let mut entropy = 0.0;
+    for value in hist {
+        if *value == 0 {
+            continue;
+        }
+        let p = *value as f64 / total_f;
+        entropy -= p * p.ln();
+    }
+    let max_entropy = (32_f64).ln();
+    if max_entropy <= 0.0 {
+        0.0
+    } else {
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    }
+}
+
+fn variance(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values
+        .iter()
+        .map(|value| {
+            let d = *value - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / values.len() as f64
+}
+
+fn max_hist_bin_change_ratio(window: &[SubstrateSecondSample]) -> f64 {
+    if window.len() < 2 {
+        return 0.0;
+    }
+    let mut max_change = 0.0_f64;
+    for pair in window.windows(2) {
+        let a = &pair[0].chemistry_hist_32;
+        let b = &pair[1].chemistry_hist_32;
+        let total_a: u64 = a.iter().sum();
+        let total_b: u64 = b.iter().sum();
+        let norm_total = total_a.max(total_b) as f64;
+        if norm_total == 0.0 {
+            continue;
+        }
+        for (x, y) in a.iter().zip(b.iter()) {
+            let change = x.abs_diff(*y) as f64 / norm_total;
+            if change > max_change {
+                max_change = change;
+            }
+        }
+    }
+    max_change
+}
+
+fn max_uv_change_ratio(window: &[SubstrateSecondSample]) -> f64 {
+    if window.len() < 2 {
+        return 0.0;
+    }
+    let mut max_change = 0.0_f64;
+    for pair in window.windows(2) {
+        let a = pair[0].uv_mass_norm as f64;
+        let b = pair[1].uv_mass_norm as f64;
+        let change = (b - a).abs();
+        if change > max_change {
+            max_change = change;
+        }
+    }
+    max_change
+}
+
+fn compute_tier_scores(state: &mut SubstrateStabilityState) {
+    if state.second_samples.is_empty() {
+        return;
+    }
+    let latest = state
+        .second_samples
+        .last()
+        .expect("second_samples must be non-empty when computing tier scores");
+    let window = if state.second_samples.len() > 30 {
+        &state.second_samples[state.second_samples.len() - 30..]
+    } else {
+        &state.second_samples[..]
+    };
+
+    // Tier 10: rewrites/sec from cumulative counter derivative.
+    let rewrites_per_second = if state.second_samples.len() < 2 {
+        0.0
+    } else {
+        let prev = &state.second_samples[state.second_samples.len() - 2];
+        latest.rewrites_total.saturating_sub(prev.rewrites_total) as f64
+    };
+    state.tier_scores.tier10_hypergraph = (rewrites_per_second / 10.0).clamp(0.0, 1.0);
+
+    // Tier 9: variance of recent energy flux.
+    let energy_fluxes: Vec<f64> = window.iter().map(|s| s.energy_flux as f64).collect();
+    let flux_variance = variance(&energy_fluxes);
+    state.tier_scores.tier9_energy = (flux_variance / 0.1).clamp(0.0, 1.0);
+
+    // Tier 8: histogram entropy normalized by ln(32).
+    let entropy_norm = histogram_entropy_32(&latest.chemistry_hist_32);
+    state.tier_scores.tier8_mineral = entropy_norm;
+
+    // Tier 7: max chemistry histogram bin change over last 30s.
+    let max_bin_change = max_hist_bin_change_ratio(window);
+    state.tier_scores.tier7_chemistry = (max_bin_change / 0.01).clamp(0.0, 1.0);
+
+    // Tier 6: fungal coverage change rate over last 30s.
+    let coverage_change_rate = if window.len() < 2 {
+        0.0
+    } else {
+        let first = window
+            .first()
+            .expect("window first sample missing");
+        let last = window
+            .last()
+            .expect("window last sample missing");
+        let seconds = (last.second.saturating_sub(first.second)).max(1) as f64;
+        (last.coverage_pct as f64 - first.coverage_pct as f64).abs() / seconds
+    };
+    state.tier_scores.tier6_fungal = (coverage_change_rate / 0.05).clamp(0.0, 1.0);
+
+    // Tier 5: max U+V field change over last 30s.
+    let max_uv_change = max_uv_change_ratio(window);
+    state.tier_scores.tier5_vegetable = (max_uv_change / 0.01).clamp(0.0, 1.0);
+
+    state.overall_vitality = (
+        state.tier_scores.tier10_hypergraph
+            + state.tier_scores.tier9_energy
+            + state.tier_scores.tier8_mineral
+            + state.tier_scores.tier7_chemistry
+            + state.tier_scores.tier6_fungal
+            + state.tier_scores.tier5_vegetable
+    ) / 6.0;
+
+    let tier10_equilibrium = if rewrites_per_second < 0.01 {
+        state.tier10_low_streak_seconds = state.tier10_low_streak_seconds.saturating_add(1);
+        state.tier10_low_streak_seconds >= 10
+    } else {
+        state.tier10_low_streak_seconds = 0;
+        false
+    };
+    let tier9_equilibrium = flux_variance < 0.01;
+    let tier8_equilibrium = entropy_norm < 0.05;
+    let tier7_equilibrium = max_bin_change < 0.005;
+    let tier6_equilibrium = coverage_change_rate < 0.001;
+    let tier5_equilibrium = max_uv_change < 0.001;
+
+    let all_equilibrium = tier10_equilibrium
+        && tier9_equilibrium
+        && tier8_equilibrium
+        && tier7_equilibrium
+        && tier6_equilibrium
+        && tier5_equilibrium;
+
+    if all_equilibrium && !state.equilibrium_reached {
+        state.equilibrium_reached = true;
+        // Bottleneck tier = currently most dynamic among the six when equilibrium is first reached.
+        let mut tiers = [
+            ("Tier 10", state.tier_scores.tier10_hypergraph),
+            ("Tier 9", state.tier_scores.tier9_energy),
+            ("Tier 8", state.tier_scores.tier8_mineral),
+            ("Tier 7", state.tier_scores.tier7_chemistry),
+            ("Tier 6", state.tier_scores.tier6_fungal),
+            ("Tier 5", state.tier_scores.tier5_vegetable),
+        ];
+        tiers.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
+            Some(ordering) => ordering,
+            None => Ordering::Equal,
+        });
+        state.equilibrium_tier = Some(tiers[0].0);
+        state.equilibrium_seconds = Some(latest.second as f64);
     }
 }
 
@@ -393,6 +651,7 @@ fn substrate_stability_probe_system(
     global_clock: Res<GlobalTickClock>,
     simlife: Res<SimLifeState>,
     chemistry: Res<ChemistryState>,
+    report: Res<SimulationReport>,
     mut state: ResMut<SubstrateStabilityState>,
 ) {
     let seq = global_clock.causal_seq();
@@ -400,6 +659,11 @@ fn substrate_stability_probe_system(
         return;
     }
     state.last_tick = seq;
+
+    // Probe once per simulated second to produce 30-second rolling windows.
+    if seq % 1000 != 0 {
+        return;
+    }
 
     let total_cells = ((CHUNK_EXTENT as u64) + 1).pow(2) as f32;
     let active_cells = simlife
@@ -413,11 +677,41 @@ fn substrate_stability_probe_system(
         0.0
     };
 
-    let mut histogram = [0_u64; 8];
+    let mut histogram = [0_u64; 32];
     for value in chemistry.receptor_noise_floor_by_chunk.values() {
         let normalized = (*value / HYPERGRAPH_NOISE_FLOOR_MAX).clamp(0.0, 0.9999);
         let bin = (normalized * histogram.len() as f32).floor() as usize;
         histogram[bin] += 1;
+    }
+
+    let mut flux_sum = 0.0_f32;
+    if let Some(previous) = state.second_samples.last() {
+        for (a, b) in previous.chemistry_hist_32.iter().zip(histogram.iter()) {
+            flux_sum += a.abs_diff(*b) as f32;
+        }
+    }
+
+    let uv_mass_norm = if total_cells > 0.0 {
+        (simlife.u_field.values().copied().sum::<f32>() + simlife.v_field.values().copied().sum::<f32>()) / total_cells
+    } else {
+        0.0
+    };
+
+    let rewrites_total = match report.counters.get("hypergraph_rewrites") {
+        Some(value) => *value,
+        None => 0,
+    };
+
+    state.second_samples.push(SubstrateSecondSample {
+        second: seq / 1000,
+        rewrites_total,
+        chemistry_hist_32: histogram,
+        coverage_pct,
+        uv_mass_norm,
+        energy_flux: flux_sum,
+    });
+    if state.second_samples.len() > 60 {
+        state.second_samples.remove(0);
     }
 
     if state.start_coverage_pct.is_none() {
@@ -428,6 +722,8 @@ fn substrate_stability_probe_system(
     }
     state.end_coverage_pct = Some(coverage_pct);
     state.end_histogram = Some(histogram);
+
+    compute_tier_scores(&mut state);
 }
 
 fn advance_simulation_one_tick(
@@ -600,6 +896,9 @@ fn build_headless_report(
         HeadlessTermination::WallTimeLimitReached => {
             format!("Wall-time limit reached at {:.1}s and {} ticks.", elapsed_secs, tick)
         }
+        HeadlessTermination::SubstrateEquilibriumReached => {
+            format!("Substrate equilibrium reached at {} ticks.", tick)
+        }
         HeadlessTermination::AllPawnsDied => {
             format!("All pawns died by tick {}.", tick)
         }
@@ -718,39 +1017,61 @@ fn build_headless_report(
             };
             let growth = end - start;
 
-            let start_hist = match stability.start_histogram {
-                Some(value) => value,
-                None => [0; 8],
-            };
-            let end_hist = match stability.end_histogram {
-                Some(value) => value,
-                None => [0; 8],
-            };
-            let l1_delta: u64 = start_hist
-                .iter()
-                .zip(end_hist.iter())
-                .map(|(a, b)| a.abs_diff(*b))
-                .sum();
-            let end_total: u64 = end_hist.iter().sum();
-            let stability_score = if end_total == 0 {
-                1.0
-            } else {
-                1.0 - (l1_delta as f64 / (2.0 * end_total as f64)).clamp(0.0, 1.0)
-            };
-
-            lines.push("Substrate Stability:".to_string());
+            lines.push("Substrate Stability Report:".to_string());
             lines.push(format!(
-                "  fungal coverage: start {:.4}% -> end {:.4}% (delta {:+.4}%).",
+                "  Tier 10 (hypergraph rewrite): {:.4}.",
+                stability.tier_scores.tier10_hypergraph
+            ));
+            lines.push(format!(
+                "  Tier 9 (energy flux variance): {:.4}.",
+                stability.tier_scores.tier9_energy
+            ));
+            lines.push(format!(
+                "  Tier 8 (chem entropy / ln(32)): {:.4}.",
+                stability.tier_scores.tier8_mineral
+            ));
+            lines.push(format!(
+                "  Tier 7 (max chemistry-bin change): {:.4}.",
+                stability.tier_scores.tier7_chemistry
+            ));
+            lines.push(format!(
+                "  Tier 6 (fungal coverage change): {:.4}.",
+                stability.tier_scores.tier6_fungal
+            ));
+            lines.push(format!(
+                "  Tier 5 (max U+V change): {:.4}.",
+                stability.tier_scores.tier5_vegetable
+            ));
+            lines.push(format!(
+                "  Overall substrate vitality: {:.4}.",
+                stability.overall_vitality
+            ));
+            lines.push(format!(
+                "  Fungal coverage start {:.4}% -> end {:.4}% (delta {:+.4}%).",
                 start, end, growth
             ));
-            lines.push(format!(
-                "  chemistry histogram stability (L1-normalized): {:.4} (1.0 is perfectly stable).",
-                stability_score
-            ));
-            lines.push(format!(
-                "  chemistry histogram end bins: {:?}.",
-                end_hist
-            ));
+
+            if stability.equilibrium_reached {
+                let tier = match stability.equilibrium_tier {
+                    Some(value) => value,
+                    None => "Tier 10",
+                };
+                let seconds = match stability.equilibrium_seconds {
+                    Some(value) => value,
+                    None => elapsed_secs,
+                };
+                lines.push(format!(
+                    "  Substrate Equilibrium Reached at {} after {:.1} seconds (vitality: {:.2}).",
+                    tier,
+                    seconds,
+                    stability.overall_vitality
+                ));
+            } else {
+                lines.push(format!(
+                    "  Substrate still dynamic (vitality: {:.2}).",
+                    stability.overall_vitality
+                ));
+            }
         }
     }
 
