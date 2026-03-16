@@ -19,6 +19,7 @@ pub struct RegionOutputs {
     pub avg_arity: f32,
     pub clustering: f32,
     pub causal_volume: f32,
+    pub usable_flux: f32,
 }
 
 impl Default for RegionOutputs {
@@ -28,6 +29,7 @@ impl Default for RegionOutputs {
             avg_arity: 0.0,
             clustering: 0.0,
             causal_volume: 0.0,
+            usable_flux: 0.0,
         }
     }
 }
@@ -91,6 +93,7 @@ struct Patch {
     next_node_id: u16,
     nodes: Vec<Node>,
     edges: Vec<Hyperedge>,
+    usable_flux: f32,
     output_cache: RegionOutputs,
 }
 
@@ -114,6 +117,7 @@ impl Patch {
             next_node_id: 4,
             nodes,
             edges,
+            usable_flux: 0.0,
             output_cache: RegionOutputs::default(),
         }
     }
@@ -237,6 +241,43 @@ impl HypergraphSubstrate {
         self.patch_index(coord).map(|idx| self.patches[idx].output_cache)
     }
 
+    pub fn usable_flux_for_chunk(&self, chunk_x: u32, chunk_y: u32) -> Option<f32> {
+        let px = chunk_x / self.config.patch_chunk_size;
+        let py = chunk_y / self.config.patch_chunk_size;
+        self.patch_index(PatchCoord { x: px, y: py })
+            .map(|idx| self.patches[idx].usable_flux)
+    }
+
+    pub fn consume_usable_flux_for_chunk(&mut self, chunk_x: u32, chunk_y: u32, requested: f32) -> f32 {
+        let px = chunk_x / self.config.patch_chunk_size;
+        let py = chunk_y / self.config.patch_chunk_size;
+        self.consume_usable_flux_for_patch(PatchCoord { x: px, y: py }, requested)
+    }
+
+    pub fn consume_usable_flux_for_patch(&mut self, coord: PatchCoord, requested: f32) -> f32 {
+        let Some(idx) = self.patch_index(coord) else {
+            return 0.0;
+        };
+        let requested = requested.max(0.0);
+        let granted = self.patches[idx].usable_flux.min(requested);
+        self.patches[idx].usable_flux = (self.patches[idx].usable_flux - granted).max(0.0);
+        self.patches[idx].output_cache.usable_flux = quantize(self.patches[idx].usable_flux);
+        granted
+    }
+
+    pub fn inject_usable_flux_for_chunk(&mut self, chunk_x: u32, chunk_y: u32, delta: f32) {
+        let px = chunk_x / self.config.patch_chunk_size;
+        let py = chunk_y / self.config.patch_chunk_size;
+        self.inject_usable_flux_for_patch(PatchCoord { x: px, y: py }, delta);
+    }
+
+    pub fn inject_usable_flux_for_patch(&mut self, coord: PatchCoord, delta: f32) {
+        if let Some(idx) = self.patch_index(coord) {
+            self.patches[idx].usable_flux = (self.patches[idx].usable_flux + delta.max(0.0)).clamp(0.0, 1.0);
+            self.patches[idx].output_cache.usable_flux = quantize(self.patches[idx].usable_flux);
+        }
+    }
+
     pub fn step_with_permissions<F>(&mut self, causal_seq: u64, mut can_write_patch: F) -> StepStats
     where
         F: FnMut(PatchCoord) -> bool,
@@ -278,6 +319,14 @@ impl HypergraphSubstrate {
                 stats.rewritten += 1;
             }
 
+            let redistributed_flux = redistribute_usable_flux(
+                self.patches[patch_idx].usable_flux,
+                neighbor.output.usable_flux,
+                rewritten,
+                rule.as_ref(),
+            );
+            self.patches[patch_idx].usable_flux = redistributed_flux;
+
             let prev = self.patches[patch_idx].output_cache;
             let raw = compute_outputs(&self.patches[patch_idx], neighbor, self.config.max_nodes_per_patch as f32);
             self.patches[patch_idx].output_cache = smooth_and_quantize(prev, raw, self.config.ema_alpha);
@@ -302,6 +351,7 @@ impl HypergraphSubstrate {
         let mut arity_sum = 0.0;
         let mut cluster_sum = 0.0;
         let mut causal_sum = 0.0;
+        let mut flux_sum = 0.0;
         let mut samples = 0.0;
 
         for (dx, dy) in [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)] {
@@ -323,6 +373,7 @@ impl HypergraphSubstrate {
                 arity_sum += snap.output.avg_arity;
                 cluster_sum += snap.output.clustering;
                 causal_sum += snap.output.causal_volume;
+                flux_sum += snap.output.usable_flux;
                 samples += 1.0;
             }
         }
@@ -345,6 +396,7 @@ impl HypergraphSubstrate {
                 avg_arity: arity_sum / samples,
                 clustering: cluster_sum / samples,
                 causal_volume: causal_sum / samples,
+                usable_flux: flux_sum / samples,
             },
         }
     }
@@ -478,6 +530,7 @@ fn compute_outputs(patch: &Patch, neighbor: PatchSnapshot, max_nodes_per_patch: 
         avg_arity: (avg_arity / 4.0).clamp(0.0, 1.0),
         clustering,
         causal_volume,
+        usable_flux: patch.usable_flux.max(neighbor.output.usable_flux * 0.15).clamp(0.0, 1.0),
     }
 }
 
@@ -488,7 +541,24 @@ fn smooth_and_quantize(prev: RegionOutputs, raw: RegionOutputs, alpha: f32) -> R
         avg_arity: quantize(prev.avg_arity + a * (raw.avg_arity - prev.avg_arity)),
         clustering: quantize(prev.clustering + a * (raw.clustering - prev.clustering)),
         causal_volume: quantize(prev.causal_volume + a * (raw.causal_volume - prev.causal_volume)),
+        usable_flux: quantize(prev.usable_flux + a * (raw.usable_flux - prev.usable_flux)),
     }
+}
+
+fn redistribute_usable_flux(current: f32, neighbor_avg: f32, rewritten: bool, rule: Option<&RewriteRule>) -> f32 {
+    let carry = current.clamp(0.0, 1.0) * 0.82;
+    let diffuse = neighbor_avg.clamp(0.0, 1.0) * 0.18;
+    let rewrite_bonus = if rewritten {
+        match rule.map(|r| r.replacement) {
+            Some(Replacement::AddNodeWithEdges { arity }) => 0.035 + (arity as f32 / 4.0) * 0.03,
+            Some(Replacement::Merge) => 0.04,
+            Some(Replacement::Split) => 0.03,
+            None => 0.03,
+        }
+    } else {
+        0.0
+    };
+    (carry + diffuse + rewrite_bonus).clamp(0.0, 1.0)
 }
 
 fn quantize(value: f32) -> f32 {
@@ -556,6 +626,7 @@ mod tests {
             assert!((0.0..=1.0).contains(&o.avg_arity));
             assert!((0.0..=1.0).contains(&o.clustering));
             assert!((0.0..=1.0).contains(&o.causal_volume));
+            assert!((0.0..=1.0).contains(&o.usable_flux));
         }
     }
 
@@ -616,5 +687,23 @@ mod tests {
             .patch_output(PatchCoord { x: 1, y: 0 })
             .expect("right output");
         assert!(right_out.clustering > 0.0);
+    }
+
+    #[test]
+    fn miracle_flux_injection_and_consumption_are_bounded() {
+        let mut substrate = HypergraphSubstrate::new(HypergraphConfig::default(), default_rules());
+        substrate.inject_usable_flux_for_chunk(0, 0, 0.8);
+        let before = substrate
+            .usable_flux_for_chunk(0, 0)
+            .expect("chunk flux exists after injection");
+        assert!(before > 0.0 && before <= 1.0);
+
+        let consumed = substrate.consume_usable_flux_for_chunk(0, 0, 0.3);
+        assert!(consumed > 0.0);
+        let after = substrate
+            .usable_flux_for_chunk(0, 0)
+            .expect("chunk flux exists after consumption");
+        assert!(after >= 0.0 && after <= 1.0);
+        assert!(after < before);
     }
 }
