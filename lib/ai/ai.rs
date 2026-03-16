@@ -1,6 +1,5 @@
 use bevy::prelude::*;
 use bevy::ecs::message::MessageWriter;
-use simrard_lib_mirror::{rank_provider_candidates_for_need, ProviderCandidateInput};
 use simrard_lib_utility_ai::prelude::*;
 use simrard_lib_causal::{CausalEventKind, CausalEventQueue, DriveType};
 use simrard_lib_charter::{
@@ -29,6 +28,8 @@ pub struct ActivityLog(pub VecDeque<String>);
 
 const ACTIVITY_LOG_MAX: usize = 32;
 const QUEST_ACCEPTANCE_MIN_DRIVE: f32 = 0.3;
+const PROVIDER_RANK_DRIVE_WEIGHT: f32 = 0.75;
+const PROVIDER_RANK_PROXIMITY_WEIGHT: f32 = 0.25;
 
 #[derive(Resource, Default)]
 pub struct DispatcherEvaluationState {
@@ -56,9 +57,14 @@ pub struct CachedScoreEntry {
     pub can_eat: bool,
     pub can_drink: bool,
     pub can_rest: bool,
-    pub food_drive: f32,
-    pub water_drive: f32,
-    pub rest_drive: f32,
+    pub cached_final_scores: [(ActionId, f32); 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionId {
+    Eat,
+    Drink,
+    Rest,
 }
 
 #[derive(Default)]
@@ -260,6 +266,7 @@ pub fn pawn_event_dispatcher_step(
         let event_started = Instant::now();
         match event.kind {
             CausalEventKind::DriveThresholdCrossed { entity, drive } => {
+                evaluation_state.mark_all_dirty();
                 evaluation_state.mark_dirty(entity);
                 if let Ok((e, name, position, mut nn)) = pawn_query.get_mut(entity) {
                     let (val, label, need) = match drive {
@@ -391,6 +398,24 @@ fn need_capability_and_drive(need: &str, nn: &NeuralNetworkComponent) -> Option<
     }
 }
 
+fn action_for_need(need: &str) -> Option<ActionId> {
+    match need {
+        "food" => Some(ActionId::Eat),
+        "water" => Some(ActionId::Drink),
+        "rest" => Some(ActionId::Rest),
+        _ => None,
+    }
+}
+
+fn cached_score_for_action(scores: &[(ActionId, f32); 3], action: ActionId) -> f32 {
+    for (candidate_action, score) in scores {
+        if *candidate_action == action {
+            return *score;
+        }
+    }
+    panic!("cached action score missing for requested action");
+}
+
 fn chebyshev_distance(a: ChunkId, b: ChunkId) -> u32 {
     a.0.abs_diff(b.0).max(a.1.abs_diff(b.1))
 }
@@ -466,9 +491,11 @@ fn quest_acceptance_step(
                 can_eat,
                 can_drink,
                 can_rest,
-                food_drive: (1.0 - nn.hunger).clamp(0.0, 1.0),
-                water_drive: (1.0 - nn.thirst).clamp(0.0, 1.0),
-                rest_drive: (1.0 - nn.fatigue).clamp(0.0, 1.0),
+                cached_final_scores: [
+                    (ActionId::Eat, (1.0 - nn.hunger).clamp(0.0, 1.0)),
+                    (ActionId::Drink, (1.0 - nn.thirst).clamp(0.0, 1.0)),
+                    (ActionId::Rest, (1.0 - nn.fatigue).clamp(0.0, 1.0)),
+                ],
             };
             timing.biochemical_base_lookup_us += bio_started.elapsed().as_micros() as u64;
             evaluation_state.last_score_cache.insert(entity, score_entry);
@@ -511,10 +538,12 @@ fn quest_acceptance_step(
         let Some((required_capability, _)) = need_capability_and_drive(&quest.need, &NeuralNetworkComponent::default()) else {
             continue;
         };
+        let Some(quest_action) = action_for_need(&quest.need) else {
+            continue;
+        };
 
-        let mut eligible_candidates: Vec<(u32, Entity, String, f32)> = Vec::new();
-        let mut rank_inputs: Vec<ProviderCandidateInput> = Vec::new();
         let modifier_started = Instant::now();
+        let mut contextual_candidates: Vec<(u32, Entity, String, f32, f32, u32)> = Vec::new();
         for (entity, name, chunk, cached) in &pawns {
             if *entity == quest.requester || providers_in_progress.contains(entity) {
                 continue;
@@ -529,56 +558,45 @@ fn quest_acceptance_step(
                 continue;
             }
 
-            let drive = match quest.need.as_str() {
-                "food" => cached.food_drive,
-                "water" => cached.water_drive,
-                "rest" => cached.rest_drive,
-                _ => 0.0,
-            };
-            if drive < QUEST_ACCEPTANCE_MIN_DRIVE {
+            let base_score = cached_score_for_action(&cached.cached_final_scores, quest_action);
+            if base_score < QUEST_ACCEPTANCE_MIN_DRIVE {
                 continue;
             }
 
             let dist = chebyshev_distance(*chunk, quest.chunk);
-            let candidate_id = eligible_candidates.len() as u32;
-            eligible_candidates.push((candidate_id, *entity, name.clone(), drive));
-            rank_inputs.push(ProviderCandidateInput {
-                candidate_id,
-                drive,
-                proximity: 1.0 / (dist + 1) as f32,
-                distance: dist,
-                can_eat: cached.can_eat,
-                can_drink: cached.can_drink,
-                can_rest: cached.can_rest,
-            });
+            let proximity = 1.0 / (dist + 1) as f32;
+            let candidate_id = contextual_candidates.len() as u32;
+            contextual_candidates.push((candidate_id, *entity, name.clone(), base_score, proximity, dist));
         }
         timing.contextual_modifier_application_us += modifier_started.elapsed().as_micros() as u64;
 
-        let select_started = Instant::now();
+        let combine_started = Instant::now();
+        let mut best: Option<(u32, Entity, String, f32, u32)> = None;
+        for (candidate_id, entity, name, base_score, proximity, dist) in contextual_candidates {
+            let final_score = 1.0
+                - (((1.0 - base_score) * PROVIDER_RANK_DRIVE_WEIGHT).powi(2)
+                    + ((1.0 - proximity) * PROVIDER_RANK_PROXIMITY_WEIGHT).powi(2))
+                .sqrt();
+            match best.as_ref() {
+                None => {
+                    best = Some((candidate_id, entity, name, final_score, dist));
+                }
+                Some((best_candidate_id, _, _, best_score, best_dist)) => {
+                    if final_score > *best_score
+                        || (final_score == *best_score && dist < *best_dist)
+                        || (final_score == *best_score && dist == *best_dist && candidate_id < *best_candidate_id)
+                    {
+                        best = Some((candidate_id, entity, name, final_score, dist));
+                    }
+                }
+            }
+        }
+        timing.final_score_combination_sorting_us += combine_started.elapsed().as_micros() as u64;
 
-        let selected_candidate = rank_provider_candidates_for_need(
-            &quest.need,
-            QUEST_ACCEPTANCE_MIN_DRIVE,
-            &rank_inputs,
-        )
-        .expect("Quest acceptance provider ranking via DuckDB failed");
-        timing.final_score_combination_sorting_us += select_started.elapsed().as_micros() as u64;
-
-        let Some(selected_candidate_id) = selected_candidate else {
+        let Some((_, provider, provider_name, drive, _)) = best else {
             continue;
         };
-
         let winner_started = Instant::now();
-        let Some((_, provider, provider_name, drive)) = eligible_candidates
-            .iter()
-            .find(|(candidate_id, _, _, _)| *candidate_id == selected_candidate_id)
-            .cloned()
-        else {
-            panic!(
-                "Quest acceptance ranked candidate id {} missing from eligible set",
-                selected_candidate_id
-            );
-        };
 
             quest.provider = Some(provider);
             quest.status = QuestStatus::InProgress { provider };
