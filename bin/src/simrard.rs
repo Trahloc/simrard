@@ -61,6 +61,7 @@ fn live_stats_overlay_system(
     thermal: Res<ThermalState>,
     global_clock: Res<GlobalTickClock>,
     time: Res<Time>,
+    camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
     existing: Query<Entity, With<LiveStatsOverlay>>,
     mut last_update: Local<f32>,
 ) {
@@ -80,12 +81,18 @@ fn live_stats_overlay_system(
 
     let insect_count = tier4.insects.len();
     let gs_active = simlife.gs_active.len();
-    let peak_temp = thermal
+    let peak_temp = match thermal
         .local_temperature_by_chunk
         .values()
         .copied()
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or(thermal.sink_temperature_k);
+        .max_by(|a, b| match a.partial_cmp(b) {
+            Some(ordering) => ordering,
+            None => Ordering::Equal,
+        })
+    {
+        Some(value) => value,
+        None => thermal.sink_temperature_k,
+    };
     let tick = global_clock.causal_seq();
 
     let stats_text = format!(
@@ -93,12 +100,25 @@ fn live_stats_overlay_system(
         insect_count, gs_active, peak_temp, tick
     );
 
+    let (cam_x, cam_y, area_max_x, area_max_y) = match camera_query.single() {
+        Ok((transform, Projection::Orthographic(ortho))) => (
+            transform.translation.x,
+            transform.translation.y,
+            ortho.area.max.x,
+            ortho.area.max.y,
+        ),
+        _ => return,
+    };
+    // Pin to the visible top-left corner of the current camera view.
+    let overlay_x = cam_x - area_max_x + 260.0;
+    let overlay_y = cam_y + area_max_y - 180.0;
+
     commands.spawn((
         LiveStatsOverlay,
         Text2d::new(stats_text),
         stats_font,
         stats_color,
-        Transform::from_translation(Vec3::new(-4900.0, 4900.0, 10.0)),
+        Transform::from_translation(Vec3::new(overlay_x, overlay_y, 10.0)),
     ));
 }
 
@@ -1739,12 +1759,12 @@ fn chunk_grid_gizmo_system(
         _ => return,
     };
 
-    let half_w = 640.0 * ortho.scale;
-    let half_h = 360.0 * ortho.scale;
-    let viewport_min_x = transform.translation.x - half_w;
-    let viewport_max_x = transform.translation.x + half_w;
-    let viewport_min_y = transform.translation.y - half_h;
-    let viewport_max_y = transform.translation.y + half_h;
+    // Use projection area from the active camera instead of hardcoded 16:9 extents.
+    // This keeps the interior grid shape consistent with the bright world boundary.
+    let viewport_min_x = transform.translation.x + ortho.area.min.x;
+    let viewport_max_x = transform.translation.x + ortho.area.max.x;
+    let viewport_min_y = transform.translation.y + ortho.area.min.y;
+    let viewport_max_y = transform.translation.y + ortho.area.max.y;
 
     // World runs from 0 to 256*CHUNK_PIXEL on each axis
     let world_min_x = 0.0_f32;
