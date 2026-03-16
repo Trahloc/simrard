@@ -292,7 +292,10 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         HeadlessProfile::SubstrateOnly => {
             app.init_resource::<QuestBoard>()
                 .init_resource::<SubstrateStabilityState>()
-                .add_systems(Startup, initialize_substrate_baseline)
+                .add_systems(
+                    Startup,
+                    (initialize_substrate_baseline, initialize_substrate_activation).chain(),
+                )
                 .add_systems(
                     PreUpdate,
                     (
@@ -326,6 +329,9 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
                     break HeadlessTermination::AllPawnsDied;
                 }
                 if profile == HeadlessProfile::SubstrateOnly {
+                    if started.elapsed().as_secs_f64() >= 60.0 {
+                        update_substrate_t60_debug_line(app.world_mut());
+                    }
                     if let Some(stability) = app.world().get_resource::<SubstrateStabilityState>() {
                         if stability.equilibrium_reached {
                             break HeadlessTermination::SubstrateEquilibriumReached;
@@ -365,6 +371,41 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
     }
 }
 
+fn update_substrate_t60_debug_line(world: &mut World) {
+    let rewrites_total = match world
+        .get_resource::<SimulationReport>()
+        .and_then(|report| report.counters.get("hypergraph_rewrites").copied())
+    {
+        Some(value) => value,
+        None => 0,
+    };
+    let rule_fires = match world
+        .get_resource::<SimulationReport>()
+        .and_then(|report| report.counters.get("hypergraph_rule_fires").copied())
+    {
+        Some(value) => value,
+        None => 0,
+    };
+    let cfg = world
+        .get_resource::<HypergraphSubstrate>()
+        .expect("HypergraphSubstrate missing in headless substrate profile; fix initialization")
+        .config();
+    let patch_count = (cfg.patch_cols as f64 * cfg.patch_rows as f64).max(1.0);
+    let rewrites_per_patch_per_sec = rewrites_total as f64 / (patch_count * 60.0);
+    let line = format!(
+        "t=60s Hypergraph: rewrites_total={} avg_rewrites_per_patch_per_sec={:.4} active_rule_firing_count={}",
+        rewrites_total,
+        rewrites_per_patch_per_sec,
+        rule_fires,
+    );
+
+    if let Some(mut state) = world.get_resource_mut::<SubstrateStabilityState>() {
+        if state.debug_line_t60_hypergraph.is_none() {
+            state.debug_line_t60_hypergraph = Some(line);
+        }
+    }
+}
+
 fn force_panic_error_handlers(app: &mut App) {
     for sub_app in app.sub_apps_mut().iter_mut() {
         sub_app.insert_resource(bevy::ecs::error::DefaultErrorHandler(bevy::ecs::error::panic));
@@ -384,6 +425,82 @@ fn initialize_substrate_baseline(mut report: Option<ResMut<SimulationReport>>) {
     if let Some(ref mut report) = report {
         report.set_initial_pawn_count(0);
     }
+}
+
+fn initialize_substrate_activation(
+    mut simlife: ResMut<SimLifeState>,
+    mut chemistry: ResMut<ChemistryState>,
+    mut charter: ResMut<SpatialCharter>,
+    mut substrate: ResMut<HypergraphSubstrate>,
+    mut state: ResMut<SubstrateStabilityState>,
+) {
+    // Substrate-only profile requires visible Tier 10 activity in the first minute.
+    substrate.set_interval_ticks(SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS);
+    substrate.set_chaos(SUBSTRATE_HYPERGRAPH_CHAOS);
+
+    let seeded = gs_seed_initial_state(0, &mut simlife, Some(&mut chemistry), &mut charter);
+
+    let total_cells = ((CHUNK_EXTENT as u64) + 1).pow(2) as f32;
+    let non_zero_cells = simlife
+        .v_field
+        .iter()
+        .filter(|(_, v)| **v > 0.0)
+        .count();
+    let (sum_u, sum_v, sample_count) = simlife
+        .u_field
+        .iter()
+        .filter_map(|(chunk, u)| {
+            simlife
+                .v_field
+                .get(chunk)
+                .map(|v| (*u as f64, *v as f64))
+        })
+        .fold((0.0_f64, 0.0_f64, 0_u64), |(su, sv, c), (u, v)| {
+            (su + u, sv + v, c + 1)
+        });
+    let avg_u = if sample_count > 0 {
+        sum_u / sample_count as f64
+    } else {
+        0.0
+    };
+    let avg_v = if sample_count > 0 {
+        sum_v / sample_count as f64
+    } else {
+        0.0
+    };
+    let coverage_pct = if total_cells > 0.0 {
+        (non_zero_cells as f32 / total_cells) * 100.0
+    } else {
+        0.0
+    };
+
+    let fungal_coverage_pct = if total_cells > 0.0 {
+        (simlife.grass_per_chunk.len() as f32 / total_cells) * 100.0
+    } else {
+        0.0
+    };
+    let nutrient_redistribution_rate = if seeded == 0 {
+        0.0
+    } else {
+        let mut total = 0.0_f64;
+        for chunk in simlife.v_field.keys() {
+                let noise_floor = match chemistry.receptor_noise_floor_by_chunk.get(chunk).copied() {
+                    Some(value) => value,
+                    None => 0.0,
+                };
+                total += noise_floor as f64 / HYPERGRAPH_NOISE_FLOOR_MAX as f64;
+        }
+        total / seeded as f64
+    };
+
+    state.debug_line_t0_gray_scott = format!(
+        "t=0 Gray-Scott seed: non_zero_cells={} avg_u={:.4} avg_v={:.4} coverage={:.4}%",
+        non_zero_cells, avg_u, avg_v, coverage_pct
+    );
+    state.debug_line_t0_fungal = format!(
+        "t=0 Fungal init: coverage={:.4}% nutrient_redistribution_rate={:.4}",
+        fungal_coverage_pct, nutrient_redistribution_rate
+    );
 }
 
 fn substrate_tick_driver(
@@ -413,6 +530,9 @@ struct SubstrateStabilityState {
     equilibrium_seconds: Option<f64>,
     // Per-tier low-activity streak counters: index [0]=T5, [1]=T6, [2]=T7, [3]=T8, [4]=T9, [5]=T10.
     tier_low_streak: [u64; 6],
+    debug_line_t0_gray_scott: String,
+    debug_line_t0_fungal: String,
+    debug_line_t60_hypergraph: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +583,9 @@ impl Default for SubstrateStabilityState {
             equilibrium_tier: None,
             equilibrium_seconds: None,
             tier_low_streak: [0; 6],
+            debug_line_t0_gray_scott: "t=0 Gray-Scott seed: unavailable".to_string(),
+            debug_line_t0_fungal: "t=0 Fungal init: unavailable".to_string(),
+            debug_line_t60_hypergraph: None,
         }
     }
 }
@@ -771,12 +894,15 @@ fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
     let early_fluxes: Vec<f64> = early.iter().map(|s| s.energy_flux as f64).collect();
     let late_fluxes: Vec<f64> = late.iter().map(|s| s.energy_flux as f64).collect();
 
+    let early_tier9 = (variance(&early_fluxes) / 0.1).clamp(0.0, 1.0);
+    let late_tier9 = (variance(&late_fluxes) / 0.1).clamp(0.0, 1.0);
+
     TierTrends {
         tier10: tier_trend(
             window_avg_rewrites_per_sec(early),
             window_avg_rewrites_per_sec(late),
         ),
-        tier9: tier_trend(variance(&early_fluxes), variance(&late_fluxes)),
+        tier9: tier_trend(early_tier9, late_tier9),
         tier8: tier_trend(early_entropy, late_entropy),
         tier7: tier_trend(
             max_hist_bin_change_ratio(early),
@@ -802,6 +928,7 @@ fn substrate_stability_probe_system(
     simlife: Res<SimLifeState>,
     chemistry: Res<ChemistryState>,
     report: Res<SimulationReport>,
+    substrate: Res<HypergraphSubstrate>,
     mut state: ResMut<SubstrateStabilityState>,
 ) {
     let seq = global_clock.causal_seq();
@@ -874,6 +1001,26 @@ fn substrate_stability_probe_system(
     state.end_histogram = Some(histogram);
 
     compute_tier_scores(&mut state);
+
+    if state.debug_line_t60_hypergraph.is_none() && (seq / 1000) >= 60 {
+        let rewrites_total = match report.counters.get("hypergraph_rewrites").copied() {
+            Some(value) => value,
+            None => 0,
+        };
+        let rule_fires = match report.counters.get("hypergraph_rule_fires").copied() {
+            Some(value) => value,
+            None => 0,
+        };
+        let cfg = substrate.config();
+        let patch_count = (cfg.patch_cols as f64 * cfg.patch_rows as f64).max(1.0);
+        let rewrites_per_patch_per_sec = rewrites_total as f64 / (patch_count * 60.0);
+        state.debug_line_t60_hypergraph = Some(format!(
+            "t=60s Hypergraph: rewrites_total={} avg_rewrites_per_patch_per_sec={:.4} active_rule_firing_count={}",
+            rewrites_total,
+            rewrites_per_patch_per_sec,
+            rule_fires,
+        ));
+    }
 }
 
 fn advance_simulation_one_tick(
@@ -1237,6 +1384,14 @@ fn build_headless_report(
                 )
             };
             lines.push(vitality_status);
+
+            lines.push(format!("  {}", stability.debug_line_t0_gray_scott));
+            lines.push(format!("  {}", stability.debug_line_t0_fungal));
+            let t60_line = match stability.debug_line_t60_hypergraph.clone() {
+                Some(value) => value,
+                None => "t=60s Hypergraph: unavailable".to_string(),
+            };
+            lines.push(format!("  {}", t60_line));
 
             let start = match stability.start_coverage_pct {
                 Some(value) => value,
@@ -2031,6 +2186,13 @@ const GS_F_CAUSAL_VOLUME_SCALE: f32 = 0.012;
 const GS_CLUSTERING_MULTIPLIER: f32 = 0.5;
 /// Directive retune: soften causal-volume influence on local growth.
 const GS_CAUSAL_VOLUME_MULTIPLIER: f32 = 0.6;
+/// Chemistry hotspots softly bias local GS feed toward active nutrient regions.
+const GS_F_CHEMISTRY_HOTSPOT_SCALE: f32 = 0.03;
+/// Substrate mode target initial GS seeded density in [0.5%, 1.0%].
+const GS_INITIAL_SEED_COVERAGE: f32 = 0.006;
+/// Tier 10 activation tuning for substrate profile.
+const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS: u64 = 1_000;
+const SUBSTRATE_HYPERGRAPH_CHAOS: f32 = 0.45;
 
 #[derive(Resource, Debug, Clone)]
 struct ChemistryState {
@@ -2099,7 +2261,7 @@ impl Default for SimLifeState {
 #[cfg(test)]
 fn advance_simlife_grass(current_seq: u64, simlife: &mut SimLifeState) {
     let mut charter = SpatialCharter::default();
-    advance_simlife_grass_with_hypergraph(current_seq, simlife, None, &mut charter);
+    advance_simlife_grass_with_hypergraph(current_seq, simlife, None, None, &mut charter, None);
 }
 
 /// Advance the Gray-Scott Tier 5/6 field by one logical tick.
@@ -2108,7 +2270,9 @@ fn advance_simlife_grass_with_hypergraph(
     current_seq: u64,
     simlife: &mut SimLifeState,
     hypergraph: Option<&HypergraphSubstrate>,
+    chemistry: Option<&ChemistryState>,
     charter: &mut SpatialCharter,
+    report: Option<&mut SimulationReport>,
 ) {
     if current_seq <= simlife.last_tick {
         return;
@@ -2117,7 +2281,7 @@ fn advance_simlife_grass_with_hypergraph(
 
     // Seed initial state when all active cells have been exhausted (or on cold start).
     if simlife.gs_active.is_empty() {
-        gs_seed_initial_state(simlife);
+        gs_seed_initial_state(current_seq, simlife, None, charter);
     }
 
     // Throttle: only run the GS stencil every GS_UPDATE_INTERVAL_TICKS sim ticks.
@@ -2126,22 +2290,125 @@ fn advance_simlife_grass_with_hypergraph(
     }
     simlife.last_gs_tick = current_seq;
 
-    gs_update(current_seq, simlife, hypergraph, charter);
+    gs_update(current_seq, simlife, hypergraph, chemistry, charter, report);
 }
 
-/// Set up four widely-spaced seed clusters (<0.01 % of the 256×256 grid).
-/// Initial conditions: u=0.50, v=0.25 — classical GS spot-seed amplitude.
-fn gs_seed_initial_state(simlife: &mut SimLifeState) {
-    let seeds: &[(u32, u32)] = &[(64, 64), (64, 192), (192, 64), (192, 192)];
-    for &(x, y) in seeds {
-        let chunk = ChunkId(x, y);
-        simlife.u_field.insert(chunk, 0.5);
-        simlife.v_field.insert(chunk, 0.25);
-        simlife.gs_active.insert(chunk);
-        for (nx, ny) in gs_neighbor_coords(x, y) {
-            simlife.gs_active.insert(ChunkId(nx, ny));
+fn substrate_hotspot_centers() -> [(u32, u32); 8] {
+    [
+        (32, 32),
+        (32, CHUNK_EXTENT.saturating_sub(32)),
+        (CHUNK_EXTENT.saturating_sub(32), 32),
+        (CHUNK_EXTENT.saturating_sub(32), CHUNK_EXTENT.saturating_sub(32)),
+        (CHUNK_EXTENT / 2, CHUNK_EXTENT / 2),
+        (CHUNK_EXTENT / 2, 40),
+        (40, CHUNK_EXTENT / 2),
+        (CHUNK_EXTENT.saturating_sub(40), CHUNK_EXTENT / 2),
+    ]
+}
+
+fn seeded_uv_for_chunk(chunk: ChunkId) -> (f32, f32) {
+    let hash = ((chunk.0 as u64) << 32) ^ (chunk.1 as u64) ^ 0x9e37_79b9;
+    let u = 0.2 + ((hash & 0xff) as f32 / 255.0) * 0.4;
+    let v = 0.2 + (((hash >> 8) & 0xff) as f32 / 255.0) * 0.4;
+    (u.clamp(0.2, 0.6), v.clamp(0.2, 0.6))
+}
+
+/// Seed sparse GS + chemistry hotspots through charter leases.
+/// Returns number of seeded GS cells.
+fn gs_seed_initial_state(
+    current_seq: u64,
+    simlife: &mut SimLifeState,
+    chemistry: Option<&mut ChemistryState>,
+    charter: &mut SpatialCharter,
+) -> usize {
+    let total_cells = ((CHUNK_EXTENT as usize) + 1).pow(2);
+    let target_seed_cells = (total_cells as f32 * GS_INITIAL_SEED_COVERAGE) as usize;
+
+    let mut seeded_cells = 0_usize;
+    let centers = substrate_hotspot_centers();
+
+    if let Some(chemistry) = chemistry {
+        for (cx, cy) in centers {
+            for dx in -6_i32..=6_i32 {
+                for dy in -6_i32..=6_i32 {
+                    let x = cx as i32 + dx;
+                    let y = cy as i32 + dy;
+                    if x < 0 || y < 0 || x > CHUNK_EXTENT as i32 || y > CHUNK_EXTENT as i32 {
+                        continue;
+                    }
+                    let dist2 = (dx * dx + dy * dy) as f32;
+                    if dist2 > 36.0 {
+                        continue;
+                    }
+                    let chunk = ChunkId(x as u32, y as u32);
+                    let intensity = ((36.0 - dist2) / 36.0).clamp(0.0, 1.0);
+                    let noise_floor = (0.08 + intensity * 0.24).clamp(0.0, HYPERGRAPH_NOISE_FLOOR_MAX);
+                    let lease_req = SpatialLease {
+                        primary: chunk,
+                        fringe: vec![],
+                        intent: LeaseIntent {
+                            reads: vec![],
+                            writes: vec![TypeId::of::<ChemistryNoiseFloorWrite>()],
+                        },
+                        granted_at_causal_seq: current_seq,
+                    };
+                    if let Ok(handle) = charter.request_lease(lease_req, current_seq) {
+                        chemistry.receptor_noise_floor_by_chunk.insert(chunk, noise_floor);
+                        charter.release_lease(handle);
+                    }
+                }
+            }
         }
     }
+
+    'seed: for (cx, cy) in centers {
+        for dx in -5_i32..=5_i32 {
+            for dy in -5_i32..=5_i32 {
+                let x = cx as i32 + dx;
+                let y = cy as i32 + dy;
+                if x < 0 || y < 0 || x > CHUNK_EXTENT as i32 || y > CHUNK_EXTENT as i32 {
+                    continue;
+                }
+                let dist2 = (dx * dx + dy * dy) as f32;
+                if dist2 > 25.0 {
+                    continue;
+                }
+                let chunk = ChunkId(x as u32, y as u32);
+                if simlife.v_field.contains_key(&chunk) {
+                    continue;
+                }
+                let lease_req = SpatialLease {
+                    primary: chunk,
+                    fringe: vec![],
+                    intent: LeaseIntent {
+                        reads: vec![],
+                        writes: vec![TypeId::of::<SimLifeGrayScottWrite>()],
+                    },
+                    granted_at_causal_seq: current_seq,
+                };
+                if let Ok(handle) = charter.request_lease(lease_req, current_seq) {
+                    let (u, v) = seeded_uv_for_chunk(chunk);
+                    simlife.u_field.insert(chunk, u);
+                    simlife.v_field.insert(chunk, v);
+                    let grass = (v * SIMLIFE_GRASS_MAX as f32) as u32;
+                    if grass > 0 {
+                        simlife.grass_per_chunk.insert(chunk, grass);
+                    }
+                    simlife.gs_active.insert(chunk);
+                    for (nx, ny) in gs_neighbor_coords(chunk.0, chunk.1) {
+                        simlife.gs_active.insert(ChunkId(nx, ny));
+                    }
+                    charter.release_lease(handle);
+                    seeded_cells += 1;
+                }
+                if seeded_cells >= target_seed_cells {
+                    break 'seed;
+                }
+            }
+        }
+    }
+
+    seeded_cells
 }
 
 /// 4-neighbor coordinates of (cx, cy) with Neumann (zero-flux) boundary clamping.
@@ -2172,7 +2439,9 @@ fn gs_update(
     current_seq: u64,
     simlife: &mut SimLifeState,
     hypergraph: Option<&HypergraphSubstrate>,
+    chemistry: Option<&ChemistryState>,
     charter: &mut SpatialCharter,
+    mut report: Option<&mut SimulationReport>,
 ) {
     let active_cells: Vec<ChunkId> = simlife.gs_active.iter().copied().collect();
 
@@ -2193,7 +2462,14 @@ fn gs_update(
                 let causal_volume = output.causal_volume.clamp(0.0, 1.0)
                     * GS_F_CAUSAL_VOLUME_SCALE
                     * GS_CAUSAL_VOLUME_MULTIPLIER;
-                (GS_F_BASE + clustering + causal_volume).clamp(0.01, 0.10)
+                let chemistry_hotspot_raw = chemistry
+                    .and_then(|c| c.receptor_noise_floor_by_chunk.get(&cell).copied());
+                let chemistry_hotspot = match chemistry_hotspot_raw {
+                    Some(value) => value,
+                    None => 0.0,
+                } / HYPERGRAPH_NOISE_FLOOR_MAX;
+                let hotspot_bias = chemistry_hotspot.clamp(0.0, 1.0) * GS_F_CHEMISTRY_HOTSPOT_SCALE;
+                (GS_F_BASE + clustering + causal_volume + hotspot_bias).clamp(0.01, 0.12)
             } else {
                 GS_F_BASE
             }
@@ -2215,6 +2491,8 @@ fn gs_update(
     // Apply updates through charter leases. Build next active frontier.
     let mut new_active: HashSet<ChunkId> = HashSet::new();
     let mut lease_handles: Vec<LeaseHandle> = Vec::new();
+    let mut lease_grants = 0_u64;
+    let mut lease_denials = 0_u64;
 
     for (cell, new_u, new_v) in updates {
         let ChunkId(cx, cy) = cell;
@@ -2229,6 +2507,7 @@ fn gs_update(
         };
         match charter.request_lease(lease_req, current_seq) {
             Ok(handle) => {
+                lease_grants += 1;
                 simlife.u_field.insert(cell, new_u);
                 simlife.v_field.insert(cell, new_v);
                 // Derive grass from V concentration.
@@ -2248,6 +2527,7 @@ fn gs_update(
                 lease_handles.push(handle);
             }
             Err(_) => {
+                lease_denials += 1;
                 // Denied: preserve old value; keep cell in active set for retry next step.
                 let old_v = *simlife.v_field.get(&cell).unwrap_or(&0.0); // GS_SPARSE_FIELD_DEFAULT
                 if old_v > GS_V_ACTIVE_THRESHOLD {
@@ -2264,6 +2544,15 @@ fn gs_update(
 
     for handle in lease_handles {
         charter.release_lease(handle);
+    }
+
+    if let Some(ref mut report) = report {
+        for _ in 0..lease_grants {
+            report.bump("simlife_lease_grants");
+        }
+        for _ in 0..lease_denials {
+            report.bump("simlife_lease_denials");
+        }
     }
 }
 
@@ -2290,7 +2579,9 @@ fn simlife_tick_system(
     global_clock: Res<GlobalTickClock>,
     mut simlife: ResMut<SimLifeState>,
     hypergraph: Res<HypergraphSubstrate>,
+    chemistry: Res<ChemistryState>,
     mut charter: ResMut<SpatialCharter>,
+    mut report: Option<ResMut<SimulationReport>>,
 ) {
     let started = Instant::now();
     // Causal ordering: run after sim_tick_driver, then respawn reads same-tick SimLife state.
@@ -2299,14 +2590,18 @@ fn simlife_tick_system(
             global_clock.causal_seq(),
             &mut simlife,
             Some(&hypergraph),
+            Some(&chemistry),
             &mut charter,
+            report.as_deref_mut(),
         );
     } else {
         advance_simlife_grass_with_hypergraph(
             global_clock.causal_seq(),
             &mut simlife,
             None,
+            None,
             &mut charter,
+            report.as_deref_mut(),
         );
     }
     perf_record("simlife_tick", started.elapsed());
@@ -2384,8 +2679,12 @@ fn hypergraph_tick_system(
         if stats.considered > 0 {
             report.bump("hypergraph_ticks");
         }
+        for _ in 0..stats.considered.saturating_sub(stats.denied) {
+            report.bump("hypergraph_lease_grants");
+        }
         for _ in 0..stats.rewritten {
             report.bump("hypergraph_rewrites");
+            report.bump("hypergraph_rule_fires");
         }
         for _ in 0..stats.denied {
             report.bump("hypergraph_lease_denials");

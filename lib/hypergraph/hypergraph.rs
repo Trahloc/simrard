@@ -208,6 +208,10 @@ impl HypergraphSubstrate {
         self.config.chaos = chaos.clamp(0.0, 1.0);
     }
 
+    pub fn set_interval_ticks(&mut self, interval_ticks: u64) {
+        self.config.interval_ticks = interval_ticks.max(1);
+    }
+
     pub fn patch_dimensions(&self) -> (u32, u32) {
         (self.config.patch_cols, self.config.patch_rows)
     }
