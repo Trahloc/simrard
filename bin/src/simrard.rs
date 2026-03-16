@@ -48,7 +48,6 @@ static HEADLESS_PERF: OnceLock<Mutex<PerfAudit>> = OnceLock::new();
 static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
 static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
 static BENCHMARK_SECONDS: OnceLock<f64> = OnceLock::new();
-static VISUAL_DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Resource, Debug, Clone, Copy)]
 struct VisualDebug {
@@ -119,14 +118,6 @@ fn benchmark_seconds_from_args() -> f64 {
     })
 }
 
-fn visual_debug_enabled_from_args() -> bool {
-    *VISUAL_DEBUG_ENABLED.get_or_init(|| {
-        std::env::args()
-            .skip(1)
-            .any(|arg| arg == "--visual-debug")
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SimulationMode {
     Interactive,
@@ -182,7 +173,7 @@ fn parse_mode() -> SimulationMode {
 fn run_interactive() {
     let mut app = App::new();
     app.set_error_handler(bevy::ecs::error::panic);
-    let visual_debug_default_on = visual_debug_enabled_from_args() || !headless_substrate_from_args();
+    let visual_debug_default_on = true;
     app.add_plugins(DefaultPlugins)
         .add_plugins(BigBrainPlugin::new(PreUpdate))
         .add_plugins(TransformsPlugin)
@@ -1706,9 +1697,9 @@ struct VisualDebugGsSprite;
 #[derive(Component)]
 struct VisualDebugThermalSprite;
 
-const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 120;
-const VISUAL_DEBUG_MAX_GS_SPRITES: usize = 40;
-const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 32;
+const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 200;
+const VISUAL_DEBUG_MAX_GS_SPRITES: usize = 30;
+const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 20;
 
 fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMut<VisualDebug>) {
     if keys.just_pressed(KeyCode::KeyV) {
@@ -1738,21 +1729,21 @@ fn visual_debug_insect_overlay_system(
         let sum = (hunger + fear).max(0.001);
         let hw = hunger / sum;
         let fw = fear / sum;
-        let r = 0.9 * hw + 0.62 * fw;
-        let g = 0.18 * hw + 0.15 * fw;
-        let b = 0.2 * hw + 0.82 * fw;
+        let r = (0.95 * hw + 0.66 * fw).clamp(0.0, 1.0);
+        let g = (0.12 * hw + 0.10 * fw).clamp(0.0, 1.0);
+        let b = (0.18 * hw + 0.90 * fw).clamp(0.0, 1.0);
         let energy_norm = (insect.energy / 8.0).clamp(0.0, 1.0);
         let pulse_rate = 2.5 + hunger * 5.0;
         let phase = insect.age as f32 * 0.11 + insect.chunk.0 as f32 * 0.03 + insect.chunk.1 as f32 * 0.02;
         let pulse = (t * pulse_rate + phase).sin();
-        let base_size = 1.4 + insect.energy.clamp(0.0, 8.0) * 1.0;
-        let width = base_size * (1.0 + 0.22 * pulse);
-        let height = base_size * (1.0 - 0.14 * pulse + (1.0 - energy_norm) * 0.08);
+        let base_size = 4.2 + insect.energy.clamp(0.0, 8.0) * 1.2;
+        let width = base_size * (1.0 + 0.28 * pulse);
+        let height = base_size * (1.0 - 0.18 * pulse + (1.0 - energy_norm) * 0.10);
         let mut pos = chunk_to_translation(&insect.chunk, 3.2);
         pos.x += ((insect.age as f32).sin() * 0.35).clamp(-0.4, 0.4);
         pos.y += ((insect.age as f32 * 0.73).cos() * 0.35).clamp(-0.4, 0.4);
-        let leg_wobble = 0.2 * (t * (6.0 + hunger * 4.0) + phase * 0.7).sin();
-        let alpha = (0.75 + 0.2 * energy_norm + 0.05 * pulse).clamp(0.35, 0.98);
+        let leg_wobble = 0.28 * (t * (6.0 + hunger * 4.0) + phase * 0.7).sin();
+        let alpha = (0.82 + 0.14 * energy_norm + 0.06 * pulse).clamp(0.55, 1.0);
         commands.spawn((
             VisualDebugInsectSprite,
             Sprite::from_color(Color::srgba(r, g, b, alpha), Vec2::new(width, height)),
@@ -1774,6 +1765,7 @@ fn visual_debug_gs_overlay_system(
     visual: Res<VisualDebug>,
     simlife: Res<SimLifeState>,
     time: Res<Time>,
+    mut gizmos: Gizmos,
     existing: Query<Entity, With<VisualDebugGsSprite>>,
 ) {
     for entity in existing.iter() {
@@ -1818,7 +1810,7 @@ fn visual_debug_gs_overlay_system(
         let g = (biomass * 0.75 + shade * 0.22).clamp(0.0, 1.0);
         let b = (v * 0.82 + (1.0 - shade) * 0.15 + flow * 0.08).clamp(0.0, 1.0);
         let shimmer = (t * 1.4 + (cell.0 as f32 * 0.03 + cell.1 as f32 * 0.05)).sin();
-        let alpha = (0.26 + 0.24 * flow + 0.12 * (shade - 0.5) + 0.04 * shimmer).clamp(0.14, 0.58);
+        let alpha = (0.34 + 0.28 * flow + 0.14 * (shade - 0.5) + 0.05 * shimmer).clamp(0.22, 0.72);
         let h = (CHUNK_PIXEL - 1.4 + v * 0.9 + flow * 0.7).max(1.0);
         let w = (CHUNK_PIXEL - 1.2 + u * 0.6).max(1.0);
         let tilt = 0.12 * ny;
@@ -1829,6 +1821,16 @@ fn visual_debug_gs_overlay_system(
             Sprite::from_color(color, Vec2::new(w, h)),
             Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(tilt)),
         ));
+
+        let dir = Vec2::new(nx, ny);
+        let dir_len = dir.length();
+        if dir_len > 0.03 {
+            let tangent = dir / dir_len;
+            let half = (4.0 + 8.0 * flow).min(10.0);
+            let center = Vec2::new(pos.x, pos.y);
+            let line_color = Color::srgba(0.25, 0.95, 0.55, (0.18 + flow * 0.34).clamp(0.18, 0.52));
+            gizmos.line_2d(center - tangent * half, center + tangent * half, line_color);
+        }
     }
 }
 
@@ -1883,17 +1885,17 @@ fn visual_debug_thermal_overlay_system(
         let phase = chunk.0 as f32 * 0.03 + chunk.1 as f32 * 0.05;
         let pulse = (time_s * (2.8 + rate * 4.0) + phase).sin().abs();
         let pulse_boost = (rate * 0.2 * pulse).clamp(0.0, 0.22);
-        let alpha = (0.22 + intensity * 0.20 + pulse_boost).clamp(0.14, 0.68);
+        let alpha = (0.30 + intensity * 0.26 + pulse_boost).clamp(0.20, 0.86);
         let color = Color::srgba(
-            0.15 + intensity * 0.85,
-            0.1 + pulse_boost * 0.2,
-            1.0 - intensity * 0.9,
+            0.08 + intensity * 0.92,
+            0.08 + pulse_boost * 0.25,
+            1.0 - intensity * 0.95,
             alpha,
         );
         let pos = chunk_to_translation(&chunk, 2.0);
         commands.spawn((
             VisualDebugThermalSprite,
-            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 2.0 + pulse_boost * 2.0).max(1.0))),
+            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 1.0 + pulse_boost * 4.0).max(1.0))),
             Transform::from_translation(pos),
         ));
         cache.prev_temp_by_chunk.insert(chunk, current_temp);
@@ -2094,6 +2096,10 @@ fn setup_quest_ui(mut commands: Commands) {
                     p.spawn((TextSpan::new("food"), TextColor(food_c.into())));
                     p.spawn((TextSpan::new("   "), TextColor(neutral_c.into())));
                     p.spawn((TextSpan::new("water"), TextColor(water_c.into())));
+                    p.spawn((TextSpan::new("\n  Thermal key: "), TextColor(neutral_c.into())));
+                    p.spawn((TextSpan::new("hot"), TextColor(Color::srgb(0.95, 0.16, 0.12).into())));
+                    p.spawn((TextSpan::new(" / "), TextColor(neutral_c.into())));
+                    p.spawn((TextSpan::new("cold"), TextColor(Color::srgb(0.2, 0.4, 0.98).into())));
                 });
             // Sections 2–4: resources, quests, activity (plain text, updated each frame)
             for _ in 0..(UI_SECTIONS - 2) {
@@ -2207,6 +2213,7 @@ fn ui_panel_update_system(
     global_clock: Res<GlobalTickClock>,
     scale: Res<SimTimeScale>,
     hypergraph: Res<HypergraphSubstrate>,
+    visual: Res<VisualDebug>,
     #[cfg(debug_assertions)] hypergraph_viz: Res<HypergraphDebugViz>,
     quest_board: Res<QuestBoard>,
     activity: Res<ActivityLog>,
@@ -2224,19 +2231,20 @@ fn ui_panel_update_system(
     let pause = if scale.0 == 0.0 { " [PAUSED]" } else { "" };
     #[cfg(debug_assertions)]
     let hypergraph_controls = if hypergraph_viz.enabled {
-        "J/K chaos  V viz:on"
+        "J/K chaos  H hyper-viz:on"
     } else {
-        "J/K chaos  V viz:off"
+        "J/K chaos  H hyper-viz:off"
     };
     #[cfg(not(debug_assertions))]
     let hypergraph_controls = "";
     let sim_status = format!(
-        "Sim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}",
+        "Sim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}\nVisual Debug: {}",
         seq,
         scale.0,
         pause,
         hypergraph.chaos(),
-        hypergraph_controls
+        hypergraph_controls,
+        if visual.enabled { "ON" } else { "OFF" }
     );
     // Legend is built once in setup with actual colors (no color words); section 1 is not overwritten.
     let _legend_placeholder = "Pawn color = dominant need:\n  hunger   thirst   fatigue\n  Big food   water";
