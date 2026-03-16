@@ -21,6 +21,7 @@ use simrard_lib_charter::{
 #[cfg(debug_assertions)]
 use simrard_lib_charter::charter_watchguard_system;
 use simrard_lib_hypergraph::HypergraphSubstrate;
+use simrard_lib_tier4::{advance_tier4, Tier4State};
 use simrard_lib_pawn::{
     Capabilities, FoodReservation, ItemHistory, ItemIdAllocator, ItemIdentity, KnownRecipes,
     MortalityCause, NeuralNetworkComponent, Position, Quest, QuestBoard, QuestStatus, RestSpot,
@@ -47,6 +48,12 @@ static HEADLESS_PERF: OnceLock<Mutex<PerfAudit>> = OnceLock::new();
 static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
 static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
 static BENCHMARK_SECONDS: OnceLock<f64> = OnceLock::new();
+static VISUAL_DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[derive(Resource, Debug, Clone, Copy)]
+struct VisualDebug {
+    enabled: bool,
+}
 
 #[derive(Default)]
 struct PerfAudit {
@@ -107,6 +114,14 @@ fn benchmark_seconds_from_args() -> f64 {
     })
 }
 
+fn visual_debug_enabled_from_args() -> bool {
+    *VISUAL_DEBUG_ENABLED.get_or_init(|| {
+        std::env::args()
+            .skip(1)
+            .any(|arg| arg == "--visual-debug")
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SimulationMode {
     Interactive,
@@ -162,6 +177,7 @@ fn parse_mode() -> SimulationMode {
 fn run_interactive() {
     let mut app = App::new();
     app.set_error_handler(bevy::ecs::error::panic);
+    let visual_debug_default_on = visual_debug_enabled_from_args() || !headless_substrate_from_args();
     app.add_plugins(DefaultPlugins)
         .add_plugins(BigBrainPlugin::new(PreUpdate))
         .add_plugins(TransformsPlugin)
@@ -177,8 +193,12 @@ fn run_interactive() {
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
+        .init_resource::<Tier4State>()
         .init_resource::<RespawnState>()
         .init_resource::<SimLifeState>()
+        .insert_resource(VisualDebug {
+            enabled: visual_debug_default_on,
+        })
         .add_plugins(MirrorPlugin);
     #[cfg(debug_assertions)]
     app.init_resource::<HypergraphDebugViz>();
@@ -201,6 +221,7 @@ fn run_interactive() {
                 sim_tick_driver,
                 hypergraph_tick_system,
                 simlife_tick_system,
+                tier4_tick_system,
                 curiosity_discovery_system,
                 resource_respawn_system,
             )
@@ -221,6 +242,11 @@ fn run_interactive() {
                 hypergraph_debug_input_system,
                 ui_panel_update_system,
                 hypergraph_debug_viz_system,
+                visual_debug_toggle_system,
+                visual_debug_insect_overlay_system,
+                visual_debug_gs_overlay_system,
+                visual_debug_thermal_overlay_system,
+                visual_debug_hypergraph_overlay_system,
             )
                 .chain(),
         );
@@ -237,6 +263,42 @@ fn run_interactive() {
 
 fn main() {
     run();
+}
+
+fn tier4_tick_system(
+    mut state: ResMut<Tier4State>,
+    mut simlife: ResMut<SimLifeState>,
+    mut chemistry: ResMut<ChemistryState>,
+    mut thermal: ResMut<ThermalState>,
+    hypergraph: Option<Res<HypergraphSubstrate>>,
+    mut charter: ResMut<SpatialCharter>,
+    mut report: Option<ResMut<SimulationReport>>,
+    global_clock: Res<GlobalTickClock>,
+) {
+    let current_seq = global_clock.causal_seq();
+    let sink_temperature_k = thermal.sink_temperature_k;
+    let metrics = advance_tier4(
+        current_seq,
+        &mut simlife.grass_per_chunk,
+        &mut chemistry.receptor_noise_floor_by_chunk,
+        &mut thermal.local_temperature_by_chunk,
+        sink_temperature_k,
+        hypergraph.as_deref(),
+        &mut charter,
+        &mut state,
+    );
+    if let Some(metrics) = metrics {
+        if let Some(ref mut report) = report {
+            report.counters.insert("tier4_population", metrics.population as u64);
+            report.counters.insert("tier4_eat_grants", metrics.eat_grants);
+            report.counters.insert("tier4_eat_denials", metrics.eat_denials);
+            report.counters.insert("tier4_repro_grants", metrics.repro_grants);
+            report.counters.insert("tier4_repro_denials", metrics.repro_denials);
+            report.counters.insert("tier4_deaths", metrics.deaths);
+            report.counters.insert("tier4_avg_energy", metrics.avg_energy as u64);
+            report.counters.insert("tier4_decomp_total", state.decomp_total);
+        }
+    }
 }
 
 fn run_headless() -> HeadlessRunResult {
@@ -319,46 +381,6 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
                 );
         }
     }
-// ──────────────────────────────────────────────────────────────────────────
-// Tier 4 tick system integration for substrate-only mode
-// ──────────────────────────────────────────────────────────────────────────
-use simrard_lib_tier4::{advance_tier4, Tier4State};
-fn tier4_tick_system(
-    mut state: ResMut<Tier4State>,
-    mut simlife: ResMut<SimLifeState>,
-    mut chemistry: ResMut<ChemistryState>,
-    mut thermal: ResMut<ThermalState>,
-    hypergraph: Option<Res<HypergraphSubstrate>>,
-    mut charter: ResMut<SpatialCharter>,
-    mut report: Option<ResMut<SimulationReport>>,
-    global_clock: Res<GlobalTickClock>,
-) {
-    let current_seq = global_clock.causal_seq();
-    let sink_temperature_k = thermal.sink_temperature_k;
-    let metrics = advance_tier4(
-        current_seq,
-        &mut simlife.grass_per_chunk,
-        &mut chemistry.receptor_noise_floor_by_chunk,
-        &mut thermal.local_temperature_by_chunk,
-        sink_temperature_k,
-        hypergraph.as_deref(),
-        &mut charter,
-        &mut state,
-    );
-    if let Some(metrics) = metrics {
-        if let Some(ref mut report) = report {
-            report.counters.insert("tier4_population", metrics.population as u64);
-            report.counters.insert("tier4_eat_grants", metrics.eat_grants);
-            report.counters.insert("tier4_eat_denials", metrics.eat_denials);
-            report.counters.insert("tier4_repro_grants", metrics.repro_grants);
-            report.counters.insert("tier4_repro_denials", metrics.repro_denials);
-            report.counters.insert("tier4_deaths", metrics.deaths);
-            report.counters.insert("tier4_avg_energy", metrics.avg_energy as u64);
-            report.counters.insert("tier4_decomp_total", state.decomp_total);
-        }
-    }
-}
-
     force_panic_error_handlers(&mut app);
 
     let started = Instant::now();
@@ -1666,6 +1688,192 @@ fn chunk_grid_gizmo_system(mut gizmos: Gizmos) {
         let p = i as f32 * CHUNK_PIXEL;
         gizmos.line_2d(Vec2::new(p, 0.0), Vec2::new(p, extent as f32 * CHUNK_PIXEL), color);
         gizmos.line_2d(Vec2::new(0.0, p), Vec2::new(extent as f32 * CHUNK_PIXEL, p), color);
+    }
+}
+
+#[derive(Component)]
+struct VisualDebugInsectSprite;
+
+#[derive(Component)]
+struct VisualDebugGsSprite;
+
+#[derive(Component)]
+struct VisualDebugThermalSprite;
+
+const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 120;
+const VISUAL_DEBUG_MAX_GS_SPRITES: usize = 40;
+const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 32;
+
+fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMut<VisualDebug>) {
+    if keys.just_pressed(KeyCode::KeyV) {
+        visual.enabled = !visual.enabled;
+    }
+}
+
+fn visual_debug_insect_overlay_system(
+    mut commands: Commands,
+    visual: Res<VisualDebug>,
+    tier4: Res<Tier4State>,
+    existing: Query<Entity, With<VisualDebugInsectSprite>>,
+) {
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
+    }
+    if !visual.enabled || tier4.insects.is_empty() {
+        return;
+    }
+
+    let step = (tier4.insects.len() / VISUAL_DEBUG_MAX_INSECT_SPRITES).max(1);
+    for insect in tier4.insects.iter().step_by(step).take(VISUAL_DEBUG_MAX_INSECT_SPRITES) {
+        let hunger = insect.hunger.clamp(0.0, 1.0);
+        let fear = insect.fear.clamp(0.0, 1.0);
+        let sum = (hunger + fear).max(0.001);
+        let hw = hunger / sum;
+        let fw = fear / sum;
+        let r = 0.9 * hw + 0.62 * fw;
+        let g = 0.18 * hw + 0.15 * fw;
+        let b = 0.2 * hw + 0.82 * fw;
+        let size = 1.5 + insect.energy.clamp(0.0, 8.0) * 1.1;
+        let mut pos = chunk_to_translation(&insect.chunk, 3.2);
+        pos.x += ((insect.age as f32).sin() * 0.35).clamp(-0.4, 0.4);
+        pos.y += ((insect.age as f32 * 0.73).cos() * 0.35).clamp(-0.4, 0.4);
+        commands.spawn((
+            VisualDebugInsectSprite,
+            Sprite::from_color(Color::srgba(r, g, b, 0.9), Vec2::splat(size)),
+            Transform::from_translation(pos),
+        ));
+    }
+}
+
+fn visual_debug_gs_overlay_system(
+    mut commands: Commands,
+    visual: Res<VisualDebug>,
+    simlife: Res<SimLifeState>,
+    existing: Query<Entity, With<VisualDebugGsSprite>>,
+) {
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
+    }
+    if !visual.enabled || simlife.gs_active.is_empty() {
+        return;
+    }
+
+    let mut cells: Vec<ChunkId> = simlife.gs_active.iter().copied().collect();
+    cells.sort_by(|a, b| {
+        let av = simlife.v_field.get(a).copied();
+        let bv = simlife.v_field.get(b).copied();
+        let av = match av { Some(value) => value, None => 0.0 };
+        let bv = match bv { Some(value) => value, None => 0.0 };
+        match bv.partial_cmp(&av) {
+            Some(ordering) => ordering,
+            None => Ordering::Equal,
+        }
+    });
+
+    for cell in cells.into_iter().take(VISUAL_DEBUG_MAX_GS_SPRITES) {
+        let u_raw = simlife.u_field.get(&cell).copied();
+        let v_raw = simlife.v_field.get(&cell).copied();
+        let u = match u_raw { Some(value) => value, None => 1.0 }.clamp(0.0, 1.0);
+        let v = match v_raw { Some(value) => value, None => 0.0 }.clamp(0.0, 1.0);
+        let biomass = (v * 1.2).clamp(0.0, 1.0);
+        let color = Color::srgba(u, biomass, v, 0.35);
+        let pos = chunk_to_translation(&cell, 2.2);
+        commands.spawn((
+            VisualDebugGsSprite,
+            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 1.0).max(1.0))),
+            Transform::from_translation(pos),
+        ));
+    }
+}
+
+fn visual_debug_thermal_overlay_system(
+    mut commands: Commands,
+    visual: Res<VisualDebug>,
+    thermal: Res<ThermalState>,
+    existing: Query<Entity, With<VisualDebugThermalSprite>>,
+) {
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
+    }
+    if !visual.enabled || thermal.local_temperature_by_chunk.is_empty() {
+        return;
+    }
+
+    let mut hotspots: Vec<(ChunkId, f32)> = thermal
+        .local_temperature_by_chunk
+        .iter()
+        .map(|(chunk, temp)| (*chunk, (*temp - thermal.sink_temperature_k).max(0.0)))
+        .collect();
+    hotspots.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
+        Some(ordering) => ordering,
+        None => Ordering::Equal,
+    });
+
+    let denom = hotspots
+        .first()
+        .map(|(_, delta)| *delta);
+    let denom = match denom {
+        Some(value) => value,
+        None => 1.0,
+    }
+        .max(0.001);
+    for (chunk, delta) in hotspots.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES) {
+        let t = (delta / denom).clamp(0.0, 1.0);
+        let color = Color::srgba(0.15 + t * 0.85, 0.1, 1.0 - t * 0.9, 0.32);
+        let pos = chunk_to_translation(&chunk, 2.0);
+        commands.spawn((
+            VisualDebugThermalSprite,
+            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 2.0).max(1.0))),
+            Transform::from_translation(pos),
+        ));
+    }
+}
+
+fn visual_debug_hypergraph_overlay_system(
+    visual: Res<VisualDebug>,
+    keys: Res<ButtonInput<KeyCode>>,
+    camera_query: Query<&Projection, With<Camera2d>>,
+    substrate: Res<HypergraphSubstrate>,
+    mut gizmos: Gizmos,
+) {
+    if !visual.enabled {
+        return;
+    }
+
+    let zoomed_in = match camera_query.single() {
+        Ok(Projection::Orthographic(ortho)) => ortho.scale <= 0.9,
+        _ => false,
+    };
+    let show_detail = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || zoomed_in;
+    if !show_detail {
+        return;
+    }
+
+    let mut shown = 0usize;
+    for coord in substrate.patch_coords() {
+        if shown >= 80 {
+            break;
+        }
+        let output = match substrate.patch_output(coord) {
+            Some(value) => value,
+            None => continue,
+        };
+        let (chunk_x, chunk_y) = substrate.patch_primary_chunk(coord);
+        let center = Vec2::new(
+            chunk_x as f32 * CHUNK_PIXEL + CHUNK_PIXEL * 0.5,
+            chunk_y as f32 * CHUNK_PIXEL + CHUNK_PIXEL * 0.5,
+        );
+        let glow = Color::srgba(
+            (0.2 + output.clustering * 0.6).clamp(0.0, 1.0),
+            (0.2 + output.usable_flux * 0.7).clamp(0.0, 1.0),
+            (0.35 + output.causal_volume * 0.55).clamp(0.0, 1.0),
+            0.25,
+        );
+        let radius = 1.6 + output.density * 3.2;
+        gizmos.circle_2d(center, radius, glow);
+        let ribbon = 3.0 + output.avg_arity * 4.0;
+        gizmos.line_2d(center, center + Vec2::new(ribbon, ribbon * 0.35), glow);
+        shown += 1;
     }
 }
 
@@ -3088,7 +3296,7 @@ fn hypergraph_debug_input_system(
     mut viz: ResMut<HypergraphDebugViz>,
     mut substrate: ResMut<HypergraphSubstrate>,
 ) {
-    if keys.just_pressed(KeyCode::KeyV) {
+    if keys.just_pressed(KeyCode::KeyH) {
         viz.enabled = !viz.enabled;
     }
 
