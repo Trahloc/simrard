@@ -34,13 +34,16 @@ const QUEST_ACCEPTANCE_MIN_DRIVE: f32 = 0.3;
 pub struct DispatcherEvaluationState {
     pub dirty_all: bool,
     pub dirty_entities: HashSet<Entity>,
+    pub score_dirty_flag: HashSet<Entity>,
     pub last_evaluation_tick: HashMap<Entity, u64>,
     pub last_region_signature: HashMap<Entity, u64>,
+    pub last_score_cache: HashMap<Entity, CachedScoreEntry>,
 }
 
 impl DispatcherEvaluationState {
     pub fn mark_dirty(&mut self, entity: Entity) {
         self.dirty_entities.insert(entity);
+        self.score_dirty_flag.insert(entity);
     }
 
     pub fn mark_all_dirty(&mut self) {
@@ -48,11 +51,23 @@ impl DispatcherEvaluationState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CachedScoreEntry {
+    pub can_eat: bool,
+    pub can_drink: bool,
+    pub can_rest: bool,
+    pub food_drive: f32,
+    pub water_drive: f32,
+    pub rest_drive: f32,
+}
+
 #[derive(Default)]
 struct QuestAcceptanceTiming {
-    utility_score_calc_us: u64,
-    best_action_selection_us: u64,
-    action_execution_us: u64,
+    per_pawn_score_collection_us: u64,
+    biochemical_base_lookup_us: u64,
+    contextual_modifier_application_us: u64,
+    final_score_combination_sorting_us: u64,
+    winner_selection_action_prep_us: u64,
 }
 
 impl ActivityLog {
@@ -245,7 +260,6 @@ pub fn pawn_event_dispatcher_step(
         let event_started = Instant::now();
         match event.kind {
             CausalEventKind::DriveThresholdCrossed { entity, drive } => {
-                evaluation_state.mark_all_dirty();
                 evaluation_state.mark_dirty(entity);
                 if let Ok((e, name, position, mut nn)) = pawn_query.get_mut(entity) {
                     let (val, label, need) = match drive {
@@ -359,9 +373,11 @@ pub fn pawn_event_dispatcher_step(
         report.add_counter("dispatcher_drive_updates_us", drive_updates_us);
         report.add_counter("dispatcher_lease_requests_us", lease_request_path_us);
         report.add_counter("dispatcher_action_resolution_us", action_elapsed.as_micros() as u64);
-        report.add_counter("dispatcher_score_calc_us", timing.utility_score_calc_us);
-        report.add_counter("dispatcher_best_action_select_us", timing.best_action_selection_us);
-        report.add_counter("dispatcher_action_execute_us", timing.action_execution_us);
+        report.add_counter("dispatcher_per_pawn_score_collection_us", timing.per_pawn_score_collection_us);
+        report.add_counter("dispatcher_biochemical_base_lookup_us", timing.biochemical_base_lookup_us);
+        report.add_counter("dispatcher_contextual_modifier_us", timing.contextual_modifier_application_us);
+        report.add_counter("dispatcher_score_combine_sort_us", timing.final_score_combination_sorting_us);
+        report.add_counter("dispatcher_winner_selection_us", timing.winner_selection_action_prep_us);
         report.add_counter("dispatcher_other_event_us", other_event_us);
     }
 }
@@ -419,31 +435,55 @@ fn quest_acceptance_step(
         return timing;
     }
 
-    let mut pawns: Vec<(Entity, String, ChunkId, Option<Capabilities>, f32, f32, f32)> = Vec::new();
+    let score_collect_started = Instant::now();
+    let mut pawns: Vec<(Entity, String, ChunkId, CachedScoreEntry)> = Vec::new();
     let mut pawn_name_by_entity: HashMap<Entity, String> = HashMap::new();
     let dirty_all = evaluation_state.dirty_all;
     for (entity, name, position, nn) in pawn_query.iter_mut() {
-        if !dirty_all && !evaluation_state.dirty_entities.contains(&entity) {
-            continue;
-        }
-        match evaluation_state.last_evaluation_tick.get(&entity) {
-            Some(last) if *last == current_seq => continue,
-            _ => {}
-        }
         let name_string = name.to_string();
         pawn_name_by_entity.insert(entity, name_string.clone());
-        let capabilities = capabilities_query.get(entity).ok().cloned();
-        pawns.push((
-            entity,
-            name_string,
-            position.chunk,
-            capabilities,
-            (1.0 - nn.hunger).clamp(0.0, 1.0),
-            (1.0 - nn.thirst).clamp(0.0, 1.0),
-            (1.0 - nn.fatigue).clamp(0.0, 1.0),
-        ));
+        let score_dirty = dirty_all
+            || evaluation_state.dirty_entities.contains(&entity)
+            || evaluation_state.score_dirty_flag.contains(&entity)
+            || !evaluation_state.last_score_cache.contains_key(&entity);
+
+        let cached = if score_dirty {
+            let bio_started = Instant::now();
+            let capabilities = capabilities_query.get(entity).ok().cloned();
+            let can_eat = match capabilities.as_ref() {
+                Some(caps) => caps.has("Eat"),
+                None => false,
+            };
+            let can_drink = match capabilities.as_ref() {
+                Some(caps) => caps.has("Drink"),
+                None => false,
+            };
+            let can_rest = match capabilities.as_ref() {
+                Some(caps) => caps.has("Rest"),
+                None => false,
+            };
+            let score_entry = CachedScoreEntry {
+                can_eat,
+                can_drink,
+                can_rest,
+                food_drive: (1.0 - nn.hunger).clamp(0.0, 1.0),
+                water_drive: (1.0 - nn.thirst).clamp(0.0, 1.0),
+                rest_drive: (1.0 - nn.fatigue).clamp(0.0, 1.0),
+            };
+            timing.biochemical_base_lookup_us += bio_started.elapsed().as_micros() as u64;
+            evaluation_state.last_score_cache.insert(entity, score_entry);
+            score_entry
+        } else {
+            *evaluation_state
+                .last_score_cache
+                .get(&entity)
+                .expect("score cache missing for clean pawn")
+        };
+
+        pawns.push((entity, name_string, position.chunk, cached));
         evaluation_state.last_evaluation_tick.insert(entity, current_seq);
     }
+    timing.per_pawn_score_collection_us += score_collect_started.elapsed().as_micros() as u64;
 
     if pawns.is_empty() {
         evaluation_state.dirty_entities.clear();
@@ -474,22 +514,25 @@ fn quest_acceptance_step(
 
         let mut eligible_candidates: Vec<(u32, Entity, String, f32)> = Vec::new();
         let mut rank_inputs: Vec<ProviderCandidateInput> = Vec::new();
-        let score_started = Instant::now();
-        for (entity, name, chunk, capabilities, food_drive, water_drive, rest_drive) in &pawns {
+        let modifier_started = Instant::now();
+        for (entity, name, chunk, cached) in &pawns {
             if *entity == quest.requester || providers_in_progress.contains(entity) {
                 continue;
             }
-            let Some(caps) = capabilities.as_ref() else {
-                continue;
+            let has_capability = match required_capability {
+                "Eat" => cached.can_eat,
+                "Drink" => cached.can_drink,
+                "Rest" => cached.can_rest,
+                _ => false,
             };
-            if !caps.has(required_capability) {
+            if !has_capability {
                 continue;
             }
 
             let drive = match quest.need.as_str() {
-                "food" => *food_drive,
-                "water" => *water_drive,
-                "rest" => *rest_drive,
+                "food" => cached.food_drive,
+                "water" => cached.water_drive,
+                "rest" => cached.rest_drive,
                 _ => 0.0,
             };
             if drive < QUEST_ACCEPTANCE_MIN_DRIVE {
@@ -504,24 +547,28 @@ fn quest_acceptance_step(
                 drive,
                 proximity: 1.0 / (dist + 1) as f32,
                 distance: dist,
-                can_eat: caps.has("Eat"),
-                can_drink: caps.has("Drink"),
-                can_rest: caps.has("Rest"),
+                can_eat: cached.can_eat,
+                can_drink: cached.can_drink,
+                can_rest: cached.can_rest,
             });
         }
-        timing.utility_score_calc_us += score_started.elapsed().as_micros() as u64;
+        timing.contextual_modifier_application_us += modifier_started.elapsed().as_micros() as u64;
 
         let select_started = Instant::now();
 
-        let Some(selected_candidate_id) = rank_provider_candidates_for_need(
+        let selected_candidate = rank_provider_candidates_for_need(
             &quest.need,
             QUEST_ACCEPTANCE_MIN_DRIVE,
             &rank_inputs,
         )
-        .expect("Quest acceptance provider ranking via DuckDB failed") else {
+        .expect("Quest acceptance provider ranking via DuckDB failed");
+        timing.final_score_combination_sorting_us += select_started.elapsed().as_micros() as u64;
+
+        let Some(selected_candidate_id) = selected_candidate else {
             continue;
         };
 
+        let winner_started = Instant::now();
         let Some((_, provider, provider_name, drive)) = eligible_candidates
             .iter()
             .find(|(candidate_id, _, _, _)| *candidate_id == selected_candidate_id)
@@ -532,9 +579,6 @@ fn quest_acceptance_step(
                 selected_candidate_id
             );
         };
-        timing.best_action_selection_us += select_started.elapsed().as_micros() as u64;
-
-        let execute_started = Instant::now();
 
             quest.provider = Some(provider);
             quest.status = QuestStatus::InProgress { provider };
@@ -558,9 +602,12 @@ fn quest_acceptance_step(
                     current_seq, quest.need, provider, drive
                 );
             }
-        timing.action_execution_us += execute_started.elapsed().as_micros() as u64;
+        timing.winner_selection_action_prep_us += winner_started.elapsed().as_micros() as u64;
     }
 
+    for (entity, _, _, _) in &pawns {
+        evaluation_state.score_dirty_flag.remove(entity);
+    }
     evaluation_state.dirty_entities.clear();
     evaluation_state.dirty_all = false;
     timing

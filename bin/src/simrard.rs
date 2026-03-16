@@ -621,24 +621,34 @@ fn build_headless_report(
         Some(value) => *value,
         None => 0,
     };
-    let score_calc_us = match report.counters.get("dispatcher_score_calc_us") {
+    let per_pawn_score_collection_us = match report.counters.get("dispatcher_per_pawn_score_collection_us") {
         Some(value) => *value,
         None => 0,
     };
-    let best_action_select_us = match report.counters.get("dispatcher_best_action_select_us") {
+    let biochemical_lookup_us = match report.counters.get("dispatcher_biochemical_base_lookup_us") {
         Some(value) => *value,
         None => 0,
     };
-    let action_execute_us = match report.counters.get("dispatcher_action_execute_us") {
+    let contextual_modifier_us = match report.counters.get("dispatcher_contextual_modifier_us") {
+        Some(value) => *value,
+        None => 0,
+    };
+    let score_combine_sort_us = match report.counters.get("dispatcher_score_combine_sort_us") {
+        Some(value) => *value,
+        None => 0,
+    };
+    let winner_selection_us = match report.counters.get("dispatcher_winner_selection_us") {
         Some(value) => *value,
         None => 0,
     };
 
     let mut dispatcher_phases: Vec<(&str, u64)> = vec![
         ("event collection", event_collection_us),
-        ("utility score calculation", score_calc_us),
-        ("best-action selection", best_action_select_us),
-        ("action execution/effect", action_execute_us),
+        ("per-pawn score collection", per_pawn_score_collection_us),
+        ("biochemical base lookup", biochemical_lookup_us),
+        ("contextual modifier application", contextual_modifier_us),
+        ("final score combine+sorting", score_combine_sort_us),
+        ("winner selection+action prep", winner_selection_us),
         ("lease requests", lease_requests_us),
     ];
     dispatcher_phases.retain(|(_, us)| *us > 0);
@@ -646,8 +656,8 @@ fn build_headless_report(
         dispatcher_phases.sort_by(|a, b| b.1.cmp(&a.1));
         let total_us: u64 = dispatcher_phases.iter().map(|(_, us)| *us).sum();
         let denom = (total_us as f64).max(1.0);
-        lines.push("Dispatcher internals (top 3):".to_string());
-        for (phase, total_us) in dispatcher_phases.iter().take(3) {
+        lines.push("Dispatcher internals (phase breakdown):".to_string());
+        for (phase, total_us) in &dispatcher_phases {
             let total_ms = *total_us as f64 / 1000.0;
             let pct = (*total_us as f64 / denom) * 100.0;
             lines.push(format!(
@@ -1802,7 +1812,6 @@ fn resource_respawn_system(
     mut state: ResMut<RespawnState>,
     mut commands: Commands,
     mut allocator: ResMut<ItemIdAllocator>,
-    mut evaluation_state: ResMut<ai::DispatcherEvaluationState>,
     simlife: Res<SimLifeState>,
     food_query: Query<&Position, With<FoodReservation>>,
     water_query: Query<&Position, With<WaterSource>>,
@@ -1831,8 +1840,6 @@ fn resource_respawn_system(
         None
     };
 
-    let mut region_changed = false;
-
     if let Some(chunk) = food_chunk {
         let id = allocator.alloc();
         let grass = *simlife.grass_per_chunk.get(&chunk).unwrap_or(&0);
@@ -1846,7 +1853,6 @@ fn resource_respawn_system(
             Transform::from_translation(chunk_to_translation(&chunk, 0.0)),
             Name::new("Food_respawn"),
         ));
-        region_changed = true;
     }
 
     if need_water {
@@ -1871,12 +1877,7 @@ fn resource_respawn_system(
                 Transform::from_translation(chunk_to_translation(&chunk, 0.0)),
                 Name::new("Water_respawn"),
             ));
-            region_changed = true;
         }
-    }
-    if region_changed {
-        // Charter-region change trigger (food/water topology changed).
-        evaluation_state.mark_all_dirty();
     }
     perf_record("resource_respawn", started.elapsed());
 }
