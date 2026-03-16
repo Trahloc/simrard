@@ -55,6 +55,11 @@ struct VisualDebug {
     enabled: bool,
 }
 
+#[derive(Resource, Default)]
+struct VisualDebugThermalCache {
+    prev_temp_by_chunk: HashMap<ChunkId, f32>,
+}
+
 #[derive(Default)]
 struct PerfAudit {
     totals: HashMap<&'static str, Duration>,
@@ -199,6 +204,7 @@ fn run_interactive() {
         .insert_resource(VisualDebug {
             enabled: visual_debug_default_on,
         })
+        .init_resource::<VisualDebugThermalCache>()
         .add_plugins(MirrorPlugin);
     #[cfg(debug_assertions)]
     app.init_resource::<HypergraphDebugViz>();
@@ -1714,6 +1720,7 @@ fn visual_debug_insect_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
     tier4: Res<Tier4State>,
+    time: Res<Time>,
     existing: Query<Entity, With<VisualDebugInsectSprite>>,
 ) {
     for entity in existing.iter() {
@@ -1724,6 +1731,7 @@ fn visual_debug_insect_overlay_system(
     }
 
     let step = (tier4.insects.len() / VISUAL_DEBUG_MAX_INSECT_SPRITES).max(1);
+    let t = time.elapsed_secs();
     for insect in tier4.insects.iter().step_by(step).take(VISUAL_DEBUG_MAX_INSECT_SPRITES) {
         let hunger = insect.hunger.clamp(0.0, 1.0);
         let fear = insect.fear.clamp(0.0, 1.0);
@@ -1733,15 +1741,31 @@ fn visual_debug_insect_overlay_system(
         let r = 0.9 * hw + 0.62 * fw;
         let g = 0.18 * hw + 0.15 * fw;
         let b = 0.2 * hw + 0.82 * fw;
-        let size = 1.5 + insect.energy.clamp(0.0, 8.0) * 1.1;
+        let energy_norm = (insect.energy / 8.0).clamp(0.0, 1.0);
+        let pulse_rate = 2.5 + hunger * 5.0;
+        let phase = insect.age as f32 * 0.11 + insect.chunk.0 as f32 * 0.03 + insect.chunk.1 as f32 * 0.02;
+        let pulse = (t * pulse_rate + phase).sin();
+        let base_size = 1.4 + insect.energy.clamp(0.0, 8.0) * 1.0;
+        let width = base_size * (1.0 + 0.22 * pulse);
+        let height = base_size * (1.0 - 0.14 * pulse + (1.0 - energy_norm) * 0.08);
         let mut pos = chunk_to_translation(&insect.chunk, 3.2);
         pos.x += ((insect.age as f32).sin() * 0.35).clamp(-0.4, 0.4);
         pos.y += ((insect.age as f32 * 0.73).cos() * 0.35).clamp(-0.4, 0.4);
+        let leg_wobble = 0.2 * (t * (6.0 + hunger * 4.0) + phase * 0.7).sin();
+        let alpha = (0.75 + 0.2 * energy_norm + 0.05 * pulse).clamp(0.35, 0.98);
         commands.spawn((
             VisualDebugInsectSprite,
-            Sprite::from_color(Color::srgba(r, g, b, 0.9), Vec2::splat(size)),
-            Transform::from_translation(pos),
+            Sprite::from_color(Color::srgba(r, g, b, alpha), Vec2::new(width, height)),
+            Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(leg_wobble)),
         ));
+    }
+}
+
+fn gs_v_for(simlife: &SimLifeState, chunk: ChunkId) -> f32 {
+    let value = simlife.v_field.get(&chunk).copied();
+    match value {
+        Some(v) => v,
+        None => 0.0,
     }
 }
 
@@ -1749,6 +1773,7 @@ fn visual_debug_gs_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
     simlife: Res<SimLifeState>,
+    time: Res<Time>,
     existing: Query<Entity, With<VisualDebugGsSprite>>,
 ) {
     for entity in existing.iter() {
@@ -1770,18 +1795,39 @@ fn visual_debug_gs_overlay_system(
         }
     });
 
+    let t = time.elapsed_secs();
     for cell in cells.into_iter().take(VISUAL_DEBUG_MAX_GS_SPRITES) {
         let u_raw = simlife.u_field.get(&cell).copied();
         let v_raw = simlife.v_field.get(&cell).copied();
         let u = match u_raw { Some(value) => value, None => 1.0 }.clamp(0.0, 1.0);
         let v = match v_raw { Some(value) => value, None => 0.0 }.clamp(0.0, 1.0);
+        let left = gs_v_for(&simlife, ChunkId(cell.0.saturating_sub(1), cell.1));
+        let right = gs_v_for(&simlife, ChunkId((cell.0 + 1).min(CHUNK_EXTENT), cell.1));
+        let down = gs_v_for(&simlife, ChunkId(cell.0, cell.1.saturating_sub(1)));
+        let up = gs_v_for(&simlife, ChunkId(cell.0, (cell.1 + 1).min(CHUNK_EXTENT)));
+        let nx = right - left;
+        let ny = up - down;
+        let nz = 0.55;
+        let len = (nx * nx + ny * ny + nz * nz).sqrt().max(0.0001);
+        let normal = Vec3::new(nx / len, ny / len, nz / len);
+        let light = Vec3::new(0.58, 0.48, 0.66).normalize();
+        let shade = normal.dot(light).clamp(0.0, 1.0);
+        let flow = (nx.abs() + ny.abs()).clamp(0.0, 1.0);
         let biomass = (v * 1.2).clamp(0.0, 1.0);
-        let color = Color::srgba(u, biomass, v, 0.35);
+        let r = (u * 0.42 + shade * 0.35 + flow * 0.18).clamp(0.0, 1.0);
+        let g = (biomass * 0.75 + shade * 0.22).clamp(0.0, 1.0);
+        let b = (v * 0.82 + (1.0 - shade) * 0.15 + flow * 0.08).clamp(0.0, 1.0);
+        let shimmer = (t * 1.4 + (cell.0 as f32 * 0.03 + cell.1 as f32 * 0.05)).sin();
+        let alpha = (0.26 + 0.24 * flow + 0.12 * (shade - 0.5) + 0.04 * shimmer).clamp(0.14, 0.58);
+        let h = (CHUNK_PIXEL - 1.4 + v * 0.9 + flow * 0.7).max(1.0);
+        let w = (CHUNK_PIXEL - 1.2 + u * 0.6).max(1.0);
+        let tilt = 0.12 * ny;
+        let color = Color::srgba(r, g, b, alpha);
         let pos = chunk_to_translation(&cell, 2.2);
         commands.spawn((
             VisualDebugGsSprite,
-            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 1.0).max(1.0))),
-            Transform::from_translation(pos),
+            Sprite::from_color(color, Vec2::new(w, h)),
+            Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(tilt)),
         ));
     }
 }
@@ -1790,12 +1836,15 @@ fn visual_debug_thermal_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
     thermal: Res<ThermalState>,
+    mut cache: ResMut<VisualDebugThermalCache>,
+    time: Res<Time>,
     existing: Query<Entity, With<VisualDebugThermalSprite>>,
 ) {
     for entity in existing.iter() {
         commands.entity(entity).despawn();
     }
     if !visual.enabled || thermal.local_temperature_by_chunk.is_empty() {
+        cache.prev_temp_by_chunk.clear();
         return;
     }
 
@@ -1817,15 +1866,37 @@ fn visual_debug_thermal_overlay_system(
         None => 1.0,
     }
         .max(0.001);
+    let time_s = time.elapsed_secs();
     for (chunk, delta) in hotspots.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES) {
-        let t = (delta / denom).clamp(0.0, 1.0);
-        let color = Color::srgba(0.15 + t * 0.85, 0.1, 1.0 - t * 0.9, 0.32);
+        let intensity = (delta / denom).clamp(0.0, 1.0);
+        let current_temp = thermal.local_temperature_by_chunk.get(&chunk).copied();
+        let current_temp = match current_temp {
+            Some(value) => value,
+            None => thermal.sink_temperature_k,
+        };
+        let prev_temp = cache.prev_temp_by_chunk.get(&chunk).copied();
+        let prev_temp = match prev_temp {
+            Some(value) => value,
+            None => current_temp,
+        };
+        let rate = (current_temp - prev_temp).abs().clamp(0.0, 2.0);
+        let phase = chunk.0 as f32 * 0.03 + chunk.1 as f32 * 0.05;
+        let pulse = (time_s * (2.8 + rate * 4.0) + phase).sin().abs();
+        let pulse_boost = (rate * 0.2 * pulse).clamp(0.0, 0.22);
+        let alpha = (0.22 + intensity * 0.20 + pulse_boost).clamp(0.14, 0.68);
+        let color = Color::srgba(
+            0.15 + intensity * 0.85,
+            0.1 + pulse_boost * 0.2,
+            1.0 - intensity * 0.9,
+            alpha,
+        );
         let pos = chunk_to_translation(&chunk, 2.0);
         commands.spawn((
             VisualDebugThermalSprite,
-            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 2.0).max(1.0))),
+            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 2.0 + pulse_boost * 2.0).max(1.0))),
             Transform::from_translation(pos),
         ));
+        cache.prev_temp_by_chunk.insert(chunk, current_temp);
     }
 }
 
