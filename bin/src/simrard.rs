@@ -9,7 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use simrard_lib_utility_ai::{BigBrainPlugin, BigBrainSet};
-use simrard_lib_ai::{self as ai, build_pawn_brain, ActivityLog, PawnAIPlugin};
+use simrard_lib_ai::{self as ai, ActivityLog, PawnAIPlugin};
 use simrard_lib_causal::{
     heartbeat, chebyshev_distance, propagation_delay, CausalEventKind, CausalEventQueue,
     CausalPlugin,
@@ -2436,6 +2436,7 @@ fn clip_to_world_bounds(pos: Vec3) -> Vec3 {
 const SPRITE_FOOD: f32 = 18.0;
 /// Water = medium cyan so clearly distinct from blue/purple thirst pawns.
 const SPRITE_WATER: f32 = 14.0;
+#[allow(dead_code)]
 const SPRITE_PAWN: f32 = 10.0;
 const RESOURCE_BAR_HEIGHT: f32 = 3.0;
 const RESOURCE_BAR_MAX_WIDTH: f32 = 18.0;
@@ -2540,7 +2541,7 @@ fn camera_pan_zoom_input(
     }
 }
 
-fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
+fn setup(mut commands: Commands, _allocator: ResMut<ItemIdAllocator>) {
     // Center camera on world and zoom to show full 256x256 extent
     let world_cx = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
     let world_cy = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
@@ -2553,9 +2554,10 @@ fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
         }),
     ));
 
-    // Axis coordinate labels every 32 chunks
-    let axis_font = TextFont { font_size: 280.0, ..default() };
-    let axis_color = TextColor(Color::srgba(0.72, 0.78, 0.92, 0.68));
+    // Axis coordinate labels every 32 chunks - smaller font, positioned outside world bounds
+    let axis_font = TextFont { font_size: 96.0, ..default() };
+    let axis_color = TextColor(Color::srgba(0.72, 0.78, 0.92, 0.72));
+    let label_margin = -480.0;
     for ci in (0u32..=256).step_by(32) {
         let wx = ci as f32 * CHUNK_PIXEL;
         // X-axis labels below grid
@@ -2563,109 +2565,18 @@ fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>) {
             Text2d::new(format!("{}", ci)),
             axis_font.clone(),
             axis_color,
-            Transform::from_translation(Vec3::new(wx, -280.0, 5.0)),
+            Transform::from_translation(Vec3::new(wx, label_margin, 5.0)),
         ));
         // Y-axis labels left of grid
         commands.spawn((
             Text2d::new(format!("{}", ci)),
             axis_font.clone(),
             axis_color,
-            Transform::from_translation(Vec3::new(-280.0, ci as f32 * CHUNK_PIXEL, 5.0)),
+            Transform::from_translation(Vec3::new(label_margin, wx, 5.0)),
         ));
     }
 
-    // Food and water never share a chunk. Cluster A: food at (0,0), water at (1,0).
-    // Enough portions per cluster so 10 pawns can eat/drink and sustain 10k ticks with respawn.
-    let chunk_a = ChunkId(0, 0);
-    let water_a_chunk = ChunkId(1, 0);
-    let id_food_a = allocator.alloc();
-    commands.spawn((
-        FoodReservation { portions: 12 },
-        Position { chunk: chunk_a },
-        ItemIdentity { item_id: id_food_a, created_at_causal_seq: 0 },
-        ItemHistory::default(),
-        Sprite::from_color(Color::srgb(0.9, 0.5, 0.1), Vec2::splat(SPRITE_FOOD)),
-        Transform::from_translation(chunk_to_translation(&chunk_a, 0.0)),
-        Name::new("Food_A"),
-    ));
-    let id_water_a = allocator.alloc();
-    commands.spawn((
-        WaterSource { portions: 12 },
-        Position { chunk: water_a_chunk },
-        ItemIdentity { item_id: id_water_a, created_at_causal_seq: 0 },
-        ItemHistory::default(),
-        Sprite::from_color(Color::srgb(0.2, 0.85, 0.95), Vec2::splat(SPRITE_WATER)),
-        Transform::from_translation(chunk_to_translation(&water_a_chunk, 0.0)),
-        Name::new("Water_A"),
-    ));
-    commands.spawn((
-        RestSpot,
-        Position { chunk: chunk_a },
-        Sprite::from_color(Color::srgb(0.4, 0.35, 0.3), Vec2::splat(SPRITE_FOOD)),
-        Transform::from_translation(chunk_to_translation(&chunk_a, 0.0)),
-        Name::new("Rest_A"),
-    ));
-    for i in 1..=4 {
-        let offset = Vec3::new((i as f32 - 2.5) * 4.0, 0.0, 1.0);
-        commands.spawn((
-            build_pawn_brain(),
-            NeuralNetworkComponent { hunger: 0.9, thirst: 0.85, fatigue: 0.8, ..default() },
-            Position { chunk: chunk_a },
-            DisplayOffset(offset),
-            Capabilities { can_do: vec!["Eat".into(), "Drink".into(), "Rest".into()] },
-            KnownRecipes::default(),
-            Sprite::from_color(Color::srgb(0.2, 0.75, 0.3), Vec2::splat(SPRITE_PAWN)),
-            Transform::from_translation(chunk_to_translation(&chunk_a, 0.0) + offset),
-            Name::new(format!("Pawn_A_{}", i)),
-            PawnVisual,
-        ));
-    }
-
-    // Cluster B near far corner to exercise large-grid propagation and long-range behavior.
-    let chunk_b = ChunkId(CHUNK_EXTENT - 1, CHUNK_EXTENT - 1);
-    let water_b_chunk = ChunkId(CHUNK_EXTENT - 2, CHUNK_EXTENT - 1);
-    let id_food_b = allocator.alloc();
-    commands.spawn((
-        FoodReservation { portions: 12 },
-        Position { chunk: chunk_b },
-        ItemIdentity { item_id: id_food_b, created_at_causal_seq: 0 },
-        ItemHistory::default(),
-        Sprite::from_color(Color::srgb(0.9, 0.5, 0.1), Vec2::splat(SPRITE_FOOD)),
-        Transform::from_translation(chunk_to_translation(&chunk_b, 0.0)),
-        Name::new("Food_B"),
-    ));
-    let id_water_b = allocator.alloc();
-    commands.spawn((
-        WaterSource { portions: 12 },
-        Position { chunk: water_b_chunk },
-        ItemIdentity { item_id: id_water_b, created_at_causal_seq: 0 },
-        ItemHistory::default(),
-        Sprite::from_color(Color::srgb(0.2, 0.85, 0.95), Vec2::splat(SPRITE_WATER)),
-        Transform::from_translation(chunk_to_translation(&water_b_chunk, 0.0)),
-        Name::new("Water_B"),
-    ));
-    commands.spawn((
-        RestSpot,
-        Position { chunk: chunk_b },
-        Sprite::from_color(Color::srgb(0.4, 0.35, 0.3), Vec2::splat(SPRITE_FOOD)),
-        Transform::from_translation(chunk_to_translation(&chunk_b, 0.0)),
-        Name::new("Rest_B"),
-    ));
-    for i in 1..=4 {
-        let offset = Vec3::new((i as f32 - 2.5) * 4.0, 0.0, 1.0);
-        commands.spawn((
-            build_pawn_brain(),
-            NeuralNetworkComponent { hunger: 0.9, thirst: 0.85, fatigue: 0.8, ..default() },
-            Position { chunk: chunk_b },
-            DisplayOffset(offset),
-            Capabilities { can_do: vec!["Eat".into(), "Drink".into(), "Rest".into()] },
-            KnownRecipes::default(),
-            Sprite::from_color(Color::srgb(0.2, 0.75, 0.3), Vec2::splat(SPRITE_PAWN)),
-            Transform::from_translation(chunk_to_translation(&chunk_b, 0.0) + offset),
-            Name::new(format!("Pawn_B_{}", i)),
-            PawnVisual,
-        ));
-    }
+    // Interactive mode: skip pawn/food/water spawning for pure visualization debug
 }
 
 const DISCOVERY_RECIPE_FIRE: &str = "Fire";
