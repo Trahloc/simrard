@@ -925,13 +925,15 @@ fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
     }
 }
 
-fn tier_status(streak: u64) -> &'static str {
-    if streak >= COLLAPSE_STREAK_REQUIRED {
-        "Collapsed"
-    } else if streak >= COLLAPSE_STREAK_REQUIRED / 2 {
-        "Collapsing"
-    } else {
+fn tier_status(streak: u64, vitality: f64) -> &'static str {
+    if vitality > 0.3 {
         "Active"
+    } else if vitality >= 0.1 {
+        "Collapsing"
+    } else if streak >= COLLAPSE_STREAK_REQUIRED {
+        "Collapsed"
+    } else {
+        "Collapsing"
     }
 }
 
@@ -1345,42 +1347,42 @@ fn build_headless_report(
                 "10",
                 stability.tier_scores.tier10_hypergraph,
                 trends.tier10,
-                tier_status(stability.tier_low_streak[5]),
+                tier_status(stability.tier_low_streak[5], stability.tier_scores.tier10_hypergraph),
             ));
             lines.push(format!(
                 "  {:>4}  {:>8.4}  {:^11}  {}",
                 "9",
                 stability.tier_scores.tier9_energy,
                 trends.tier9,
-                tier_status(stability.tier_low_streak[4]),
+                tier_status(stability.tier_low_streak[4], stability.tier_scores.tier9_energy),
             ));
             lines.push(format!(
                 "  {:>4}  {:>8.4}  {:^11}  {}",
                 "8",
                 stability.tier_scores.tier8_mineral,
                 trends.tier8,
-                tier_status(stability.tier_low_streak[3]),
+                tier_status(stability.tier_low_streak[3], stability.tier_scores.tier8_mineral),
             ));
             lines.push(format!(
                 "  {:>4}  {:>8.4}  {:^11}  {}",
                 "7",
                 stability.tier_scores.tier7_chemistry,
                 trends.tier7,
-                tier_status(stability.tier_low_streak[2]),
+                tier_status(stability.tier_low_streak[2], stability.tier_scores.tier7_chemistry),
             ));
             lines.push(format!(
                 "  {:>4}  {:>8.4}  {:^11}  {}",
                 "6",
                 stability.tier_scores.tier6_fungal,
                 trends.tier6,
-                tier_status(stability.tier_low_streak[1]),
+                tier_status(stability.tier_low_streak[1], stability.tier_scores.tier6_fungal),
             ));
             lines.push(format!(
                 "  {:>4}  {:>8.4}  {:^11}  {}",
                 "5",
                 stability.tier_scores.tier5_vegetable,
                 trends.tier5,
-                tier_status(stability.tier_low_streak[0]),
+                tier_status(stability.tier_low_streak[0], stability.tier_scores.tier5_vegetable),
             ));
 
             let vitality_status = if stability.equilibrium_reached {
@@ -1412,6 +1414,15 @@ fn build_headless_report(
             };
             lines.push(format!("  {}", t60_line));
 
+            let any_tier_equilibrium = stability
+                .tier_low_streak
+                .iter()
+                .any(|streak| *streak >= COLLAPSE_STREAK_REQUIRED);
+            lines.push(format!(
+                "  Any tier reached equilibrium: {}",
+                if any_tier_equilibrium { "yes" } else { "no" }
+            ));
+
             let start = match stability.start_coverage_pct {
                 Some(value) => value,
                 None => 0.0,
@@ -1423,6 +1434,15 @@ fn build_headless_report(
             lines.push(format!(
                 "  Fungal coverage: {:.4}% -> {:.4}% (delta {:+.4}%)",
                 start, end, end - start
+            ));
+
+            let end_hist = match stability.end_histogram {
+                Some(value) => value,
+                None => [0; 32],
+            };
+            lines.push(format!(
+                "  Final chemistry histogram entropy: {:.4}",
+                histogram_entropy_32(&end_hist)
             ));
         }
     }
@@ -2201,7 +2221,7 @@ const GS_DT: f32 = 1.0;
 /// GS runs every this many sim ticks; at target 1000 Hz → 200 Hz GS rate.
 const GS_UPDATE_INTERVAL_TICKS: u64 = 5;
 /// Substrate-only mode runs GS at lower cadence to prioritize benchmark throughput.
-const GS_UPDATE_INTERVAL_TICKS_SUBSTRATE: u64 = 100;
+const GS_UPDATE_INTERVAL_TICKS_SUBSTRATE: u64 = 200;
 /// Cells with V above this are considered active; their neighbors are queued as frontier.
 const GS_V_ACTIVE_THRESHOLD: f32 = 0.01;
 /// Hypergraph clustering scales the local GS feed rate.
