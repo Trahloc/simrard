@@ -37,6 +37,12 @@ const HEADLESS_TARGET_TICKS: u64 = 10_000;
 const HEADLESS_MAX_WALL_SECONDS: f64 = 60.0;
 const HEADLESS_MIN_SURVIVORS: usize = 8;
 
+// Temporary binary-isolation toggles for substrate performance analysis.
+const ISOLATION_DISABLE_T60_AND_EXTRA_COUNTERS: bool = false;
+const ISOLATION_REVERT_HYPERGRAPH_CADENCE: bool = false;
+const ISOLATION_MINIMAL_SEEDING: bool = false;
+const ISOLATION_DISABLE_PER_SECOND_PROBES: bool = false;
+
 static HEADLESS_PERF: OnceLock<Mutex<PerfAudit>> = OnceLock::new();
 static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
 static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
@@ -329,7 +335,9 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
                     break HeadlessTermination::AllPawnsDied;
                 }
                 if profile == HeadlessProfile::SubstrateOnly {
-                    if started.elapsed().as_secs_f64() >= 60.0 {
+                    if !ISOLATION_DISABLE_T60_AND_EXTRA_COUNTERS
+                        && started.elapsed().as_secs_f64() >= 60.0
+                    {
                         update_substrate_t60_debug_line(app.world_mut());
                     }
                     if let Some(stability) = app.world().get_resource::<SubstrateStabilityState>() {
@@ -435,7 +443,11 @@ fn initialize_substrate_activation(
     mut state: ResMut<SubstrateStabilityState>,
 ) {
     // Substrate-only profile requires visible Tier 10 activity in the first minute.
-    substrate.set_interval_ticks(SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS);
+    if ISOLATION_REVERT_HYPERGRAPH_CADENCE {
+        substrate.set_interval_ticks(SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS_PRE_TUNE);
+    } else {
+        substrate.set_interval_ticks(SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS);
+    }
     substrate.set_chaos(SUBSTRATE_HYPERGRAPH_CHAOS);
 
     let seeded = gs_seed_initial_state(0, &mut simlife, Some(&mut chemistry), &mut charter);
@@ -746,7 +758,7 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
         let seconds = (last.second.saturating_sub(first.second)).max(1) as f64;
         (last.coverage_pct as f64 - first.coverage_pct as f64).abs() / seconds
     };
-    state.tier_scores.tier6_fungal = (coverage_change_rate / 0.05).clamp(0.0, 1.0);
+    state.tier_scores.tier6_fungal = (coverage_change_rate / 0.015).clamp(0.0, 1.0);
     if coverage_change_rate < T6_COLLAPSE_THRESHOLD {
         state.tier_low_streak[1] = state.tier_low_streak[1].saturating_add(1);
     } else {
@@ -755,7 +767,7 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
 
     // Tier 5: max U+V field change over last 30s.
     let max_uv_change = max_uv_change_ratio(window);
-    state.tier_scores.tier5_vegetable = (max_uv_change / 0.01).clamp(0.0, 1.0);
+    state.tier_scores.tier5_vegetable = (max_uv_change / 0.0004).clamp(0.0, 1.0);
     if max_uv_change < T5_COLLAPSE_THRESHOLD {
         state.tier_low_streak[0] = state.tier_low_streak[0].saturating_add(1);
     } else {
@@ -942,6 +954,10 @@ fn substrate_stability_probe_system(
         return;
     }
 
+    if ISOLATION_DISABLE_PER_SECOND_PROBES {
+        return;
+    }
+
     let total_cells = ((CHUNK_EXTENT as u64) + 1).pow(2) as f32;
     let active_cells = simlife
         .grass_per_chunk
@@ -1002,7 +1018,10 @@ fn substrate_stability_probe_system(
 
     compute_tier_scores(&mut state);
 
-    if state.debug_line_t60_hypergraph.is_none() && (seq / 1000) >= 60 {
+    if !ISOLATION_DISABLE_T60_AND_EXTRA_COUNTERS
+        && state.debug_line_t60_hypergraph.is_none()
+        && (seq / 1000) >= 60
+    {
         let rewrites_total = match report.counters.get("hypergraph_rewrites").copied() {
             Some(value) => value,
             None => 0,
@@ -1423,9 +1442,14 @@ fn build_headless_report(
         entries.sort_by(|a, b| b.1.cmp(&a.1));
 
         if !entries.is_empty() {
-            lines.push("Perf breakdown (top 3):".to_string());
+            let top_n = if profile == HeadlessProfile::SubstrateOnly {
+                5
+            } else {
+                3
+            };
+            lines.push(format!("Perf breakdown (top {}):", top_n));
             let denom = audit.headless_total.as_secs_f64().max(0.000_001);
-            for (name, total, count) in entries.into_iter().take(3) {
+            for (name, total, count) in entries.into_iter().take(top_n) {
                 let total_ms = total.as_secs_f64() * 1000.0;
                 let pct = (total.as_secs_f64() / denom) * 100.0;
                 let avg_ms = if count == 0 {
@@ -2176,6 +2200,8 @@ const GS_K: f32 = 0.062;
 const GS_DT: f32 = 1.0;
 /// GS runs every this many sim ticks; at target 1000 Hz → 200 Hz GS rate.
 const GS_UPDATE_INTERVAL_TICKS: u64 = 5;
+/// Substrate-only mode runs GS at lower cadence to prioritize benchmark throughput.
+const GS_UPDATE_INTERVAL_TICKS_SUBSTRATE: u64 = 100;
 /// Cells with V above this are considered active; their neighbors are queued as frontier.
 const GS_V_ACTIVE_THRESHOLD: f32 = 0.01;
 /// Hypergraph clustering scales the local GS feed rate.
@@ -2188,10 +2214,11 @@ const GS_CLUSTERING_MULTIPLIER: f32 = 0.5;
 const GS_CAUSAL_VOLUME_MULTIPLIER: f32 = 0.6;
 /// Chemistry hotspots softly bias local GS feed toward active nutrient regions.
 const GS_F_CHEMISTRY_HOTSPOT_SCALE: f32 = 0.03;
-/// Substrate mode target initial GS seeded density in [0.5%, 1.0%].
-const GS_INITIAL_SEED_COVERAGE: f32 = 0.006;
+/// Substrate mode default initial GS seeded density (~0.1% for sparse activation).
+const GS_INITIAL_SEED_COVERAGE: f32 = 0.001;
 /// Tier 10 activation tuning for substrate profile.
-const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS: u64 = 40;
+const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS: u64 = 800;
+const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS_PRE_TUNE: u64 = 1_000;
 const SUBSTRATE_HYPERGRAPH_CHAOS: f32 = 0.45;
 
 #[derive(Resource, Debug, Clone)]
@@ -2284,8 +2311,8 @@ fn advance_simlife_grass_with_hypergraph(
         gs_seed_initial_state(current_seq, simlife, None, charter);
     }
 
-    // Throttle: only run the GS stencil every GS_UPDATE_INTERVAL_TICKS sim ticks.
-    if current_seq.saturating_sub(simlife.last_gs_tick) < GS_UPDATE_INTERVAL_TICKS {
+    // Throttle: only run the GS stencil at mode-specific interval.
+    if current_seq.saturating_sub(simlife.last_gs_tick) < gs_update_interval_ticks_for_mode() {
         return;
     }
     simlife.last_gs_tick = current_seq;
@@ -2306,6 +2333,31 @@ fn substrate_hotspot_centers() -> [(u32, u32); 8] {
     ]
 }
 
+fn substrate_seed_coverage() -> f32 {
+    if ISOLATION_MINIMAL_SEEDING {
+        0.001
+    } else {
+        GS_INITIAL_SEED_COVERAGE
+    }
+}
+
+fn substrate_seed_centers() -> Vec<(u32, u32)> {
+    let centers = substrate_hotspot_centers();
+    if ISOLATION_MINIMAL_SEEDING {
+        centers.to_vec()
+    } else {
+        centers[..4].to_vec()
+    }
+}
+
+fn gs_update_interval_ticks_for_mode() -> u64 {
+    if headless_substrate_from_args() {
+        GS_UPDATE_INTERVAL_TICKS_SUBSTRATE
+    } else {
+        GS_UPDATE_INTERVAL_TICKS
+    }
+}
+
 fn seeded_uv_for_chunk(chunk: ChunkId) -> (f32, f32) {
     let hash = ((chunk.0 as u64) << 32) ^ (chunk.1 as u64) ^ 0x9e37_79b9;
     let u = 0.2 + ((hash & 0xff) as f32 / 255.0) * 0.4;
@@ -2322,17 +2374,17 @@ fn gs_seed_initial_state(
     charter: &mut SpatialCharter,
 ) -> usize {
     let total_cells = ((CHUNK_EXTENT as usize) + 1).pow(2);
-    let target_seed_cells = (total_cells as f32 * GS_INITIAL_SEED_COVERAGE) as usize;
+    let target_seed_cells = (total_cells as f32 * substrate_seed_coverage()) as usize;
 
     let mut seeded_cells = 0_usize;
-    let centers = substrate_hotspot_centers();
+    let centers = substrate_seed_centers();
 
     if let Some(chemistry) = chemistry {
-        for (cx, cy) in centers {
+        for (cx, cy) in &centers {
             for dx in -6_i32..=6_i32 {
                 for dy in -6_i32..=6_i32 {
-                    let x = cx as i32 + dx;
-                    let y = cy as i32 + dy;
+                    let x = *cx as i32 + dx;
+                    let y = *cy as i32 + dy;
                     if x < 0 || y < 0 || x > CHUNK_EXTENT as i32 || y > CHUNK_EXTENT as i32 {
                         continue;
                     }
@@ -2361,11 +2413,11 @@ fn gs_seed_initial_state(
         }
     }
 
-    'seed: for (cx, cy) in centers {
+    'seed: for (cx, cy) in &centers {
         for dx in -5_i32..=5_i32 {
             for dy in -5_i32..=5_i32 {
-                let x = cx as i32 + dx;
-                let y = cy as i32 + dy;
+                let x = *cx as i32 + dx;
+                let y = *cy as i32 + dy;
                 if x < 0 || y < 0 || x > CHUNK_EXTENT as i32 || y > CHUNK_EXTENT as i32 {
                     continue;
                 }
@@ -2547,11 +2599,13 @@ fn gs_update(
     }
 
     if let Some(ref mut report) = report {
-        for _ in 0..lease_grants {
-            report.bump("simlife_lease_grants");
-        }
-        for _ in 0..lease_denials {
-            report.bump("simlife_lease_denials");
+        if !ISOLATION_DISABLE_T60_AND_EXTRA_COUNTERS {
+            for _ in 0..lease_grants {
+                report.bump("simlife_lease_grants");
+            }
+            for _ in 0..lease_denials {
+                report.bump("simlife_lease_denials");
+            }
         }
     }
 }
@@ -2679,12 +2733,16 @@ fn hypergraph_tick_system(
         if stats.considered > 0 {
             report.bump("hypergraph_ticks");
         }
-        for _ in 0..stats.considered.saturating_sub(stats.denied) {
-            report.bump("hypergraph_lease_grants");
+        if !ISOLATION_DISABLE_T60_AND_EXTRA_COUNTERS {
+            for _ in 0..stats.considered.saturating_sub(stats.denied) {
+                report.bump("hypergraph_lease_grants");
+            }
         }
         for _ in 0..stats.rewritten {
             report.bump("hypergraph_rewrites");
-            report.bump("hypergraph_rule_fires");
+            if !ISOLATION_DISABLE_T60_AND_EXTRA_COUNTERS {
+                report.bump("hypergraph_rule_fires");
+            }
         }
         for _ in 0..stats.denied {
             report.bump("hypergraph_lease_denials");
