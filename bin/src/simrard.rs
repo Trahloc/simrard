@@ -411,7 +411,8 @@ struct SubstrateStabilityState {
     equilibrium_reached: bool,
     equilibrium_tier: Option<&'static str>,
     equilibrium_seconds: Option<f64>,
-    tier10_low_streak_seconds: u64,
+    // Per-tier low-activity streak counters: index [0]=T5, [1]=T6, [2]=T7, [3]=T8, [4]=T9, [5]=T10.
+    tier_low_streak: [u64; 6],
 }
 
 #[derive(Debug, Clone)]
@@ -461,7 +462,7 @@ impl Default for SubstrateStabilityState {
             equilibrium_reached: false,
             equilibrium_tier: None,
             equilibrium_seconds: None,
-            tier10_low_streak_seconds: 0,
+            tier_low_streak: [0; 6],
         }
     }
 }
@@ -543,6 +544,16 @@ fn max_uv_change_ratio(window: &[SubstrateSecondSample]) -> f64 {
     max_change
 }
 
+// Collapse thresholds (calibrated): a tier is in equilibrium when its raw activity stays
+// below the threshold for COLLAPSE_STREAK_REQUIRED consecutive probe seconds.
+const T10_COLLAPSE_THRESHOLD: f64 = 0.001;
+const T9_COLLAPSE_THRESHOLD: f64 = 0.005;
+const T8_COLLAPSE_THRESHOLD: f64 = 0.02;
+const T7_COLLAPSE_THRESHOLD: f64 = 0.002;
+const T6_COLLAPSE_THRESHOLD: f64 = 0.0005;
+const T5_COLLAPSE_THRESHOLD: f64 = 0.001;
+const COLLAPSE_STREAK_REQUIRED: u64 = 30;
+
 fn compute_tier_scores(state: &mut SubstrateStabilityState) {
     if state.second_samples.is_empty() {
         return;
@@ -565,19 +576,39 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
         latest.rewrites_total.saturating_sub(prev.rewrites_total) as f64
     };
     state.tier_scores.tier10_hypergraph = (rewrites_per_second / 10.0).clamp(0.0, 1.0);
+    if rewrites_per_second < T10_COLLAPSE_THRESHOLD {
+        state.tier_low_streak[5] = state.tier_low_streak[5].saturating_add(1);
+    } else {
+        state.tier_low_streak[5] = 0;
+    }
 
     // Tier 9: variance of recent energy flux.
     let energy_fluxes: Vec<f64> = window.iter().map(|s| s.energy_flux as f64).collect();
     let flux_variance = variance(&energy_fluxes);
     state.tier_scores.tier9_energy = (flux_variance / 0.1).clamp(0.0, 1.0);
+    if flux_variance < T9_COLLAPSE_THRESHOLD {
+        state.tier_low_streak[4] = state.tier_low_streak[4].saturating_add(1);
+    } else {
+        state.tier_low_streak[4] = 0;
+    }
 
     // Tier 8: histogram entropy normalized by ln(32).
     let entropy_norm = histogram_entropy_32(&latest.chemistry_hist_32);
     state.tier_scores.tier8_mineral = entropy_norm;
+    if entropy_norm < T8_COLLAPSE_THRESHOLD {
+        state.tier_low_streak[3] = state.tier_low_streak[3].saturating_add(1);
+    } else {
+        state.tier_low_streak[3] = 0;
+    }
 
     // Tier 7: max chemistry histogram bin change over last 30s.
     let max_bin_change = max_hist_bin_change_ratio(window);
     state.tier_scores.tier7_chemistry = (max_bin_change / 0.01).clamp(0.0, 1.0);
+    if max_bin_change < T7_COLLAPSE_THRESHOLD {
+        state.tier_low_streak[2] = state.tier_low_streak[2].saturating_add(1);
+    } else {
+        state.tier_low_streak[2] = 0;
+    }
 
     // Tier 6: fungal coverage change rate over last 30s.
     let coverage_change_rate = if window.len() < 2 {
@@ -593,10 +624,20 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
         (last.coverage_pct as f64 - first.coverage_pct as f64).abs() / seconds
     };
     state.tier_scores.tier6_fungal = (coverage_change_rate / 0.05).clamp(0.0, 1.0);
+    if coverage_change_rate < T6_COLLAPSE_THRESHOLD {
+        state.tier_low_streak[1] = state.tier_low_streak[1].saturating_add(1);
+    } else {
+        state.tier_low_streak[1] = 0;
+    }
 
     // Tier 5: max U+V field change over last 30s.
     let max_uv_change = max_uv_change_ratio(window);
     state.tier_scores.tier5_vegetable = (max_uv_change / 0.01).clamp(0.0, 1.0);
+    if max_uv_change < T5_COLLAPSE_THRESHOLD {
+        state.tier_low_streak[0] = state.tier_low_streak[0].saturating_add(1);
+    } else {
+        state.tier_low_streak[0] = 0;
+    }
 
     state.overall_vitality = (
         state.tier_scores.tier10_hypergraph
@@ -607,25 +648,10 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
             + state.tier_scores.tier5_vegetable
     ) / 6.0;
 
-    let tier10_equilibrium = if rewrites_per_second < 0.01 {
-        state.tier10_low_streak_seconds = state.tier10_low_streak_seconds.saturating_add(1);
-        state.tier10_low_streak_seconds >= 10
-    } else {
-        state.tier10_low_streak_seconds = 0;
-        false
-    };
-    let tier9_equilibrium = flux_variance < 0.01;
-    let tier8_equilibrium = entropy_norm < 0.05;
-    let tier7_equilibrium = max_bin_change < 0.005;
-    let tier6_equilibrium = coverage_change_rate < 0.001;
-    let tier5_equilibrium = max_uv_change < 0.001;
-
-    let all_equilibrium = tier10_equilibrium
-        && tier9_equilibrium
-        && tier8_equilibrium
-        && tier7_equilibrium
-        && tier6_equilibrium
-        && tier5_equilibrium;
+    let all_equilibrium = state
+        .tier_low_streak
+        .iter()
+        .all(|streak| *streak >= COLLAPSE_STREAK_REQUIRED);
 
     if all_equilibrium && !state.equilibrium_reached {
         state.equilibrium_reached = true;
@@ -644,6 +670,130 @@ fn compute_tier_scores(state: &mut SubstrateStabilityState) {
         });
         state.equilibrium_tier = Some(tiers[0].0);
         state.equilibrium_seconds = Some(latest.second as f64);
+    }
+}
+
+fn tier_trend(earlier_avg: f64, later_avg: f64) -> &'static str {
+    const TREND_THRESHOLD: f64 = 0.1;
+    if earlier_avg < 1e-10 && later_avg < 1e-10 {
+        return "stable";
+    }
+    if earlier_avg < 1e-10 {
+        return "rising";
+    }
+    let ratio = later_avg / earlier_avg;
+    if ratio > 1.0 + TREND_THRESHOLD {
+        "rising"
+    } else if ratio < 1.0 - TREND_THRESHOLD {
+        "falling"
+    } else {
+        "stable"
+    }
+}
+
+fn window_avg_rewrites_per_sec(samples: &[SubstrateSecondSample]) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let first = &samples[0];
+    let last = &samples[samples.len() - 1];
+    let span = last.second.saturating_sub(first.second) as f64;
+    if span < 1.0 {
+        return 0.0;
+    }
+    last.rewrites_total.saturating_sub(first.rewrites_total) as f64 / span
+}
+
+struct TierTrends {
+    tier10: &'static str,
+    tier9: &'static str,
+    tier8: &'static str,
+    tier7: &'static str,
+    tier6: &'static str,
+    tier5: &'static str,
+}
+
+fn compute_tier_trends(samples: &[SubstrateSecondSample]) -> TierTrends {
+    if samples.len() < 6 {
+        let s = "stable";
+        return TierTrends { tier10: s, tier9: s, tier8: s, tier7: s, tier6: s, tier5: s };
+    }
+    let mid = samples.len() / 2;
+    let early = &samples[..mid];
+    let late = &samples[mid..];
+
+    let early_entropy: f64 = early
+        .iter()
+        .map(|s| histogram_entropy_32(&s.chemistry_hist_32))
+        .sum::<f64>()
+        / early.len() as f64;
+    let late_entropy: f64 = late
+        .iter()
+        .map(|s| histogram_entropy_32(&s.chemistry_hist_32))
+        .sum::<f64>()
+        / late.len() as f64;
+
+    let early_cov_change = if early.len() < 2 {
+        0.0
+    } else {
+        let span = early
+            .last()
+            .expect("early half last sample missing")
+            .second
+            .saturating_sub(early[0].second)
+            .max(1) as f64;
+        (early
+            .last()
+            .expect("early half last sample missing")
+            .coverage_pct as f64
+            - early[0].coverage_pct as f64)
+            .abs()
+            / span
+    };
+    let late_cov_change = if late.len() < 2 {
+        0.0
+    } else {
+        let span = late
+            .last()
+            .expect("late half last sample missing")
+            .second
+            .saturating_sub(late[0].second)
+            .max(1) as f64;
+        (late
+            .last()
+            .expect("late half last sample missing")
+            .coverage_pct as f64
+            - late[0].coverage_pct as f64)
+            .abs()
+            / span
+    };
+
+    let early_fluxes: Vec<f64> = early.iter().map(|s| s.energy_flux as f64).collect();
+    let late_fluxes: Vec<f64> = late.iter().map(|s| s.energy_flux as f64).collect();
+
+    TierTrends {
+        tier10: tier_trend(
+            window_avg_rewrites_per_sec(early),
+            window_avg_rewrites_per_sec(late),
+        ),
+        tier9: tier_trend(variance(&early_fluxes), variance(&late_fluxes)),
+        tier8: tier_trend(early_entropy, late_entropy),
+        tier7: tier_trend(
+            max_hist_bin_change_ratio(early),
+            max_hist_bin_change_ratio(late),
+        ),
+        tier6: tier_trend(early_cov_change, late_cov_change),
+        tier5: tier_trend(max_uv_change_ratio(early), max_uv_change_ratio(late)),
+    }
+}
+
+fn tier_status(streak: u64) -> &'static str {
+    if streak >= COLLAPSE_STREAK_REQUIRED {
+        "Collapsed"
+    } else if streak >= COLLAPSE_STREAK_REQUIRED / 2 {
+        "Collapsing"
+    } else {
+        "Active"
     }
 }
 
@@ -1007,51 +1157,67 @@ fn build_headless_report(
 
     if profile == HeadlessProfile::SubstrateOnly {
         if let Some(stability) = world.get_resource::<SubstrateStabilityState>() {
-            let start = match stability.start_coverage_pct {
-                Some(value) => value,
-                None => 0.0,
+            let samples = &stability.second_samples;
+            let window = if samples.len() > 30 {
+                &samples[samples.len() - 30..]
+            } else {
+                &samples[..]
             };
-            let end = match stability.end_coverage_pct {
-                Some(value) => value,
-                None => 0.0,
-            };
-            let growth = end - start;
+            let trends = compute_tier_trends(window);
 
-            lines.push("Substrate Stability Report:".to_string());
+            lines.push("=== Tier Monitor ===".to_string());
             lines.push(format!(
-                "  Tier 10 (hypergraph rewrite): {:.4}.",
-                stability.tier_scores.tier10_hypergraph
+                "  {:>4}  {:>8}  {:^11}  {}",
+                "Tier", "Vitality", "Trend(30s)", "Status"
             ));
             lines.push(format!(
-                "  Tier 9 (energy flux variance): {:.4}.",
-                stability.tier_scores.tier9_energy
+                "  {:>4}  {:>8}  {:^11}  {}",
+                "----", "--------", "-----------", "-------"
             ));
             lines.push(format!(
-                "  Tier 8 (chem entropy / ln(32)): {:.4}.",
-                stability.tier_scores.tier8_mineral
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "10",
+                stability.tier_scores.tier10_hypergraph,
+                trends.tier10,
+                tier_status(stability.tier_low_streak[5]),
             ));
             lines.push(format!(
-                "  Tier 7 (max chemistry-bin change): {:.4}.",
-                stability.tier_scores.tier7_chemistry
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "9",
+                stability.tier_scores.tier9_energy,
+                trends.tier9,
+                tier_status(stability.tier_low_streak[4]),
             ));
             lines.push(format!(
-                "  Tier 6 (fungal coverage change): {:.4}.",
-                stability.tier_scores.tier6_fungal
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "8",
+                stability.tier_scores.tier8_mineral,
+                trends.tier8,
+                tier_status(stability.tier_low_streak[3]),
             ));
             lines.push(format!(
-                "  Tier 5 (max U+V change): {:.4}.",
-                stability.tier_scores.tier5_vegetable
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "7",
+                stability.tier_scores.tier7_chemistry,
+                trends.tier7,
+                tier_status(stability.tier_low_streak[2]),
             ));
             lines.push(format!(
-                "  Overall substrate vitality: {:.4}.",
-                stability.overall_vitality
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "6",
+                stability.tier_scores.tier6_fungal,
+                trends.tier6,
+                tier_status(stability.tier_low_streak[1]),
             ));
             lines.push(format!(
-                "  Fungal coverage start {:.4}% -> end {:.4}% (delta {:+.4}%).",
-                start, end, growth
+                "  {:>4}  {:>8.4}  {:^11}  {}",
+                "5",
+                stability.tier_scores.tier5_vegetable,
+                trends.tier5,
+                tier_status(stability.tier_low_streak[0]),
             ));
 
-            if stability.equilibrium_reached {
+            let vitality_status = if stability.equilibrium_reached {
                 let tier = match stability.equilibrium_tier {
                     Some(value) => value,
                     None => "Tier 10",
@@ -1060,18 +1226,30 @@ fn build_headless_report(
                     Some(value) => value,
                     None => elapsed_secs,
                 };
-                lines.push(format!(
-                    "  Substrate Equilibrium Reached at {} after {:.1} seconds (vitality: {:.2}).",
-                    tier,
-                    seconds,
-                    stability.overall_vitality
-                ));
+                format!(
+                    "  Overall vitality: {:.2}  (Equilibrium Reached at {} after {:.1}s)",
+                    stability.overall_vitality, tier, seconds
+                )
             } else {
-                lines.push(format!(
-                    "  Substrate still dynamic (vitality: {:.2}).",
+                format!(
+                    "  Overall vitality: {:.2}  (still dynamic)",
                     stability.overall_vitality
-                ));
-            }
+                )
+            };
+            lines.push(vitality_status);
+
+            let start = match stability.start_coverage_pct {
+                Some(value) => value,
+                None => 0.0,
+            };
+            let end = match stability.end_coverage_pct {
+                Some(value) => value,
+                None => 0.0,
+            };
+            lines.push(format!(
+                "  Fungal coverage: {:.4}% -> {:.4}% (delta {:+.4}%)",
+                start, end, end - start
+            ));
         }
     }
 
