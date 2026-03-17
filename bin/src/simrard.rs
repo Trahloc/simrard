@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy::ecs::message::{MessageReader, Messages};
+use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseWheel;
 use bevy::sprite::Sprite;
 use bevy::text::{Font, FontSmoothing};
@@ -83,6 +84,7 @@ fn live_stats_overlay_system(
         Query<&mut Visibility, With<LiveStatsPanelUiRoot>>,
     )>,
     mut local: Local<LiveStatsPanelLocal>,
+    detail: LiveStatsDetailParams,
 ) {
     let (cam_x, cam_y, area_max_x, area_max_y) = match camera_query.single() {
         Ok((transform, Projection::Orthographic(ortho))) => (
@@ -193,6 +195,83 @@ fn live_stats_overlay_system(
         deaths_5s,
     );
 
+    let seq = global_clock.causal_seq();
+    let pause = if detail.scale.0 == 0.0 { " [PAUSED]" } else { "" };
+    #[cfg(debug_assertions)]
+    let hypergraph_controls = if detail.hypergraph_viz.enabled {
+        "J/K chaos  H hyper-viz:on"
+    } else {
+        "J/K chaos  H hyper-viz:off"
+    };
+    #[cfg(not(debug_assertions))]
+    let hypergraph_controls = "";
+
+    let sim_status = format!(
+        "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}\nVisual Debug: {}",
+        seq,
+        detail.scale.0,
+        pause,
+        detail.hypergraph.chaos(),
+        hypergraph_controls,
+        if visual.enabled { "ON" } else { "OFF" }
+    );
+
+    let food_count = detail.food_query.iter().count();
+    let food_info = detail
+        .food_query
+        .iter()
+        .map(|(pos, f)| format!("{:?}({})", pos.chunk, f.portions))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let water_count = detail.water_query.iter().count();
+    let water_info = detail
+        .water_query
+        .iter()
+        .map(|(pos, w)| format!("{:?}({})", pos.chunk, w.portions))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let resource_lines = format!(
+        "\n\nResources:\n  Food {}: {}\n  Water {}: {}",
+        food_count, food_info, water_count, water_info,
+    );
+
+    let quest_lines = if detail.quest_board.active_quests.is_empty() {
+        "\n\nQuests: (none)".to_string()
+    } else {
+        std::iter::once("\n\nQuests:".to_string())
+            .chain(detail.quest_board.active_quests.iter().take(10).map(|q| {
+                let status = match q.status {
+                    QuestStatus::Open => "Open".to_string(),
+                    QuestStatus::Completed => "Completed".to_string(),
+                    QuestStatus::InProgress { provider } => {
+                        let provider_name = detail
+                            .pawn_names
+                            .get(provider)
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|_| format!("{:?}", provider));
+                        format!("InProgress({})", provider_name)
+                    }
+                };
+                format!("  {} @ {:?} - {}", q.need, q.chunk, status)
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let activity_lines = if detail.activity.0.is_empty() {
+        "\n\nActivity: (none yet)".to_string()
+    } else {
+        std::iter::once("\n\nActivity:".to_string())
+            .chain(detail.activity.0.iter().rev().take(8).cloned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let stats_text = format!(
+        "{}{}{}{}{}",
+        stats_text, sim_status, resource_lines, quest_lines, activity_lines
+    );
+
     if !visual.enabled {
         if let Ok((_, _, mut vis)) = panel_queries.p0().single_mut() {
             *vis = Visibility::Hidden;
@@ -243,6 +322,19 @@ fn live_stats_overlay_system(
 }
 
 
+
+#[derive(SystemParam)]
+struct LiveStatsDetailParams<'w, 's> {
+    scale: Res<'w, SimTimeScale>,
+    hypergraph: Res<'w, HypergraphSubstrate>,
+    #[cfg(debug_assertions)]
+    hypergraph_viz: Res<'w, HypergraphDebugViz>,
+    quest_board: Res<'w, QuestBoard>,
+    activity: Res<'w, ActivityLog>,
+    pawn_names: Query<'w, 's, &'static Name>,
+    food_query: Query<'w, 's, (&'static Position, &'static FoodReservation)>,
+    water_query: Query<'w, 's, (&'static Position, &'static WaterSource)>,
+}
 
 #[derive(Default)]
 struct LiveStatsPanelLocal {
