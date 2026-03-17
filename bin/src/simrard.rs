@@ -267,9 +267,21 @@ fn live_stats_overlay_system(
             .join("\n")
     };
 
+    let last_rewrites = detail.audit_log.last_n(5);
+    let audit_lines = if last_rewrites.is_empty() {
+        "\n\nAudit: no rewrites recorded".to_string()
+    } else {
+        std::iter::once("\n\nLast 5 rewrites:".to_string())
+            .chain(last_rewrites.iter().map(|entry| {
+                format!("  @{} - {} rewrites @ {:.1}s", entry.tick, entry.rewrite_count, entry.elapsed_secs)
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let stats_text = format!(
-        "{}{}{}{}{}",
-        stats_text, sim_status, resource_lines, quest_lines, activity_lines
+        "{}{}{}{}{}{}",
+        stats_text, sim_status, resource_lines, quest_lines, activity_lines, audit_lines
     );
 
     if !visual.enabled {
@@ -334,6 +346,7 @@ struct LiveStatsDetailParams<'w, 's> {
     pawn_names: Query<'w, 's, &'static Name>,
     food_query: Query<'w, 's, (&'static Position, &'static FoodReservation)>,
     water_query: Query<'w, 's, (&'static Position, &'static WaterSource)>,
+    audit_log: Res<'w, HypergraphAuditLog>,
 }
 
 #[derive(Default)]
@@ -352,6 +365,35 @@ struct LiveStatsPanelLocal {
 struct HypergraphRuntimeStats {
     rewritten_total: u64,
 }
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct HypergraphAuditEntry {
+    tick: u64,
+    elapsed_secs: f32,
+    rewrite_count: u64,
+    description: String,
+}
+
+#[derive(Resource, Default)]
+struct HypergraphAuditLog {
+    entries: VecDeque<HypergraphAuditEntry>,
+}
+
+impl HypergraphAuditLog {
+    fn push(&mut self, entry: HypergraphAuditEntry) {
+        self.entries.push_back(entry);
+        while self.entries.len() > 50 {
+            self.entries.pop_front();
+        }
+    }
+
+    fn last_n(&self, n: usize) -> Vec<HypergraphAuditEntry> {
+        self.entries.iter().rev().take(n).cloned().collect()
+    }
+}
+
+
 
 #[derive(Resource, Default)]
 struct VisualDebugThermalCache {
@@ -509,6 +551,7 @@ fn run_interactive() {
         .init_resource::<ActivityLog>()
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<HypergraphRuntimeStats>()
+        .init_resource::<HypergraphAuditLog>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<Tier4State>()
@@ -679,6 +722,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         .init_resource::<ActivityLog>()
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<HypergraphRuntimeStats>()
+        .init_resource::<HypergraphAuditLog>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<RespawnState>()
@@ -3789,6 +3833,8 @@ fn hypergraph_tick_system(
     mut thermal: ResMut<ThermalState>,
     mut runtime_stats: ResMut<HypergraphRuntimeStats>,
     mut report: Option<ResMut<SimulationReport>>,
+    time: Res<Time>,
+    mut audit_log: ResMut<HypergraphAuditLog>,
 ) {
     let started = Instant::now();
     if !tier10_enabled_from_args() {
@@ -3866,6 +3912,16 @@ fn hypergraph_tick_system(
     runtime_stats.rewritten_total = runtime_stats
         .rewritten_total
         .saturating_add(stats.rewritten as u64);
+
+    if stats.rewritten > 0 {
+        let entry = HypergraphAuditEntry {
+            tick: seq,
+            elapsed_secs: time.elapsed_secs(),
+            rewrite_count: stats.rewritten as u64,
+            description: format!("{} rewrites", stats.rewritten),
+        };
+        audit_log.push(entry);
+    }
 
     if let Some(ref mut report) = report {
         if stats.considered > 0 {
