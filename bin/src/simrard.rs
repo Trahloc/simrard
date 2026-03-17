@@ -114,6 +114,7 @@ fn live_stats_overlay_system(
     )>,
     mut local: Local<LiveStatsPanelLocal>,
     detail: LiveStatsDetailParams,
+    rule_viz: Res<RuleVizState>,
 ) {
     let (cam_x, cam_y, area_max_x, area_max_y) = match camera_query.single() {
         Ok((transform, Projection::Orthographic(ortho))) => (
@@ -239,11 +240,12 @@ fn live_stats_overlay_system(
         let hypergraph_controls = "";
 
         let sim_status = format!(
-            "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}\nVisual Debug: {}",
+            "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  U rules  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} (surv: {:.2}) {}\nVisual Debug: {}",
             seq,
             detail.scale.0,
             pause,
             detail.hypergraph.chaos(),
+            rule_viz.last_survival_chaos,
             hypergraph_controls,
             if visual.enabled { "ON" } else { "OFF" }
         );
@@ -311,9 +313,29 @@ fn live_stats_overlay_system(
                 .join("\n")
         };
 
+        let rule_lines = if rule_viz.enabled {
+            let rules = detail.hypergraph.rules();
+            let chaos = detail.hypergraph.chaos();
+            let mut scored: Vec<_> = rules.iter()
+                .map(|r| {
+                    let eff = (r.probability * (0.5 + chaos)).clamp(0.0, 1.0);
+                    (r, eff)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            std::iter::once(format!("\n\nRules (U to hide  surv-chaos:{:.2}):", chaos))
+                .chain(scored.iter().take(5).map(|(r, eff)| {
+                    format!("  {:<20} p:{:.2} eff:{:.2}", r.name, r.probability, eff)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            "\n\nRules: [U to show]".to_string()
+        };
+
         let full_text = format!(
-            "{}{}{}{}{}{}",
-            stats_text, sim_status, resource_lines, quest_lines, activity_lines, audit_lines
+            "{}{}{}{}{}{}{}",
+            stats_text, sim_status, resource_lines, quest_lines, activity_lines, audit_lines, rule_lines
         );
         local.cached_stats_text = full_text;
         local.last_panel_update_secs = now;
@@ -401,6 +423,18 @@ struct LiveStatsPanelLocal {
 #[derive(Resource, Default)]
 struct HypergraphRuntimeStats {
     rewritten_total: u64,
+}
+
+#[derive(Resource, Default)]
+struct RuleVizState {
+    enabled: bool,
+    /// Survival chaos applied on the last tick (for panel display).
+    last_survival_chaos: f32,
+}
+
+#[derive(Resource, Default)]
+struct Tier5DiagnosticsSystem {
+    active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -635,6 +669,8 @@ fn run_interactive() {
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<HypergraphAuditLog>()
+        .init_resource::<RuleVizState>()
+        .init_resource::<Tier5DiagnosticsSystem>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<Tier4State>()
@@ -715,6 +751,8 @@ fn run_interactive() {
         .add_systems(Update, visual_debug_thermal_overlay_system)
         .add_systems(Update, visual_debug_hypergraph_overlay_system)
         .add_systems(Update, live_stats_overlay_system)
+        .add_systems(Update, rule_viz_toggle_system)
+        .add_systems(Update, tier5_diagnostics_placeholder_system.run_if(|v: Res<VisualDebug>| v.enabled))
         .add_systems(Update, visual_debug_profiler_report_system);
 
     // Phase 4.D1: Push ECS snapshot to DuckDB mirror after Update (post visual sync).
@@ -808,6 +846,8 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<HypergraphAuditLog>()
+        .init_resource::<RuleVizState>()
+        .init_resource::<Tier5DiagnosticsSystem>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<RespawnState>()
@@ -2349,6 +2389,19 @@ fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMu
     if keys.just_pressed(KeyCode::KeyV) {
         visual.enabled = !visual.enabled;
     }
+}
+
+fn rule_viz_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut rule_viz: ResMut<RuleVizState>) {
+    if keys.just_pressed(KeyCode::KeyU) {
+        rule_viz.enabled = !rule_viz.enabled;
+    }
+}
+
+fn tier5_diagnostics_placeholder_system(
+    _rule_viz: Res<RuleVizState>,
+    _tier5: Res<Tier5DiagnosticsSystem>,
+) {
+    // Tier-5 diagnostics hook — placeholder for next sprint
 }
 
 fn visual_debug_insect_overlay_system(
@@ -4142,11 +4195,31 @@ fn hypergraph_tick_system(
     mut report: Option<ResMut<SimulationReport>>,
     time: Res<Time>,
     mut audit_log: ResMut<HypergraphAuditLog>,
+    tier4: Res<Tier4State>,
+    mut rule_viz: ResMut<RuleVizState>,
 ) {
     let started = Instant::now();
     if !tier10_enabled_from_args() {
         perf_record("hypergraph_tick", started.elapsed());
         return;
+    }
+
+    // Survival-weighted dispatcher: low Tier-4 energy → lower chaos → more deterministic rewrites.
+    // Thermal pressure reduces chaos further when the environment is overheating.
+    {
+        let base_chaos = substrate.chaos();
+        let avg_energy_norm = if tier4.insects.is_empty() {
+            1.0_f32
+        } else {
+            let sum: f32 = tier4.insects.iter().map(|i| i.energy).sum();
+            (sum / (tier4.insects.len() as f32 * 8.0)).clamp(0.0, 1.0)
+        };
+        let thermal_stress = ((thermal.latest_peak_temperature_k - thermal.sink_temperature_k) / 50.0)
+            .clamp(0.0, 1.0);
+        let survival_factor = (avg_energy_norm * (1.0 - thermal_stress * 0.3)).clamp(0.1, 1.0);
+        let survival_chaos = (base_chaos * survival_factor).clamp(0.05, 1.0);
+        substrate.set_chaos(survival_chaos);
+        rule_viz.last_survival_chaos = survival_chaos;
     }
 
     let seq = global_clock.causal_seq();
