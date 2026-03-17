@@ -1,6 +1,5 @@
 use bevy::prelude::*;
 use bevy::ecs::message::MessageWriter;
-use simrard_lib_mirror::{rank_provider_candidates_for_need, ProviderCandidateInput};
 use simrard_lib_utility_ai::prelude::*;
 use simrard_lib_causal::{CausalEventKind, CausalEventQueue, DriveType};
 use simrard_lib_charter::{
@@ -9,12 +8,14 @@ use simrard_lib_charter::{
 };
 use simrard_lib_pawn::{
     ActiveLeaseHandle, Capabilities, FoodReservation, ItemHistory, MovementTarget,
-    KnownRecipes, NeuralNetworkComponent, Position, Quest, QuestBoard, QuestStatus,
-    RestSpot, SimulationLogSettings, SimulationReport, WaterSource, WORLD_CHUNK_EXTENT,
+    KnownRecipes, MortalityCause, NeuralNetworkComponent, PawnDeathRecord, Position, Quest,
+    QuestBoard, QuestStatus, RestSpot, SimulationLogSettings, SimulationReport, WaterSource,
+    WORLD_CHUNK_EXTENT,
 };
 use simrard_lib_time::{CausalClock, GlobalTickClock};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 fn stdout_enabled(settings: Option<&SimulationLogSettings>) -> bool {
     settings.map(|settings| settings.stdout_enabled).unwrap_or(true)
@@ -27,6 +28,53 @@ pub struct ActivityLog(pub VecDeque<String>);
 
 const ACTIVITY_LOG_MAX: usize = 32;
 const QUEST_ACCEPTANCE_MIN_DRIVE: f32 = 0.3;
+const PROVIDER_RANK_DRIVE_WEIGHT: f32 = 0.75;
+const PROVIDER_RANK_PROXIMITY_WEIGHT: f32 = 0.25;
+
+#[derive(Resource, Default)]
+pub struct DispatcherEvaluationState {
+    pub dirty_all: bool,
+    pub dirty_entities: HashSet<Entity>,
+    pub score_dirty_flag: HashSet<Entity>,
+    pub last_evaluation_tick: HashMap<Entity, u64>,
+    pub last_region_signature: HashMap<Entity, u64>,
+    pub last_score_cache: HashMap<Entity, CachedScoreEntry>,
+}
+
+impl DispatcherEvaluationState {
+    pub fn mark_dirty(&mut self, entity: Entity) {
+        self.dirty_entities.insert(entity);
+        self.score_dirty_flag.insert(entity);
+    }
+
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty_all = true;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CachedScoreEntry {
+    pub can_eat: bool,
+    pub can_drink: bool,
+    pub can_rest: bool,
+    pub cached_final_scores: [(ActionId, f32); 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionId {
+    Eat,
+    Drink,
+    Rest,
+}
+
+#[derive(Default)]
+struct QuestAcceptanceTiming {
+    per_pawn_score_collection_us: u64,
+    biochemical_base_lookup_us: u64,
+    contextual_modifier_application_us: u64,
+    final_score_combination_sorting_us: u64,
+    winner_selection_action_prep_us: u64,
+}
 
 impl ActivityLog {
     pub fn push(&mut self, s: String) {
@@ -64,6 +112,7 @@ pub struct PawnAIPlugin;
 
 impl Plugin for PawnAIPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<DispatcherEvaluationState>();
         app.add_systems(
             PreUpdate,
             (
@@ -93,35 +142,93 @@ impl Plugin for PawnAIPlugin {
 /// Death is failure: pawns must move to food/water or they die.
 pub fn pawn_death_system(
     mut commands: Commands,
-    query: Query<(Entity, &Name, &NeuralNetworkComponent)>,
+    query: Query<(Entity, &Name, &Position, &NeuralNetworkComponent)>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut quest_board: Option<ResMut<QuestBoard>>,
     global_clock: Option<Res<GlobalTickClock>>,
     mut report: Option<ResMut<SimulationReport>>,
 ) {
-    let to_despawn: Vec<(Entity, String)> = query
+    let to_despawn: Vec<(Entity, String, ChunkId, NeuralNetworkComponent)> = query
         .iter()
-        .filter(|(_, _, nn)| nn.hunger <= 0.0 || nn.thirst <= 0.0)
-        .map(|(e, name, _)| (e, format!("{}", name)))
+        .filter(|(_, _, _, nn)| nn.hunger <= 0.0 || nn.thirst <= 0.0)
+        .map(|(e, name, pos, nn)| (e, format!("{}", name), pos.chunk, nn.clone()))
         .collect();
-    let dead: std::collections::HashSet<_> = to_despawn.iter().map(|(e, _)| *e).collect();
+    let dead: std::collections::HashSet<_> = to_despawn.iter().map(|(e, _, _, _)| *e).collect();
     if let Some(ref mut board) = quest_board {
         board.active_quests.retain(|q| !dead.contains(&q.requester));
     }
-    for (entity, name) in to_despawn {
+    for (entity, name, chunk, nn) in to_despawn {
+        let (cause, primary_drive) = classify_mortality(&nn);
         if let Some(ref mut log) = activity {
             log.push(format!("{} died (hunger/thirst zero)", name));
         }
         if let Some(ref mut report) = report {
             report.bump("pawn_deaths");
+            match cause {
+                MortalityCause::Hunger => report.bump("deaths_hunger"),
+                MortalityCause::Thirst => report.bump("deaths_thirst"),
+                MortalityCause::Other => report.bump("deaths_other"),
+            }
             let tick = global_clock
                 .as_deref()
                 .map(CausalClock::causal_seq)
                 .unwrap_or_default();
-            report.note(format!("tick {}: {} died", tick, name));
+            report.record_death(PawnDeathRecord {
+                tick,
+                pawn_name: name.clone(),
+                cause,
+                primary_drive,
+                hunger: nn.hunger,
+                thirst: nn.thirst,
+                fatigue: nn.fatigue,
+                curiosity: nn.curiosity,
+                social: nn.social,
+                fear: nn.fear,
+                industriousness: nn.industriousness,
+                comfort: nn.comfort,
+                chunk,
+            });
+            report.note(format!(
+                "tick {}: {} died cause={:?} primary={} @ {:?}",
+                tick, name, cause, primary_drive, chunk
+            ));
         }
         commands.entity(entity).despawn();
     }
+}
+
+fn classify_mortality(nn: &NeuralNetworkComponent) -> (MortalityCause, &'static str) {
+    let drives = [
+        ("hunger", nn.hunger),
+        ("thirst", nn.thirst),
+        ("fatigue", nn.fatigue),
+        ("curiosity", nn.curiosity),
+        ("social", nn.social),
+        ("fear", nn.fear),
+        ("industriousness", nn.industriousness),
+        ("comfort", nn.comfort),
+    ];
+    let primary_drive = drives
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).expect("drive values must be finite"))
+        .map(|(name, _)| *name)
+        .expect("drive vector must not be empty");
+
+    let cause = if nn.hunger <= 0.0 && nn.thirst <= 0.0 {
+        if nn.hunger <= nn.thirst {
+            MortalityCause::Hunger
+        } else {
+            MortalityCause::Thirst
+        }
+    } else if nn.hunger <= 0.0 {
+        MortalityCause::Hunger
+    } else if nn.thirst <= 0.0 {
+        MortalityCause::Thirst
+    } else {
+        MortalityCause::Other
+    };
+
+    (cause, primary_drive)
 }
 
 /// One dispatcher step: drain events ready at `current_seq` and apply them.
@@ -133,15 +240,34 @@ pub fn pawn_event_dispatcher_step(
     pawn_query: &mut Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
     capabilities_query: &Query<&Capabilities>,
     known_recipes_query: &mut Query<&mut KnownRecipes>,
+    region_signatures: &HashMap<Entity, u64>,
     mut activity: Option<&mut ActivityLog>,
     mut report: Option<&mut SimulationReport>,
+    evaluation_state: &mut DispatcherEvaluationState,
     stdout_enabled: bool,
 ) {
+    for (entity, signature) in region_signatures {
+        let prev = evaluation_state.last_region_signature.insert(*entity, *signature);
+        match prev {
+            Some(old) if old == *signature => {}
+            _ => evaluation_state.mark_dirty(*entity),
+        }
+    }
+
+    let collect_started = Instant::now();
     let ready_events = event_queue.drain_ready(current_seq);
+    let collect_elapsed = collect_started.elapsed();
+
+    let mut drive_updates_us: u64 = 0;
+    let mut lease_request_path_us: u64 = 0;
+    let mut other_event_us: u64 = 0;
 
     for event in ready_events {
+        let event_started = Instant::now();
         match event.kind {
             CausalEventKind::DriveThresholdCrossed { entity, drive } => {
+                evaluation_state.mark_all_dirty();
+                evaluation_state.mark_dirty(entity);
                 if let Ok((e, name, position, mut nn)) = pawn_query.get_mut(entity) {
                     let (val, label, need) = match drive {
                         DriveType::Hunger => (&mut nn.hunger, "Hunger", "food"),
@@ -174,6 +300,17 @@ pub fn pawn_event_dispatcher_step(
                         );
                     }
                 }
+                drive_updates_us += event_started.elapsed().as_micros() as u64;
+            }
+            CausalEventKind::LeaseDenied { entity, chunk, .. } => {
+                evaluation_state.mark_dirty(entity);
+                if let Some(ref mut log) = activity {
+                    log.push(format!("Lease denied @ {:?} for {:?}", chunk, entity));
+                }
+                if let Some(report) = report.as_deref_mut() {
+                    report.bump("dispatcher_lease_denied_event");
+                }
+                lease_request_path_us += event_started.elapsed().as_micros() as u64;
             }
             CausalEventKind::LeaseReleased { chunk, .. } => {
                 if let Some(ref mut log) = activity {
@@ -185,6 +322,7 @@ pub fn pawn_event_dispatcher_step(
                 if stdout_enabled {
                     eprintln!("[dispatcher:{}] LeaseReleased on chunk({:?})", current_seq, chunk);
                 }
+                lease_request_path_us += event_started.elapsed().as_micros() as u64;
             }
             CausalEventKind::ResourceDepleted { chunk } => {
                 if let Some(ref mut log) = activity {
@@ -196,6 +334,7 @@ pub fn pawn_event_dispatcher_step(
                 if stdout_enabled {
                     eprintln!("[dispatcher:{}] ResourceDepleted at chunk({:?})", current_seq, chunk);
                 }
+                other_event_us += event_started.elapsed().as_micros() as u64;
             }
             CausalEventKind::DiscoveryPropagated { recipe, from, to } => {
                 if let Ok(mut known) = known_recipes_query.get_mut(to) {
@@ -214,19 +353,40 @@ pub fn pawn_event_dispatcher_step(
                         }
                     }
                 }
+                other_event_us += event_started.elapsed().as_micros() as u64;
             }
         }
     }
 
-    quest_acceptance_step(
+    let action_started = Instant::now();
+    let timing = quest_acceptance_step(
         current_seq,
         quest_board,
         pawn_query,
         capabilities_query,
         activity,
-        report,
+        report.as_deref_mut(),
+        evaluation_state,
         stdout_enabled,
     );
+    let action_elapsed = action_started.elapsed();
+
+    if let Some(report) = report.as_deref_mut() {
+        report.bump("dispatcher_phase_samples");
+        report.add_counter(
+            "dispatcher_event_collection_us",
+            collect_elapsed.as_micros() as u64,
+        );
+        report.add_counter("dispatcher_drive_updates_us", drive_updates_us);
+        report.add_counter("dispatcher_lease_requests_us", lease_request_path_us);
+        report.add_counter("dispatcher_action_resolution_us", action_elapsed.as_micros() as u64);
+        report.add_counter("dispatcher_per_pawn_score_collection_us", timing.per_pawn_score_collection_us);
+        report.add_counter("dispatcher_biochemical_base_lookup_us", timing.biochemical_base_lookup_us);
+        report.add_counter("dispatcher_contextual_modifier_us", timing.contextual_modifier_application_us);
+        report.add_counter("dispatcher_score_combine_sort_us", timing.final_score_combination_sorting_us);
+        report.add_counter("dispatcher_winner_selection_us", timing.winner_selection_action_prep_us);
+        report.add_counter("dispatcher_other_event_us", other_event_us);
+    }
 }
 
 fn need_capability_and_drive(need: &str, nn: &NeuralNetworkComponent) -> Option<(&'static str, f32)> {
@@ -238,19 +398,40 @@ fn need_capability_and_drive(need: &str, nn: &NeuralNetworkComponent) -> Option<
     }
 }
 
+fn action_for_need(need: &str) -> Option<ActionId> {
+    match need {
+        "food" => Some(ActionId::Eat),
+        "water" => Some(ActionId::Drink),
+        "rest" => Some(ActionId::Rest),
+        _ => None,
+    }
+}
+
+fn cached_score_for_action(scores: &[(ActionId, f32); 3], action: ActionId) -> f32 {
+    for (candidate_action, score) in scores {
+        if *candidate_action == action {
+            return *score;
+        }
+    }
+    panic!("cached action score missing for requested action");
+}
+
 fn chebyshev_distance(a: ChunkId, b: ChunkId) -> u32 {
     a.0.abs_diff(b.0).max(a.1.abs_diff(b.1))
 }
 
-pub fn quest_acceptance_step(
+fn quest_acceptance_step(
     current_seq: u64,
     quest_board: &mut QuestBoard,
     pawn_query: &mut Query<(Entity, &Name, &Position, &mut NeuralNetworkComponent)>,
     capabilities_query: &Query<&Capabilities>,
     mut activity: Option<&mut ActivityLog>,
     mut report: Option<&mut SimulationReport>,
+    evaluation_state: &mut DispatcherEvaluationState,
     stdout_enabled: bool,
-) {
+) -> QuestAcceptanceTiming {
+    let mut timing = QuestAcceptanceTiming::default();
+
     // Keep completed quests visible until next tick, then clear them.
     let completed_before = quest_board
         .active_quests
@@ -263,21 +444,81 @@ pub fn quest_acceptance_step(
             .retain(|q| !matches!(q.status, QuestStatus::Completed));
     }
 
-    let mut pawns: Vec<(Entity, String, ChunkId, Option<Capabilities>, f32, f32, f32)> = Vec::new();
+    let has_open_quests = quest_board
+        .active_quests
+        .iter()
+        .any(|q| matches!(q.status, QuestStatus::Open));
+    if !has_open_quests {
+        return timing;
+    }
+
+    let should_evaluate = evaluation_state.dirty_all || !evaluation_state.dirty_entities.is_empty();
+    if !should_evaluate {
+        if let Some(report) = report.as_deref_mut() {
+            report.bump("dispatcher_eval_skipped_clean");
+        }
+        return timing;
+    }
+
+    let score_collect_started = Instant::now();
+    let mut pawns: Vec<(Entity, String, ChunkId, CachedScoreEntry)> = Vec::new();
     let mut pawn_name_by_entity: HashMap<Entity, String> = HashMap::new();
+    let dirty_all = evaluation_state.dirty_all;
     for (entity, name, position, nn) in pawn_query.iter_mut() {
         let name_string = name.to_string();
         pawn_name_by_entity.insert(entity, name_string.clone());
-        let capabilities = capabilities_query.get(entity).ok().cloned();
-        pawns.push((
-            entity,
-            name_string,
-            position.chunk,
-            capabilities,
-            (1.0 - nn.hunger).clamp(0.0, 1.0),
-            (1.0 - nn.thirst).clamp(0.0, 1.0),
-            (1.0 - nn.fatigue).clamp(0.0, 1.0),
-        ));
+        let score_dirty = dirty_all
+            || evaluation_state.dirty_entities.contains(&entity)
+            || evaluation_state.score_dirty_flag.contains(&entity)
+            || !evaluation_state.last_score_cache.contains_key(&entity);
+
+        let cached = if score_dirty {
+            let bio_started = Instant::now();
+            let capabilities = capabilities_query.get(entity).ok().cloned();
+            let can_eat = match capabilities.as_ref() {
+                Some(caps) => caps.has("Eat"),
+                None => false,
+            };
+            let can_drink = match capabilities.as_ref() {
+                Some(caps) => caps.has("Drink"),
+                None => false,
+            };
+            let can_rest = match capabilities.as_ref() {
+                Some(caps) => caps.has("Rest"),
+                None => false,
+            };
+            let score_entry = CachedScoreEntry {
+                can_eat,
+                can_drink,
+                can_rest,
+                cached_final_scores: [
+                    (ActionId::Eat, (1.0 - nn.hunger).clamp(0.0, 1.0)),
+                    (ActionId::Drink, (1.0 - nn.thirst).clamp(0.0, 1.0)),
+                    (ActionId::Rest, (1.0 - nn.fatigue).clamp(0.0, 1.0)),
+                ],
+            };
+            timing.biochemical_base_lookup_us += bio_started.elapsed().as_micros() as u64;
+            evaluation_state.last_score_cache.insert(entity, score_entry);
+            score_entry
+        } else {
+            *evaluation_state
+                .last_score_cache
+                .get(&entity)
+                .expect("score cache missing for clean pawn")
+        };
+
+        pawns.push((entity, name_string, position.chunk, cached));
+        evaluation_state.last_evaluation_tick.insert(entity, current_seq);
+    }
+    timing.per_pawn_score_collection_us += score_collect_started.elapsed().as_micros() as u64;
+
+    if pawns.is_empty() {
+        evaluation_state.dirty_entities.clear();
+        evaluation_state.dirty_all = false;
+        if let Some(report) = report.as_deref_mut() {
+            report.bump("dispatcher_eval_skipped_no_dirty_candidates");
+        }
+        return timing;
     }
 
     let mut providers_in_progress: HashSet<Entity> = quest_board
@@ -297,63 +538,65 @@ pub fn quest_acceptance_step(
         let Some((required_capability, _)) = need_capability_and_drive(&quest.need, &NeuralNetworkComponent::default()) else {
             continue;
         };
+        let Some(quest_action) = action_for_need(&quest.need) else {
+            continue;
+        };
 
-        let mut eligible_candidates: Vec<(u32, Entity, String, f32)> = Vec::new();
-        let mut rank_inputs: Vec<ProviderCandidateInput> = Vec::new();
-        for (entity, name, chunk, capabilities, food_drive, water_drive, rest_drive) in &pawns {
+        let modifier_started = Instant::now();
+        let mut contextual_candidates: Vec<(u32, Entity, String, f32, f32, u32)> = Vec::new();
+        for (entity, name, chunk, cached) in &pawns {
             if *entity == quest.requester || providers_in_progress.contains(entity) {
                 continue;
             }
-            let Some(caps) = capabilities.as_ref() else {
-                continue;
+            let has_capability = match required_capability {
+                "Eat" => cached.can_eat,
+                "Drink" => cached.can_drink,
+                "Rest" => cached.can_rest,
+                _ => false,
             };
-            if !caps.has(required_capability) {
+            if !has_capability {
                 continue;
             }
 
-            let drive = match quest.need.as_str() {
-                "food" => *food_drive,
-                "water" => *water_drive,
-                "rest" => *rest_drive,
-                _ => 0.0,
-            };
-            if drive < QUEST_ACCEPTANCE_MIN_DRIVE {
+            let base_score = cached_score_for_action(&cached.cached_final_scores, quest_action);
+            if base_score < QUEST_ACCEPTANCE_MIN_DRIVE {
                 continue;
             }
 
             let dist = chebyshev_distance(*chunk, quest.chunk);
-            let candidate_id = eligible_candidates.len() as u32;
-            eligible_candidates.push((candidate_id, *entity, name.clone(), drive));
-            rank_inputs.push(ProviderCandidateInput {
-                candidate_id,
-                drive,
-                proximity: 1.0 / (dist + 1) as f32,
-                distance: dist,
-                can_eat: caps.has("Eat"),
-                can_drink: caps.has("Drink"),
-                can_rest: caps.has("Rest"),
-            });
+            let proximity = 1.0 / (dist + 1) as f32;
+            let candidate_id = contextual_candidates.len() as u32;
+            contextual_candidates.push((candidate_id, *entity, name.clone(), base_score, proximity, dist));
         }
+        timing.contextual_modifier_application_us += modifier_started.elapsed().as_micros() as u64;
 
-        let Some(selected_candidate_id) = rank_provider_candidates_for_need(
-            &quest.need,
-            QUEST_ACCEPTANCE_MIN_DRIVE,
-            &rank_inputs,
-        )
-        .expect("Quest acceptance provider ranking via DuckDB failed") else {
+        let combine_started = Instant::now();
+        let mut best: Option<(u32, Entity, String, f32, u32)> = None;
+        for (candidate_id, entity, name, base_score, proximity, dist) in contextual_candidates {
+            let final_score = 1.0
+                - (((1.0 - base_score) * PROVIDER_RANK_DRIVE_WEIGHT).powi(2)
+                    + ((1.0 - proximity) * PROVIDER_RANK_PROXIMITY_WEIGHT).powi(2))
+                .sqrt();
+            match best.as_ref() {
+                None => {
+                    best = Some((candidate_id, entity, name, final_score, dist));
+                }
+                Some((best_candidate_id, _, _, best_score, best_dist)) => {
+                    if final_score > *best_score
+                        || (final_score == *best_score && dist < *best_dist)
+                        || (final_score == *best_score && dist == *best_dist && candidate_id < *best_candidate_id)
+                    {
+                        best = Some((candidate_id, entity, name, final_score, dist));
+                    }
+                }
+            }
+        }
+        timing.final_score_combination_sorting_us += combine_started.elapsed().as_micros() as u64;
+
+        let Some((_, provider, provider_name, drive, _)) = best else {
             continue;
         };
-
-        let Some((_, provider, provider_name, drive)) = eligible_candidates
-            .iter()
-            .find(|(candidate_id, _, _, _)| *candidate_id == selected_candidate_id)
-            .cloned()
-        else {
-            panic!(
-                "Quest acceptance ranked candidate id {} missing from eligible set",
-                selected_candidate_id
-            );
-        };
+        let winner_started = Instant::now();
 
             quest.provider = Some(provider);
             quest.status = QuestStatus::InProgress { provider };
@@ -377,7 +620,15 @@ pub fn quest_acceptance_step(
                     current_seq, quest.need, provider, drive
                 );
             }
+        timing.winner_selection_action_prep_us += winner_started.elapsed().as_micros() as u64;
     }
+
+    for (entity, _, _, _) in &pawns {
+        evaluation_state.score_dirty_flag.remove(entity);
+    }
+    evaluation_state.dirty_entities.clear();
+    evaluation_state.dirty_all = false;
+    timing
 }
 
 pub fn complete_quest_for_action(
@@ -410,8 +661,10 @@ pub fn pawn_event_dispatcher_system(
     mut known_recipes_query: Query<&mut KnownRecipes>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
+    mut evaluation_state: ResMut<DispatcherEvaluationState>,
     log_settings: Option<Res<SimulationLogSettings>>,
 ) {
+    let region_signatures: HashMap<Entity, u64> = HashMap::new();
     pawn_event_dispatcher_step(
         global_clock.causal_seq(),
         &mut event_queue,
@@ -419,8 +672,10 @@ pub fn pawn_event_dispatcher_system(
         &mut pawn_query,
         &capabilities_query,
         &mut known_recipes_query,
+        &region_signatures,
         activity.as_deref_mut(),
         report.as_deref_mut(),
+        &mut evaluation_state,
         stdout_enabled(log_settings.as_deref()),
     );
 }
@@ -490,6 +745,7 @@ pub fn move_to_chunk_action_system(
     mut commands: Commands,
     mut action_query: Query<(&Actor, &mut ActionState), With<MoveToChunkAction>>,
     mut pawn_query: Query<(&mut Position, &MovementTarget)>,
+    mut evaluation_state: Option<ResMut<DispatcherEvaluationState>>,
 ) {
     for (Actor(actor), mut state) in action_query.iter_mut() {
         match *state {
@@ -511,8 +767,10 @@ pub fn move_to_chunk_action_system(
                         let nx = (position.chunk.0 as i32 + dx).clamp(0, CHUNK_EXTENT as i32) as u32;
                         let ny = (position.chunk.1 as i32 + dy).clamp(0, CHUNK_EXTENT as i32) as u32;
                         position.chunk = ChunkId(nx, ny);
-                        // Diagnostic: move_to_chunk_action_system actually moved (report is optional)
-                        // (report bump would need to be passed in; skip for now)
+                        // Charter-region change trigger: crossing chunk boundary invalidates prior local evaluation.
+                        if let Some(ref mut evaluation_state) = evaluation_state {
+                            evaluation_state.mark_dirty(*actor);
+                        }
                     }
                 } else {
                     *state = ActionState::Failure;
@@ -534,8 +792,10 @@ pub fn eat_action_system(
     mut frame_log: ResMut<FrameWriteLog>,
     mut flash: MessageWriter<CharterFlashEvent>,
     global_clock: Res<GlobalTickClock>,
+    mut event_queue: ResMut<CausalEventQueue>,
     mut food_query: Query<(Entity, &Position, &mut FoodReservation, Option<&mut ItemHistory>)>,
     mut quest_board: ResMut<QuestBoard>,
+    mut evaluation_state: ResMut<DispatcherEvaluationState>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
@@ -566,8 +826,12 @@ pub fn eat_action_system(
                              granted_at_causal_seq: global_clock.causal_seq(),
                          };
 
+                         let lease_started = Instant::now();
                          match charter.request_lease(request, global_clock.causal_seq()) {
                              Ok(handle) => {
+                                 if let Some(ref mut report) = report {
+                                     report.add_counter("dispatcher_lease_requests_us", lease_started.elapsed().as_micros() as u64);
+                                 }
                                  flash.write(CharterFlashEvent { chunk: food_pos.chunk, granted: true });
                                  if let Some(ref mut log) = activity {
                                      log.push(format!("{} eating @ {:?}", name, food_pos.chunk));
@@ -582,12 +846,25 @@ pub fn eat_action_system(
                                  *state = ActionState::Executing;
                              }
                              Err(CharterDenial::ChunkConflict { contested, retry_after_causal_seq, .. }) => {
+                                 if let Some(ref mut report) = report {
+                                     report.add_counter("dispatcher_lease_requests_us", lease_started.elapsed().as_micros() as u64);
+                                 }
                                  for c in &contested {
                                      flash.write(CharterFlashEvent { chunk: *c, granted: false });
                                  }
                                  if let Some(ref mut report) = report {
                                      report.bump("eat_lease_denied");
                                  }
+                                 evaluation_state.mark_dirty(*actor);
+                                 event_queue.push_at(
+                                     CausalEventKind::LeaseDenied {
+                                         entity: *actor,
+                                         chunk: food_pos.chunk,
+                                         component: TypeId::of::<FoodReservation>(),
+                                     },
+                                     food_pos.chunk,
+                                     global_clock.causal_seq(),
+                                 );
                                  if stdout_enabled {
                                      println!("[causal:{}] {} requested lease on chunk({:?}) for Write(FoodReservation) - DENIED (ChunkConflict, retry after causal:{})", global_clock.causal_seq(), name, food_pos.chunk, retry_after_causal_seq);
                                  }
@@ -688,8 +965,10 @@ pub fn drink_action_system(
     mut frame_log: ResMut<FrameWriteLog>,
     mut flash: MessageWriter<CharterFlashEvent>,
     global_clock: Res<GlobalTickClock>,
+    mut event_queue: ResMut<CausalEventQueue>,
     mut water_query: Query<(Entity, &Position, &mut WaterSource, Option<&mut ItemHistory>)>,
     mut quest_board: ResMut<QuestBoard>,
+    mut evaluation_state: ResMut<DispatcherEvaluationState>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
@@ -722,8 +1001,12 @@ pub fn drink_action_system(
                             },
                             granted_at_causal_seq: global_clock.causal_seq(),
                         };
+                        let lease_started = Instant::now();
                         match charter.request_lease(request, global_clock.causal_seq()) {
                             Ok(handle) => {
+                                if let Some(ref mut report) = report {
+                                    report.add_counter("dispatcher_lease_requests_us", lease_started.elapsed().as_micros() as u64);
+                                }
                                 flash.write(CharterFlashEvent { chunk: water_pos.chunk, granted: true });
                                 if let Some(ref mut log) = activity {
                                     log.push(format!("{} drinking @ {:?}", name, water_pos.chunk));
@@ -738,12 +1021,25 @@ pub fn drink_action_system(
                                 *state = ActionState::Executing;
                             }
                             Err(CharterDenial::ChunkConflict { contested, retry_after_causal_seq, .. }) => {
+                                if let Some(ref mut report) = report {
+                                    report.add_counter("dispatcher_lease_requests_us", lease_started.elapsed().as_micros() as u64);
+                                }
                                 for c in &contested {
                                     flash.write(CharterFlashEvent { chunk: *c, granted: false });
                                 }
                                 if let Some(ref mut report) = report {
                                     report.bump("drink_lease_denied");
                                 }
+                                evaluation_state.mark_dirty(*actor);
+                                event_queue.push_at(
+                                    CausalEventKind::LeaseDenied {
+                                        entity: *actor,
+                                        chunk: water_pos.chunk,
+                                        component: TypeId::of::<WaterSource>(),
+                                    },
+                                    water_pos.chunk,
+                                    global_clock.causal_seq(),
+                                );
                                 if stdout_enabled {
                                     println!("[causal:{}] {} DrinkAction lease DENIED (retry after {})", global_clock.causal_seq(), name, retry_after_causal_seq);
                                 }
@@ -835,8 +1131,10 @@ pub fn rest_action_system(
     mut charter: ResMut<SpatialCharter>,
     mut flash: MessageWriter<CharterFlashEvent>,
     global_clock: Res<GlobalTickClock>,
+    mut event_queue: ResMut<CausalEventQueue>,
     rest_query: Query<(&Position, &RestSpot)>,
     mut quest_board: ResMut<QuestBoard>,
+    mut evaluation_state: ResMut<DispatcherEvaluationState>,
     mut activity: Option<ResMut<ActivityLog>>,
     mut report: Option<ResMut<SimulationReport>>,
     log_settings: Option<Res<SimulationLogSettings>>,
@@ -862,8 +1160,12 @@ pub fn rest_action_system(
                             },
                             granted_at_causal_seq: global_clock.causal_seq(),
                         };
+                        let lease_started = Instant::now();
                         match charter.request_lease(request, global_clock.causal_seq()) {
                             Ok(handle) => {
+                                if let Some(ref mut report) = report {
+                                    report.add_counter("dispatcher_lease_requests_us", lease_started.elapsed().as_micros() as u64);
+                                }
                                 flash.write(CharterFlashEvent { chunk: rest_pos.chunk, granted: true });
                                 if let Some(ref mut log) = activity {
                                     log.push(format!("{} resting @ {:?}", name, rest_pos.chunk));
@@ -878,12 +1180,25 @@ pub fn rest_action_system(
                                 *state = ActionState::Executing;
                             }
                             Err(CharterDenial::ChunkConflict { contested, .. }) => {
+                                if let Some(ref mut report) = report {
+                                    report.add_counter("dispatcher_lease_requests_us", lease_started.elapsed().as_micros() as u64);
+                                }
                                 for c in &contested {
                                     flash.write(CharterFlashEvent { chunk: *c, granted: false });
                                 }
                                 if let Some(ref mut report) = report {
                                     report.bump("rest_lease_denied");
                                 }
+                                evaluation_state.mark_dirty(*actor);
+                                event_queue.push_at(
+                                    CausalEventKind::LeaseDenied {
+                                        entity: *actor,
+                                        chunk: rest_pos.chunk,
+                                        component: TypeId::of::<RestSpot>(),
+                                    },
+                                    rest_pos.chunk,
+                                    global_clock.causal_seq(),
+                                );
                             }
                             Err(_) => {}
                         }
@@ -1058,6 +1373,8 @@ mod tests {
         {
             let (mut quest_board, mut pawn_query, capabilities_query) =
                 system_state.get_mut(&mut world);
+            let mut evaluation_state = DispatcherEvaluationState::default();
+            evaluation_state.mark_all_dirty();
             quest_acceptance_step(
                 1,
                 &mut quest_board,
@@ -1065,6 +1382,7 @@ mod tests {
                 &capabilities_query,
                 None,
                 None,
+                &mut evaluation_state,
                 false,
             );
         }

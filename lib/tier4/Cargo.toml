@@ -1,0 +1,17 @@
+[package]
+name = "simrard-lib-tier4"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "simrard_lib_tier4"
+path = "tier4.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+simrard-lib-charter = { path = "../charter" }
+simrard-lib-hypergraph = { path = "../hypergraph" }

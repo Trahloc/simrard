@@ -168,10 +168,36 @@ pub struct SimulationReport {
     pub initial_pawn_count: usize,
     pub counters: BTreeMap<&'static str, u64>,
     pub notable_events: Vec<String>,
+    pub death_records: Vec<PawnDeathRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MortalityCause {
+    Hunger,
+    Thirst,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct PawnDeathRecord {
+    pub tick: u64,
+    pub pawn_name: String,
+    pub cause: MortalityCause,
+    pub primary_drive: &'static str,
+    pub hunger: f32,
+    pub thirst: f32,
+    pub fatigue: f32,
+    pub curiosity: f32,
+    pub social: f32,
+    pub fear: f32,
+    pub industriousness: f32,
+    pub comfort: f32,
+    pub chunk: ChunkId,
 }
 
 impl SimulationReport {
     const MAX_NOTABLE_EVENTS: usize = 24;
+    const MAX_DEATH_RECORDS: usize = 128;
 
     pub fn set_initial_pawn_count(&mut self, count: usize) {
         self.initial_pawn_count = count;
@@ -181,9 +207,19 @@ impl SimulationReport {
         *self.counters.entry(key).or_insert(0) += 1;
     }
 
+    pub fn add_counter(&mut self, key: &'static str, amount: u64) {
+        *self.counters.entry(key).or_insert(0) += amount;
+    }
+
     pub fn note(&mut self, message: impl Into<String>) {
         if self.notable_events.len() < Self::MAX_NOTABLE_EVENTS {
             self.notable_events.push(message.into());
+        }
+    }
+
+    pub fn record_death(&mut self, death: PawnDeathRecord) {
+        if self.death_records.len() < Self::MAX_DEATH_RECORDS {
+            self.death_records.push(death);
         }
     }
 }

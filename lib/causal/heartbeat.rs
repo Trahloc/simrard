@@ -11,9 +11,9 @@ const FATIGUE_THRESHOLD: f32 = 0.2;
 
 /// Drive decay rate per tick (applied every `HEARTBEAT_INTERVAL` ticks).
 /// Tuned so pawns can reach food/water and sustain for 10k+ ticks in headless.
-const HUNGER_DECAY_PER_TICK: f32 = 0.003;
-const THIRST_DECAY_PER_TICK: f32 = 0.0025;
-const FATIGUE_DECAY_PER_TICK: f32 = 0.003;
+const HUNGER_DECAY_PER_TICK: f32 = 0.0009;
+const THIRST_DECAY_PER_TICK: f32 = 0.0010;
+const FATIGUE_DECAY_PER_TICK: f32 = 0.0015;
 
 /// How many causal ticks between heartbeat pulses.
 /// Drive decay runs every 10 ticks; events fire only when thresholds are crossed.
