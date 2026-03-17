@@ -2732,7 +2732,10 @@ struct DisplayOffset(pub Vec3);
 struct ResourceLevelBarVisual;
 
 fn sync_position_to_transform(
-    mut query: Query<(&Position, &mut Transform, Option<&DisplayOffset>), With<Sprite>>,
+    mut query: Query<
+        (&Position, &mut Transform, Option<&DisplayOffset>),
+        (With<Sprite>, Changed<Position>),
+    >,
 ) {
     for (position, mut transform, offset) in query.iter_mut() {
         let base = chunk_to_translation(&position.chunk, transform.translation.z);
@@ -3047,11 +3050,20 @@ fn chunk_to_translation(chunk: &ChunkId, z: f32) -> Vec3 {
 
 fn resource_level_bar_system(
     mut commands: Commands,
+    time: Res<Time>,
+    scale: Res<SimTimeScale>,
+    mut last_update: Local<f32>,
     existing_bars: Query<Entity, With<ResourceLevelBarVisual>>,
     food_query: Query<(&Position, &FoodReservation)>,
     water_query: Query<(&Position, &WaterSource)>,
 ) {
-    // Keep implementation simple: rebuild tiny bar overlays each frame from current resource state.
+    let now = time.elapsed_secs();
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
     for entity in existing_bars.iter() {
         commands.entity(entity).despawn();
     }
