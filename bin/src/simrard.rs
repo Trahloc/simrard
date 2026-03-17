@@ -70,6 +70,33 @@ struct HudFontHandle(Handle<Font>);
 const LIVE_STATS_FONT_SIZE: f32 = 11.0;
 const PANEL_UPDATE_THROTTLE_SECS: f32 = 0.2; // 5 Hz update rate for text rendering
 
+#[derive(Resource)]
+struct InsectSpritePool {
+    entities: Vec<Entity>,
+    active_count: usize,
+}
+
+impl InsectSpritePool {
+    fn new(entities: Vec<Entity>) -> Self {
+        Self {
+            entities,
+            active_count: 0,
+        }
+    }
+    
+    fn get_active(&self, idx: usize) -> Option<Entity> {
+        if idx < self.entities.len() {
+            Some(self.entities[idx])
+        } else {
+            None
+        }
+    }
+    
+    fn set_active_count(&mut self, count: usize) {
+        self.active_count = count.min(self.entities.len());
+    }
+}
+
 fn live_stats_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
@@ -2229,6 +2256,8 @@ fn chunk_grid_gizmo_system(
     let end_j = ((vis_max_y / CHUNK_PIXEL).ceil() as i32).min(256);
 
     let min_grid_step = if scale.0 >= 500.0 {
+        64 // Ultra-sparse at 500x+
+    } else if scale.0 >= 250.0 {
         32
     } else if scale.0 >= 100.0 {
         8
@@ -2323,15 +2352,15 @@ fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMu
 }
 
 fn visual_debug_insect_overlay_system(
-    mut commands: Commands,
     visual: Res<VisualDebug>,
     scale: Res<SimTimeScale>,
     tier4: Res<Tier4State>,
     time: Res<Time>,
     mut profiler: ResMut<VisualSystemsProfiler>,
+    mut pool: ResMut<InsectSpritePool>,
     mut last_update: Local<f32>,
-    camera_query: Query<&Transform, With<Camera2d>>,
-    existing: Query<Entity, With<VisualDebugInsectSprite>>,
+    camera_query: Query<&Transform, (With<Camera2d>, Without<VisualDebugInsectSprite>)>,
+    mut sprite_query: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<VisualDebugInsectSprite>>,
 ) {
     let now = time.elapsed_secs();
     if profiler.window_start_secs == 0.0 {
@@ -2339,9 +2368,13 @@ fn visual_debug_insect_overlay_system(
     }
 
     if !visual.enabled || tier4.insects.is_empty() {
-        for entity in existing.iter() {
-            commands.entity(entity).despawn();
+        // Hide all pool sprites when visual debug is disabled
+        for entity in pool.entities.iter() {
+            if let Ok((_, _, mut vis)) = sprite_query.get_mut(*entity) {
+                *vis = Visibility::Hidden;
+            }
         }
+        pool.set_active_count(0);
         return;
     }
 
@@ -2352,9 +2385,7 @@ fn visual_debug_insect_overlay_system(
     *last_update = now;
 
     let start = Instant::now();
-    for entity in existing.iter() {
-        commands.entity(entity).despawn();
-    }
+    pool.active_count = 0;
 
     let camera = match camera_query.single() {
         Ok(value) => value,
@@ -2377,6 +2408,7 @@ fn visual_debug_insect_overlay_system(
 
     let t = time.elapsed_secs();
     let max_sprites = visual_debug_insect_budget(scale.0);
+    let mut active_count = 0usize;
     for (idx, _) in order.into_iter().take(max_sprites) {
         let insect = &tier4.insects[idx];
         let hunger = insect.hunger.clamp(0.0, 1.0);
@@ -2417,13 +2449,25 @@ fn visual_debug_insect_overlay_system(
         
         let leg_wobble = 0.28 * (t * (6.0 + hunger * 4.0) + phase * 0.7).sin();
         let alpha = (0.82 + 0.14 * energy_norm + 0.06 * scale_pulse).clamp(0.55, 1.0);
-        
-        commands.spawn((
-            VisualDebugInsectSprite,
-            Sprite::from_color(Color::srgba(r, g, b, alpha), Vec2::new(width, height)),
-            Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(leg_wobble)),
-        ));
+
+        if let Some(pool_entity) = pool.get_active(active_count) {
+            if let Ok((mut sprite, mut transform, mut vis)) = sprite_query.get_mut(pool_entity) {
+                sprite.color = Color::srgba(r, g, b, alpha);
+                sprite.custom_size = Some(Vec2::new(width, height));
+                *transform = Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(leg_wobble));
+                *vis = Visibility::Inherited;
+            }
+            active_count += 1;
+        }
     }
+
+    pool.set_active_count(active_count);
+    for i in active_count..pool.entities.len() {
+        if let Ok((_, _, mut vis)) = sprite_query.get_mut(pool.entities[i]) {
+            *vis = Visibility::Hidden;
+        }
+    }
+
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     profiler.insect_total_ms += elapsed_ms;
     profiler.insect_calls = profiler.insect_calls.saturating_add(1);
@@ -3154,6 +3198,20 @@ fn setup(
             ..OrthographicProjection::default_2d()
         }),
     ));
+
+    // Pre-allocate insect sprite pool (max budget for 1x speed)
+    let pool_size = VISUAL_DEBUG_MAX_INSECT_SPRITES;
+    let mut pool_entities = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let entity = commands.spawn((
+            VisualDebugInsectSprite,
+            Sprite::from_color(Color::srgba(1.0, 1.0, 1.0, 1.0), Vec2::splat(4.0)),
+            Transform::from_translation(Vec3::ZERO),
+            Visibility::Hidden,
+        )).id();
+        pool_entities.push(entity);
+    }
+    commands.insert_resource(InsectSpritePool::new(pool_entities));
 
     // Axis coordinate labels every 32 chunks - smaller font, positioned outside world bounds
     let axis_font = TextFont { font_size: 96.0, ..default() };
