@@ -2672,8 +2672,13 @@ fn visual_debug_profiler_report_system(
     visual: Res<VisualDebug>,
     time: Res<Time>,
     mut profiler: ResMut<VisualSystemsProfiler>,
+    mut frame_acc: Local<(f32, u32)>, // (total_fps_sum, count) since last report
 ) {
     let now = time.elapsed_secs();
+    let raw_fps = 1.0 / time.delta_secs().max(0.0001);
+    frame_acc.0 += raw_fps;
+    frame_acc.1 += 1;
+
     if !visual.enabled {
         profiler.reset_window(now);
         return;
@@ -2709,9 +2714,16 @@ fn visual_debug_profiler_report_system(
         0.0
     };
 
+    let actual_fps = if frame_acc.1 > 0 {
+        frame_acc.0 / frame_acc.1 as f32
+    } else {
+        0.0
+    };
+    *frame_acc = (0.0, 0);
+
     println!(
-        "[visual-profiler] insect: {:.2}ms gs: {:.2}ms thermal: {:.2}ms total: {:.2}ms fps-est: {:.1}",
-        insect_avg, gs_avg, thermal_avg, total_visual_avg, fps_est
+        "[visual-profiler] fps: {:.1} insect: {:.2}ms gs: {:.2}ms thermal: {:.2}ms total: {:.2}ms overlay-fps-budget: {:.1}",
+        actual_fps, insect_avg, gs_avg, thermal_avg, total_visual_avg, fps_est
     );
 
     profiler.reset_window(now);
