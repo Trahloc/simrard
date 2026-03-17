@@ -542,7 +542,7 @@ fn run_interactive() {
                 ai::pawn_death_system,
                 ApplyDeferred,
                 sim_tick_driver,
-                hypergraph_tick_system,
+                hypergraph_tick_system.run_if(run_hypergraph_tick_preupdate),
                 simlife_tick_system,
                 tier4_tick_system,
                 curiosity_discovery_system,
@@ -578,6 +578,12 @@ fn run_interactive() {
                 visual_debug_insect_overlay_system,
                 visual_debug_gs_overlay_system,
             ),
+        )
+        .add_systems(
+            Update,
+            (activate_visual_debug_hypergraph_system, hypergraph_tick_system)
+                .chain()
+                .run_if(run_hypergraph_tick_visual_debug_update),
         )
         .add_systems(Update, visual_debug_thermal_overlay_system)
         .add_systems(Update, visual_debug_hypergraph_overlay_system)
@@ -3147,6 +3153,7 @@ const GS_INITIAL_SEED_COVERAGE: f32 = 0.001;
 const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS: u64 = 800;
 const SUBSTRATE_HYPERGRAPH_INTERVAL_TICKS_PRE_TUNE: u64 = 1_000;
 const SUBSTRATE_HYPERGRAPH_CHAOS: f32 = 0.45;
+const VISUAL_DEBUG_HYPERGRAPH_INTERVAL_TICKS: u64 = 1;
 const T9_SINK_TEMPERATURE_K: f32 = 2.7;
 const T9_COOLING_K: f32 = 0.08;
 const THERMAL_HEAT_PER_USABLE_FLUX_CHEMISTRY: f32 = 3.0;
@@ -3741,6 +3748,37 @@ fn simlife_tick_system(
         );
     }
     perf_record("simlife_tick", started.elapsed());
+}
+
+fn run_hypergraph_tick_preupdate(sim_mode: Res<SimulationModeRuntime>) -> bool {
+    sim_mode.mode != SimulationMode::Interactive || sim_mode.interactive_with_tier1
+}
+
+fn run_hypergraph_tick_visual_debug_update(
+    visual: Res<VisualDebug>,
+    sim_mode: Res<SimulationModeRuntime>,
+) -> bool {
+    visual.enabled && sim_mode.mode == SimulationMode::Interactive && !sim_mode.interactive_with_tier1
+}
+
+fn activate_visual_debug_hypergraph_system(
+    mut simlife: ResMut<SimLifeState>,
+    mut chemistry: ResMut<ChemistryState>,
+    mut charter: ResMut<SpatialCharter>,
+    mut substrate: ResMut<HypergraphSubstrate>,
+    mut runtime_stats: ResMut<HypergraphRuntimeStats>,
+    mut activated: Local<bool>,
+) {
+    if *activated {
+        return;
+    }
+
+    // Reuse the substrate-only activation path so visual-debug mode shows live rewrites quickly.
+    substrate.set_interval_ticks(VISUAL_DEBUG_HYPERGRAPH_INTERVAL_TICKS);
+    substrate.set_chaos(SUBSTRATE_HYPERGRAPH_CHAOS);
+    let _ = gs_seed_initial_state(0, &mut simlife, Some(&mut chemistry), &mut charter);
+    runtime_stats.rewritten_total = 0;
+    *activated = true;
 }
 
 fn hypergraph_tick_system(
