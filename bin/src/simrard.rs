@@ -453,21 +453,31 @@ fn run_interactive() {
                 camera_pan_zoom_input,
                 chunk_grid_gizmo_system,
                 resource_level_bar_system,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
                 pawn_dominant_drive_color_system,
                 charter_flash_spawn_system,
                 charter_flash_tick_system,
                 hypergraph_debug_input_system,
-                ui_panel_update_system,
                 hypergraph_debug_viz_system,
+            ),
+        )
+        .add_systems(Update, ui_panel_update_system)
+        .add_systems(
+            Update,
+            (
                 visual_debug_toggle_system,
+                legacy_quest_overlay_visibility_system,
                 visual_debug_insect_overlay_system,
                 visual_debug_gs_overlay_system,
-                visual_debug_thermal_overlay_system,
-                visual_debug_hypergraph_overlay_system,
-                live_stats_overlay_system,
-            )
-                .chain(),
-        );
+            ),
+        )
+        .add_systems(Update, visual_debug_thermal_overlay_system)
+        .add_systems(Update, visual_debug_hypergraph_overlay_system)
+        .add_systems(Update, live_stats_overlay_system);
 
     // Phase 4.D1: Push ECS snapshot to DuckDB mirror after Update (post visual sync).
     // Runs in its own add_systems call so it is not constrained by the Update chain tuple limit.
@@ -2041,6 +2051,16 @@ fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMu
     }
 }
 
+fn legacy_quest_overlay_visibility_system(
+    _visual: Res<VisualDebug>,
+    mut overlay_query: Query<&mut Visibility, With<QuestOverlayRoot>>,
+) {
+    // Keep legacy quest overlay hidden since everything is now in the unified top-right panel
+    for mut vis in overlay_query.iter_mut() {
+        *vis = Visibility::Hidden;
+    }
+}
+
 fn visual_debug_insect_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
@@ -2442,6 +2462,7 @@ fn setup_quest_ui(mut commands: Commands) {
                 ..default()
             },
             QuestOverlayRoot,
+            Visibility::Hidden,  // Hidden by default; shown only when not in unified panel mode
         ))
         .with_children(|parent| {
             // Section 0: sim status (plain text, updated each frame)
