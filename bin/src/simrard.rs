@@ -51,6 +51,7 @@ static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
 static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
 static BENCHMARK_SECONDS: OnceLock<f64> = OnceLock::new();
 static INTERACTIVE_WITH_TIER1: OnceLock<bool> = OnceLock::new();
+static INITIAL_SIM_SPEED: OnceLock<f32> = OnceLock::new();
 
 #[derive(Resource, Debug, Clone, Copy)]
 struct VisualDebug {
@@ -510,6 +511,29 @@ fn interactive_with_tier1_from_args() -> bool {
             Ok(value) => value,
             Err(message) => panic!("{}", message),
         }
+    })
+}
+
+fn initial_sim_speed_from_args() -> f32 {
+    *INITIAL_SIM_SPEED.get_or_init(|| {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == "--sim-speed" {
+                let raw = args
+                    .next()
+                    .expect("missing value for --sim-speed; provide a number in [0.0, 1000.0]");
+                let parsed: f32 = raw
+                    .parse()
+                    .expect("invalid --sim-speed value; provide a number in [0.0, 1000.0]");
+                assert!(parsed.is_finite(), "--sim-speed must be finite");
+                assert!(
+                    (0.0..=1000.0).contains(&parsed),
+                    "--sim-speed must be in [0.0, 1000.0]"
+                );
+                return parsed;
+            }
+        }
+        1.0
     })
 }
 
@@ -2168,6 +2192,7 @@ fn live_stats_panel_layout(
 }
 
 fn chunk_grid_gizmo_system(
+    scale: Res<SimTimeScale>,
     camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
     mut gizmos: Gizmos,
 ) {
@@ -2196,13 +2221,25 @@ fn chunk_grid_gizmo_system(
     gizmos.line_2d(Vec2::new(world_max_x, world_max_y), Vec2::new(world_min_x, world_max_y), border_color);
     gizmos.line_2d(Vec2::new(world_min_x, world_max_y), Vec2::new(world_min_x, world_min_y), border_color);
 
-    // Draw interior grid lines only where visible and within world bounds
+    // Draw interior grid lines only where visible and within world bounds.
+    // At high sim speeds, thin out minor lines to keep the render path responsive.
     let start_i = ((vis_min_x / CHUNK_PIXEL).floor() as i32).max(0);
     let end_i = ((vis_max_x / CHUNK_PIXEL).ceil() as i32).min(256);
     let start_j = ((vis_min_y / CHUNK_PIXEL).floor() as i32).max(0);
     let end_j = ((vis_max_y / CHUNK_PIXEL).ceil() as i32).min(256);
 
+    let min_grid_step = if scale.0 >= 500.0 {
+        32
+    } else if scale.0 >= 100.0 {
+        8
+    } else {
+        1
+    };
+
     for i in start_i..=end_i {
+        if min_grid_step > 1 && i % min_grid_step != 0 {
+            continue;
+        }
         let p = i as f32 * CHUNK_PIXEL;
         let major = i % 32 == 0;
         let color = if major {
@@ -2215,6 +2252,9 @@ fn chunk_grid_gizmo_system(
         gizmos.line_2d(Vec2::new(p, vis_min_y), Vec2::new(p, vis_max_y), color);
     }
     for j in start_j..=end_j {
+        if min_grid_step > 1 && j % min_grid_step != 0 {
+            continue;
+        }
         let p = j as f32 * CHUNK_PIXEL;
         let major = j % 32 == 0;
         let color = if major {
@@ -2246,6 +2286,36 @@ struct LiveStatsPanelTextUi;
 const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 200;
 const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 20;
 
+fn visual_debug_insect_budget(sim_speed: f32) -> usize {
+    if sim_speed >= 500.0 {
+        40
+    } else if sim_speed >= 100.0 {
+        80
+    } else {
+        VISUAL_DEBUG_MAX_INSECT_SPRITES
+    }
+}
+
+fn visual_debug_thermal_budget(sim_speed: f32) -> usize {
+    if sim_speed >= 500.0 {
+        8
+    } else if sim_speed >= 100.0 {
+        12
+    } else {
+        VISUAL_DEBUG_MAX_THERMAL_SPRITES
+    }
+}
+
+fn visual_debug_overlay_update_interval_secs(sim_speed: f32) -> f32 {
+    if sim_speed >= 500.0 {
+        0.1
+    } else if sim_speed >= 100.0 {
+        1.0 / 15.0
+    } else {
+        0.0
+    }
+}
+
 fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMut<VisualDebug>) {
     if keys.just_pressed(KeyCode::KeyV) {
         visual.enabled = !visual.enabled;
@@ -2255,9 +2325,11 @@ fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMu
 fn visual_debug_insect_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
+    scale: Res<SimTimeScale>,
     tier4: Res<Tier4State>,
     time: Res<Time>,
     mut profiler: ResMut<VisualSystemsProfiler>,
+    mut last_update: Local<f32>,
     camera_query: Query<&Transform, With<Camera2d>>,
     existing: Query<Entity, With<VisualDebugInsectSprite>>,
 ) {
@@ -2265,12 +2337,23 @@ fn visual_debug_insect_overlay_system(
     if profiler.window_start_secs == 0.0 {
         profiler.window_start_secs = now;
     }
+
+    if !visual.enabled || tier4.insects.is_empty() {
+        for entity in existing.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
+
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
     let start = Instant::now();
     for entity in existing.iter() {
         commands.entity(entity).despawn();
-    }
-    if !visual.enabled || tier4.insects.is_empty() {
-        return;
     }
 
     let camera = match camera_query.single() {
@@ -2293,7 +2376,8 @@ fn visual_debug_insect_overlay_system(
     });
 
     let t = time.elapsed_secs();
-    for (idx, _) in order.into_iter().take(VISUAL_DEBUG_MAX_INSECT_SPRITES) {
+    let max_sprites = visual_debug_insect_budget(scale.0);
+    for (idx, _) in order.into_iter().take(max_sprites) {
         let insect = &tier4.insects[idx];
         let hunger = insect.hunger.clamp(0.0, 1.0);
         let fear = insect.fear.clamp(0.0, 1.0);
@@ -2348,21 +2432,34 @@ fn visual_debug_insect_overlay_system(
 fn visual_debug_gs_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
+    scale: Res<SimTimeScale>,
     simlife: Res<SimLifeState>,
     time: Res<Time>,
     mut profiler: ResMut<VisualSystemsProfiler>,
+    mut last_update: Local<f32>,
     existing: Query<Entity, With<VisualDebugGsFullWorldTint>>,
 ) {
     let now = time.elapsed_secs();
     if profiler.window_start_secs == 0.0 {
         profiler.window_start_secs = now;
     }
+
+    if !visual.enabled || simlife.gs_active.is_empty() {
+        for entity in existing.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
+
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
     let start = Instant::now();
     for entity in existing.iter() {
         commands.entity(entity).despawn();
-    }
-    if !visual.enabled || simlife.gs_active.is_empty() {
-        return;
     }
 
     // Compute average v-concentration (biomass) across all active GS cells
@@ -2412,10 +2509,12 @@ fn visual_debug_gs_overlay_system(
 fn visual_debug_thermal_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
+    scale: Res<SimTimeScale>,
     thermal: Res<ThermalState>,
     mut cache: ResMut<VisualDebugThermalCache>,
     time: Res<Time>,
     mut profiler: ResMut<VisualSystemsProfiler>,
+    mut last_update: Local<f32>,
     camera_query: Query<&Transform, With<Camera2d>>,
     existing: Query<Entity, With<VisualDebugThermalSprite>>,
 ) {
@@ -2423,13 +2522,24 @@ fn visual_debug_thermal_overlay_system(
     if profiler.window_start_secs == 0.0 {
         profiler.window_start_secs = now;
     }
+
+    if !visual.enabled || thermal.local_temperature_by_chunk.is_empty() {
+        for entity in existing.iter() {
+            commands.entity(entity).despawn();
+        }
+        cache.prev_temp_by_chunk.clear();
+        return;
+    }
+
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
     let start = Instant::now();
     for entity in existing.iter() {
         commands.entity(entity).despawn();
-    }
-    if !visual.enabled || thermal.local_temperature_by_chunk.is_empty() {
-        cache.prev_temp_by_chunk.clear();
-        return;
     }
 
     let camera = match camera_query.single() {
@@ -2451,7 +2561,8 @@ fn visual_debug_thermal_overlay_system(
             None => Ordering::Equal,
         }
     });
-    let mut hottest: Vec<(ChunkId, f32)> = hotspots.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES * 3).collect();
+    let thermal_budget = visual_debug_thermal_budget(scale.0);
+    let mut hottest: Vec<(ChunkId, f32)> = hotspots.into_iter().take(thermal_budget * 3).collect();
     hottest.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
         Some(ordering) => ordering,
         None => Ordering::Equal,
@@ -2470,7 +2581,7 @@ fn visual_debug_thermal_overlay_system(
     // Global breathing pulse synced to overall thermal system activity (0.7 Hz)
     let global_breath = (time_s * 0.7 * std::f32::consts::TAU).sin();
     
-    for (chunk, delta) in hottest.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES) {
+    for (chunk, delta) in hottest.into_iter().take(thermal_budget) {
         let intensity = (delta / denom).clamp(0.0, 1.0);
         let current_temp = thermal.local_temperature_by_chunk.get(&chunk).copied();
         let current_temp = match current_temp {
@@ -3015,8 +3126,11 @@ fn camera_pan_zoom_input(
 fn setup(
     mut commands: Commands,
     mut allocator: ResMut<ItemIdAllocator>,
+    mut sim_scale: ResMut<SimTimeScale>,
     sim_mode: Option<Res<SimulationModeRuntime>>,
 ) {
+    sim_scale.0 = initial_sim_speed_from_args();
+
     // Center camera on world and zoom to show full 256x256 extent
     let world_cx = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
     let world_cy = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
