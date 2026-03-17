@@ -9,7 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use simrard_lib_utility_ai::{BigBrainPlugin, BigBrainSet};
-use simrard_lib_ai::{self as ai, ActivityLog, PawnAIPlugin};
+use simrard_lib_ai::{self as ai, build_pawn_brain, ActivityLog, PawnAIPlugin};
 use simrard_lib_causal::{
     heartbeat, chebyshev_distance, propagation_delay, CausalEventKind, CausalEventQueue,
     CausalPlugin,
@@ -48,9 +48,15 @@ static HEADLESS_PERF: OnceLock<Mutex<PerfAudit>> = OnceLock::new();
 static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
 static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
 static BENCHMARK_SECONDS: OnceLock<f64> = OnceLock::new();
+static INTERACTIVE_WITH_TIER1: OnceLock<bool> = OnceLock::new();
 
 #[derive(Resource, Debug, Clone, Copy)]
 struct VisualDebug {
+    enabled: bool,
+}
+
+#[derive(Resource, Debug, Clone, Copy)]
+struct Tier1SpawnMode {
     enabled: bool,
 }
 
@@ -186,6 +192,18 @@ fn benchmark_seconds_from_args() -> f64 {
     })
 }
 
+fn interactive_with_tier1_from_args() -> bool {
+    *INTERACTIVE_WITH_TIER1.get_or_init(|| {
+        let has_visual_debug_only = std::env::args().skip(1).any(|arg| arg == "--visual-debug-only");
+        let has_interactive_with_tier1 = std::env::args().skip(1).any(|arg| arg == "--interactive-with-tier1");
+        assert!(
+            !(has_visual_debug_only && has_interactive_with_tier1),
+            "invalid flags: use either --visual-debug-only or --interactive-with-tier1, not both"
+        );
+        has_interactive_with_tier1
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SimulationMode {
     Interactive,
@@ -262,6 +280,9 @@ fn run_interactive() {
         .init_resource::<SimLifeState>()
         .insert_resource(VisualDebug {
             enabled: visual_debug_default_on,
+        })
+        .insert_resource(Tier1SpawnMode {
+            enabled: interactive_with_tier1_from_args(),
         })
         .init_resource::<VisualDebugThermalCache>()
         .add_plugins(MirrorPlugin);
@@ -408,6 +429,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
             app.add_plugins(BigBrainPlugin::new(PreUpdate))
                 .add_plugins(PawnAIPlugin)
                 .init_resource::<QuestBoard>()
+                .insert_resource(Tier1SpawnMode { enabled: true })
                 .add_plugins(MirrorPlugin)
                 .add_systems(Startup, (setup, initialize_report_baseline).chain())
                 .add_systems(
@@ -428,6 +450,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         }
         HeadlessProfile::SubstrateOnly => {
             app.init_resource::<QuestBoard>()
+                .insert_resource(Tier1SpawnMode { enabled: false })
                 .init_resource::<SubstrateStabilityState>()
                 .add_systems(
                     Startup,
@@ -1747,6 +1770,37 @@ fn build_headless_report(
 }
 
 // ---- Phase 3.5: Chunk grid ----
+fn world_bounds_pixels() -> (f32, f32, f32, f32) {
+    (0.0, WORLD_EXTENT_PIXELS, 0.0, WORLD_EXTENT_PIXELS)
+}
+
+fn camera_viewport_bounds(transform: &Transform, ortho: &OrthographicProjection) -> (f32, f32, f32, f32) {
+    (
+        transform.translation.x + ortho.area.min.x,
+        transform.translation.x + ortho.area.max.x,
+        transform.translation.y + ortho.area.min.y,
+        transform.translation.y + ortho.area.max.y,
+    )
+}
+
+fn visible_world_bounds(
+    viewport_min_x: f32,
+    viewport_max_x: f32,
+    viewport_min_y: f32,
+    viewport_max_y: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let (world_min_x, world_max_x, world_min_y, world_max_y) = world_bounds_pixels();
+    let vis_min_x = viewport_min_x.max(world_min_x);
+    let vis_max_x = viewport_max_x.min(world_max_x);
+    let vis_min_y = viewport_min_y.max(world_min_y);
+    let vis_max_y = viewport_max_y.min(world_max_y);
+    if vis_min_x >= vis_max_x || vis_min_y >= vis_max_y {
+        None
+    } else {
+        Some((vis_min_x, vis_max_x, vis_min_y, vis_max_y))
+    }
+}
+
 fn chunk_grid_gizmo_system(
     camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
     mut gizmos: Gizmos,
@@ -1759,28 +1813,15 @@ fn chunk_grid_gizmo_system(
         _ => return,
     };
 
-    // Use projection area from the active camera instead of hardcoded 16:9 extents.
-    // This keeps the interior grid shape consistent with the bright world boundary.
-    let viewport_min_x = transform.translation.x + ortho.area.min.x;
-    let viewport_max_x = transform.translation.x + ortho.area.max.x;
-    let viewport_min_y = transform.translation.y + ortho.area.min.y;
-    let viewport_max_y = transform.translation.y + ortho.area.max.y;
+    let (viewport_min_x, viewport_max_x, viewport_min_y, viewport_max_y) =
+        camera_viewport_bounds(transform, ortho);
+    let Some((vis_min_x, vis_max_x, vis_min_y, vis_max_y)) =
+        visible_world_bounds(viewport_min_x, viewport_max_x, viewport_min_y, viewport_max_y)
+    else {
+        return;
+    };
 
-    // World runs from 0 to 256*CHUNK_PIXEL on each axis
-    let world_min_x = 0.0_f32;
-    let world_max_x = 256.0 * CHUNK_PIXEL;
-    let world_min_y = 0.0_f32;
-    let world_max_y = 256.0 * CHUNK_PIXEL;
-
-    // Visible region clamped to world bounds
-    let vis_min_x = viewport_min_x.max(world_min_x);
-    let vis_max_x = viewport_max_x.min(world_max_x);
-    let vis_min_y = viewport_min_y.max(world_min_y);
-    let vis_max_y = viewport_max_y.min(world_max_y);
-
-    if vis_min_x >= vis_max_x || vis_min_y >= vis_max_y {
-        return; // world not in viewport
-    }
+    let (world_min_x, world_max_x, world_min_y, world_max_y) = world_bounds_pixels();
 
     // Draw world boundary as a bright outline
     let border_color = Color::srgba(0.55, 0.65, 0.80, 0.90);
@@ -2293,10 +2334,11 @@ fn setup_quest_ui(mut commands: Commands) {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_simlife_grass, apply_heat_and_cooling_to_chunk, food_portions_from_grass,
-        force_panic_error_handlers, run_headless_with_target_ticks, HeadlessTermination,
-        SimLifeState, ThermalState, HEADLESS_SURVIVAL_BASELINE_TICK, SIMLIFE_GRASS_MAX,
-        THERMAL_HEAT_PER_USABLE_FLUX_CHEMISTRY,
+        advance_simlife_grass, apply_heat_and_cooling_to_chunk, camera_viewport_bounds,
+        food_portions_from_grass, force_panic_error_handlers, run_headless_with_target_ticks,
+        visible_world_bounds, world_bounds_pixels, HeadlessTermination, SimLifeState, ThermalState,
+        HEADLESS_SURVIVAL_BASELINE_TICK, SIMLIFE_GRASS_MAX, THERMAL_HEAT_PER_USABLE_FLUX_CHEMISTRY,
+        WORLD_EXTENT_PIXELS,
     };
     use bevy::app::{AppLabel, SubApp};
     use bevy::prelude::*;
@@ -2384,6 +2426,52 @@ mod tests {
         let cooled = thermal.temperature_for_chunk(chunk);
         assert!(cooled < heated);
         assert!(cooled <= thermal.sink_temperature_k + 0.25);
+    }
+
+    fn make_ortho_for_resolution(width: f32, height: f32, scale: f32) -> OrthographicProjection {
+        let half_w = width * scale * 0.5;
+        let half_h = height * scale * 0.5;
+        let mut ortho = OrthographicProjection::default_2d();
+        ortho.scale = scale;
+        ortho.area = Rect::new(-half_w, -half_h, half_w, half_h);
+        ortho
+    }
+
+    #[test]
+    fn viewport_bounds_match_world_bounds_under_multiple_aspects() {
+        let aspects = [
+            (1024.0, 768.0),   // 4:3
+            (1280.0, 720.0),   // 16:9
+            (1280.0, 800.0),   // 16:10
+            (3440.0, 1440.0),  // ultrawide
+        ];
+        let transform = Transform::from_xyz(WORLD_EXTENT_PIXELS * 0.5, WORLD_EXTENT_PIXELS * 0.5, 0.0);
+
+        for (w, h) in aspects {
+            let ortho = make_ortho_for_resolution(w, h, 10.0);
+            let (vx0, vx1, vy0, vy1) = camera_viewport_bounds(&transform, &ortho);
+            let vis = visible_world_bounds(vx0, vx1, vy0, vy1);
+            assert!(vis.is_some(), "world must remain visible for aspect {}x{}", w, h);
+            let (min_x, max_x, min_y, max_y) = match vis {
+                Some(value) => value,
+                None => unreachable!(),
+            };
+
+            let (world_min_x, world_max_x, world_min_y, world_max_y) = world_bounds_pixels();
+            assert!(min_x >= world_min_x, "left clamp drift for aspect {}x{}", w, h);
+            assert!(max_x <= world_max_x, "right clamp drift for aspect {}x{}", w, h);
+            assert!(min_y >= world_min_y, "bottom clamp drift for aspect {}x{}", w, h);
+            assert!(max_y <= world_max_y, "top clamp drift for aspect {}x{}", w, h);
+        }
+    }
+
+    #[test]
+    fn world_bounds_are_exact_256_by_256_chunks() {
+        let (min_x, max_x, min_y, max_y) = world_bounds_pixels();
+        assert_eq!(min_x, 0.0);
+        assert_eq!(min_y, 0.0);
+        assert_eq!(max_x, WORLD_EXTENT_PIXELS);
+        assert_eq!(max_y, WORLD_EXTENT_PIXELS);
     }
 }
 
@@ -2508,7 +2596,6 @@ fn clip_to_world_bounds(pos: Vec3) -> Vec3 {
 const SPRITE_FOOD: f32 = 18.0;
 /// Water = medium cyan so clearly distinct from blue/purple thirst pawns.
 const SPRITE_WATER: f32 = 14.0;
-#[allow(dead_code)]
 const SPRITE_PAWN: f32 = 10.0;
 const RESOURCE_BAR_HEIGHT: f32 = 3.0;
 const RESOURCE_BAR_MAX_WIDTH: f32 = 18.0;
@@ -2613,7 +2700,7 @@ fn camera_pan_zoom_input(
     }
 }
 
-fn setup(mut commands: Commands, _allocator: ResMut<ItemIdAllocator>) {
+fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>, spawn_mode: Option<Res<Tier1SpawnMode>>) {
     // Center camera on world and zoom to show full 256x256 extent
     let world_cx = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
     let world_cy = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
@@ -2648,7 +2735,106 @@ fn setup(mut commands: Commands, _allocator: ResMut<ItemIdAllocator>) {
         ));
     }
 
-    // Interactive mode: skip pawn/food/water spawning for pure visualization debug
+    let tier1_enabled = match spawn_mode {
+        Some(mode) => mode.enabled,
+        None => false,
+    };
+    if !tier1_enabled {
+        return;
+    }
+
+    // Food and water never share a chunk. Cluster A: food at (0,0), water at (1,0).
+    // Enough portions per cluster so 10 pawns can eat/drink and sustain 10k ticks with respawn.
+    let chunk_a = ChunkId(0, 0);
+    let water_a_chunk = ChunkId(1, 0);
+    let id_food_a = allocator.alloc();
+    commands.spawn((
+        FoodReservation { portions: 12 },
+        Position { chunk: chunk_a },
+        ItemIdentity { item_id: id_food_a, created_at_causal_seq: 0 },
+        ItemHistory::default(),
+        Sprite::from_color(Color::srgb(0.9, 0.5, 0.1), Vec2::splat(SPRITE_FOOD)),
+        Transform::from_translation(chunk_to_translation(&chunk_a, 0.0)),
+        Name::new("Food_A"),
+    ));
+    let id_water_a = allocator.alloc();
+    commands.spawn((
+        WaterSource { portions: 12 },
+        Position { chunk: water_a_chunk },
+        ItemIdentity { item_id: id_water_a, created_at_causal_seq: 0 },
+        ItemHistory::default(),
+        Sprite::from_color(Color::srgb(0.2, 0.85, 0.95), Vec2::splat(SPRITE_WATER)),
+        Transform::from_translation(chunk_to_translation(&water_a_chunk, 0.0)),
+        Name::new("Water_A"),
+    ));
+    commands.spawn((
+        RestSpot,
+        Position { chunk: chunk_a },
+        Sprite::from_color(Color::srgb(0.4, 0.35, 0.3), Vec2::splat(SPRITE_FOOD)),
+        Transform::from_translation(chunk_to_translation(&chunk_a, 0.0)),
+        Name::new("Rest_A"),
+    ));
+    for i in 1..=4 {
+        let offset = Vec3::new((i as f32 - 2.5) * 4.0, 0.0, 1.0);
+        commands.spawn((
+            build_pawn_brain(),
+            NeuralNetworkComponent { hunger: 0.9, thirst: 0.85, fatigue: 0.8, ..default() },
+            Position { chunk: chunk_a },
+            DisplayOffset(offset),
+            Capabilities { can_do: vec!["Eat".into(), "Drink".into(), "Rest".into()] },
+            KnownRecipes::default(),
+            Sprite::from_color(Color::srgb(0.2, 0.75, 0.3), Vec2::splat(SPRITE_PAWN)),
+            Transform::from_translation(chunk_to_translation(&chunk_a, 0.0) + offset),
+            Name::new(format!("Pawn_A_{}", i)),
+            PawnVisual,
+        ));
+    }
+
+    // Cluster B near far corner to exercise large-grid propagation and long-range behavior.
+    let chunk_b = ChunkId(CHUNK_EXTENT - 1, CHUNK_EXTENT - 1);
+    let water_b_chunk = ChunkId(CHUNK_EXTENT - 2, CHUNK_EXTENT - 1);
+    let id_food_b = allocator.alloc();
+    commands.spawn((
+        FoodReservation { portions: 12 },
+        Position { chunk: chunk_b },
+        ItemIdentity { item_id: id_food_b, created_at_causal_seq: 0 },
+        ItemHistory::default(),
+        Sprite::from_color(Color::srgb(0.9, 0.5, 0.1), Vec2::splat(SPRITE_FOOD)),
+        Transform::from_translation(chunk_to_translation(&chunk_b, 0.0)),
+        Name::new("Food_B"),
+    ));
+    let id_water_b = allocator.alloc();
+    commands.spawn((
+        WaterSource { portions: 12 },
+        Position { chunk: water_b_chunk },
+        ItemIdentity { item_id: id_water_b, created_at_causal_seq: 0 },
+        ItemHistory::default(),
+        Sprite::from_color(Color::srgb(0.2, 0.85, 0.95), Vec2::splat(SPRITE_WATER)),
+        Transform::from_translation(chunk_to_translation(&water_b_chunk, 0.0)),
+        Name::new("Water_B"),
+    ));
+    commands.spawn((
+        RestSpot,
+        Position { chunk: chunk_b },
+        Sprite::from_color(Color::srgb(0.4, 0.35, 0.3), Vec2::splat(SPRITE_FOOD)),
+        Transform::from_translation(chunk_to_translation(&chunk_b, 0.0)),
+        Name::new("Rest_B"),
+    ));
+    for i in 1..=4 {
+        let offset = Vec3::new((i as f32 - 2.5) * 4.0, 0.0, 1.0);
+        commands.spawn((
+            build_pawn_brain(),
+            NeuralNetworkComponent { hunger: 0.9, thirst: 0.85, fatigue: 0.8, ..default() },
+            Position { chunk: chunk_b },
+            DisplayOffset(offset),
+            Capabilities { can_do: vec!["Eat".into(), "Drink".into(), "Rest".into()] },
+            KnownRecipes::default(),
+            Sprite::from_color(Color::srgb(0.2, 0.75, 0.3), Vec2::splat(SPRITE_PAWN)),
+            Transform::from_translation(chunk_to_translation(&chunk_b, 0.0) + offset),
+            Name::new(format!("Pawn_B_{}", i)),
+            PawnVisual,
+        ));
+    }
 }
 
 const DISCOVERY_RECIPE_FIRE: &str = "Fire";
