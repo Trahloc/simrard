@@ -2084,22 +2084,40 @@ fn visual_debug_insect_overlay_system(
         let sum = (hunger + fear).max(0.001);
         let hw = hunger / sum;
         let fw = fear / sum;
-        let r = (0.95 * hw + 0.66 * fw).clamp(0.0, 1.0);
-        let g = (0.12 * hw + 0.10 * fw).clamp(0.0, 1.0);
-        let b = (0.18 * hw + 0.90 * fw).clamp(0.0, 1.0);
+        let mut r = (0.95 * hw + 0.66 * fw).clamp(0.0, 1.0);
+        let mut g = (0.12 * hw + 0.10 * fw).clamp(0.0, 1.0);
+        let mut b = (0.18 * hw + 0.90 * fw).clamp(0.0, 1.0);
+        
         let energy_norm = (insect.energy / 8.0).clamp(0.0, 1.0);
-        let pulse_rate = 2.5 + hunger * 5.0;
+        
+        // 0.8 Hz pulse for subtle scale bob + color pulse (red → bright-orange → red)
+        let pulse_freq = 0.8;
+        let pulse_rad = t * pulse_freq * std::f32::consts::TAU;
+        let scale_pulse = pulse_rad.sin();
+        
+        // Scale bob: 0.9× to 1.1× amplitude
+        let scale_modulation = 1.0 + 0.1 * scale_pulse;
+        
+        // Color pulse: blend toward bright orange on positive pulse
+        // When pulse > 0: shift color toward orange (1.0, 0.6, 0.0)
+        let orange_blend = scale_pulse.max(0.0);
+        r = (1.0 - orange_blend) * r + orange_blend * 1.0;
+        g = (1.0 - orange_blend) * g + orange_blend * 0.6;
+        b = (1.0 - orange_blend) * b + orange_blend * 0.0;
+        
         let phase = insect.age as f32 * 0.11 + insect.chunk.0 as f32 * 0.03 + insect.chunk.1 as f32 * 0.02;
-        let pulse = (t * pulse_rate + phase).sin();
         let base_size = 4.2 + insect.energy.clamp(0.0, 8.0) * 1.2;
-        let width = base_size * (1.0 + 0.28 * pulse);
-        let height = base_size * (1.0 - 0.18 * pulse + (1.0 - energy_norm) * 0.10);
+        let width = base_size * scale_modulation;
+        let height = base_size * scale_modulation;
+        
         let mut pos = chunk_to_translation(&insect.chunk, 3.2);
         pos.x += ((insect.age as f32).sin() * 0.35).clamp(-0.4, 0.4);
         pos.y += ((insect.age as f32 * 0.73).cos() * 0.35).clamp(-0.4, 0.4);
         pos = clip_to_world_bounds(pos);
+        
         let leg_wobble = 0.28 * (t * (6.0 + hunger * 4.0) + phase * 0.7).sin();
-        let alpha = (0.82 + 0.14 * energy_norm + 0.06 * pulse).clamp(0.55, 1.0);
+        let alpha = (0.82 + 0.14 * energy_norm + 0.06 * scale_pulse).clamp(0.55, 1.0);
+        
         commands.spawn((
             VisualDebugInsectSprite,
             Sprite::from_color(Color::srgba(r, g, b, alpha), Vec2::new(width, height)),
