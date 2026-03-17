@@ -4,7 +4,7 @@ use bevy::input::mouse::MouseWheel;
 use bevy::sprite::Sprite;
 use std::cmp::Ordering;
 use std::any::TypeId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -63,50 +63,26 @@ struct SimulationModeRuntime {
 
 fn live_stats_overlay_system(
     mut commands: Commands,
+    visual: Res<VisualDebug>,
     tier4: Res<Tier4State>,
     simlife: Res<SimLifeState>,
+    hypergraph_stats: Res<HypergraphRuntimeStats>,
     thermal: Res<ThermalState>,
     global_clock: Res<GlobalTickClock>,
     time: Res<Time>,
     camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
-    existing: Query<Entity, With<LiveStatsOverlay>>,
-    mut last_update: Local<f32>,
+    mut panel_queries: ParamSet<(
+        Query<
+            (&mut Text2d, &mut Transform, &mut Visibility),
+            (With<LiveStatsPanelText>, Without<Camera2d>),
+        >,
+        Query<
+            (&mut Sprite, &mut Transform, &mut Visibility),
+            (With<LiveStatsPanelBg>, Without<Camera2d>),
+        >,
+    )>,
+    mut local: Local<LiveStatsPanelLocal>,
 ) {
-    // Update once per second to avoid excessive text updates
-    *last_update += time.delta_secs();
-    if *last_update < 1.0 {
-        return;
-    }
-    *last_update = 0.0;
-
-    for entity in existing.iter() {
-        commands.entity(entity).despawn();
-    }
-
-    let stats_font = TextFont { font_size: 120.0, ..default() };
-    let stats_color = TextColor(Color::srgba(0.92, 0.94, 0.98, 0.88));
-
-    let insect_count = tier4.insects.len();
-    let gs_active = simlife.gs_active.len();
-    let peak_temp = match thermal
-        .local_temperature_by_chunk
-        .values()
-        .copied()
-        .max_by(|a, b| match a.partial_cmp(b) {
-            Some(ordering) => ordering,
-            None => Ordering::Equal,
-        })
-    {
-        Some(value) => value,
-        None => thermal.sink_temperature_k,
-    };
-    let tick = global_clock.causal_seq();
-
-    let stats_text = format!(
-        "Insects: {}  GS: {}  Peak: {:.1}K  Ticks: {}",
-        insect_count, gs_active, peak_temp, tick
-    );
-
     let (cam_x, cam_y, area_max_x, area_max_y) = match camera_query.single() {
         Ok((transform, Projection::Orthographic(ortho))) => (
             transform.translation.x,
@@ -116,17 +92,165 @@ fn live_stats_overlay_system(
         ),
         _ => return,
     };
-    // Pin to the visible top-left corner of the current camera view.
-    let overlay_x = cam_x - area_max_x + 260.0;
-    let overlay_y = cam_y + area_max_y - 180.0;
 
-    commands.spawn((
-        LiveStatsOverlay,
-        Text2d::new(stats_text),
-        stats_font,
-        stats_color,
-        Transform::from_translation(Vec3::new(overlay_x, overlay_y, 10.0)),
-    ));
+    let panel_w = 1650.0;
+    let panel_h = 640.0;
+    let margin_x = 220.0;
+    let margin_y = 180.0;
+    let panel_center_x = cam_x + area_max_x - margin_x - panel_w * 0.5;
+    let panel_center_y = cam_y + area_max_y - margin_y - panel_h * 0.5;
+    let text_x = panel_center_x - panel_w * 0.5 + 90.0;
+    let text_y = panel_center_y + panel_h * 0.5 - 70.0;
+
+    let now = time.elapsed_secs();
+    let dt = time.delta_secs().max(0.0001);
+    local.fps = 1.0 / dt;
+
+    if local.prev_time > 0.0 {
+        let tick = global_clock.causal_seq();
+        let tick_dt = (now - local.prev_time).max(0.0001);
+        local.ticks_per_sec = (tick.saturating_sub(local.prev_tick) as f32) / tick_dt;
+        local.prev_tick = tick;
+    } else {
+        local.prev_tick = global_clock.causal_seq();
+    }
+    local.prev_time = now;
+
+    let current_delta_k = (thermal.latest_peak_temperature_k - thermal.sink_temperature_k).max(0.0);
+    local.thermal_delta_samples.push_back((now, current_delta_k));
+    while let Some((t, _)) = local.thermal_delta_samples.front() {
+        if now - *t > 5.0 {
+            local.thermal_delta_samples.pop_front();
+        } else {
+            break;
+        }
+    }
+    let thermal_avg_5s = if local.thermal_delta_samples.is_empty() {
+        0.0
+    } else {
+        let sum: f32 = local.thermal_delta_samples.iter().map(|(_, v)| *v).sum();
+        sum / local.thermal_delta_samples.len() as f32
+    };
+
+    // Track rewrite rate using cumulative rewritten count over rolling 5s window.
+    local
+        .hyper_rewrite_samples
+        .push_back((now, hypergraph_stats.rewritten_total));
+    while let Some((t, _)) = local.hyper_rewrite_samples.front() {
+        if now - *t > 5.0 {
+            local.hyper_rewrite_samples.pop_front();
+        } else {
+            break;
+        }
+    }
+    let rewrite_rate = if local.hyper_rewrite_samples.len() >= 2 {
+        let (first_t, first_v) = match local.hyper_rewrite_samples.front() {
+            Some(value) => *value,
+            None => (now, 0),
+        };
+        let (last_t, last_v) = match local.hyper_rewrite_samples.back() {
+            Some(value) => *value,
+            None => (now, 0),
+        };
+        let dt = (last_t - first_t).max(0.0001);
+        (last_v.saturating_sub(first_v) as f32) / dt
+    } else {
+        0.0
+    };
+
+    // Record births/deaths from new Tier4 metrics and compute 5s rolling sums.
+    if local.prev_tier_metric_len > tier4.metrics.len() {
+        local.prev_tier_metric_len = 0;
+    }
+    for metrics in tier4.metrics.iter().skip(local.prev_tier_metric_len) {
+        local
+            .tier4_birth_death_samples
+            .push_back((now, metrics.repro_grants, metrics.deaths));
+    }
+    local.prev_tier_metric_len = tier4.metrics.len();
+    while let Some((t, _, _)) = local.tier4_birth_death_samples.front() {
+        if now - *t > 5.0 {
+            local.tier4_birth_death_samples.pop_front();
+        } else {
+            break;
+        }
+    }
+    let births_5s: u64 = local.tier4_birth_death_samples.iter().map(|(_, b, _)| *b).sum();
+    let deaths_5s: u64 = local.tier4_birth_death_samples.iter().map(|(_, _, d)| *d).sum();
+
+    let gs_active = simlife.gs_active.len();
+    let total_cells = ((CHUNK_EXTENT as u64) + 1).pow(2) as f32;
+    let gs_coverage_pct = if total_cells > 0.0 {
+        (gs_active as f32 / total_cells) * 100.0
+    } else {
+        0.0
+    };
+
+    let stats_text = format!(
+        "Live Stats\nFPS / ticks-sec: {:.1} / {:.1}\nThermal sink Δ: +{:.2}K (5s avg +{:.2}K)\nGS active coverage: {:.3}%\nHypergraph rewrite rate: {:.2}/s\nTier-4 births/deaths (5s): {}/{}",
+        local.fps,
+        local.ticks_per_sec,
+        current_delta_k,
+        thermal_avg_5s,
+        gs_coverage_pct,
+        rewrite_rate,
+        births_5s,
+        deaths_5s,
+    );
+
+    if !visual.enabled {
+        if let Ok((_, _, mut vis)) = panel_queries.p0().single_mut() {
+            *vis = Visibility::Hidden;
+        }
+        if let Ok((_, _, mut vis)) = panel_queries.p1().single_mut() {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
+
+    if let Ok((mut sprite, mut transform, mut vis)) = panel_queries.p1().single_mut() {
+        sprite.color = Color::srgba(0.08, 0.10, 0.14, 0.62);
+        sprite.custom_size = Some(Vec2::new(panel_w, panel_h));
+        *transform = Transform::from_translation(Vec3::new(panel_center_x, panel_center_y, 9.0));
+        *vis = Visibility::Visible;
+    } else {
+        commands.spawn((
+            LiveStatsPanelBg,
+            Sprite::from_color(Color::srgba(0.08, 0.10, 0.14, 0.62), Vec2::new(panel_w, panel_h)),
+            Transform::from_translation(Vec3::new(panel_center_x, panel_center_y, 9.0)),
+        ));
+    }
+
+    if let Ok((mut text, mut transform, mut vis)) = panel_queries.p0().single_mut() {
+        text.0 = stats_text;
+        *transform = Transform::from_translation(Vec3::new(text_x, text_y, 10.0));
+        *vis = Visibility::Visible;
+    } else {
+        commands.spawn((
+            LiveStatsPanelText,
+            Text2d::new(stats_text),
+            TextFont { font_size: 92.0, ..default() },
+            TextColor(Color::srgba(0.92, 0.94, 0.98, 0.92)),
+            Transform::from_translation(Vec3::new(text_x, text_y, 10.0)),
+        ));
+    }
+}
+
+#[derive(Default)]
+struct LiveStatsPanelLocal {
+    prev_time: f32,
+    prev_tick: u64,
+    ticks_per_sec: f32,
+    fps: f32,
+    prev_tier_metric_len: usize,
+    thermal_delta_samples: VecDeque<(f32, f32)>,
+    hyper_rewrite_samples: VecDeque<(f32, u64)>,
+    tier4_birth_death_samples: VecDeque<(f32, u64, u64)>,
+}
+
+#[derive(Resource, Default)]
+struct HypergraphRuntimeStats {
+    rewritten_total: u64,
 }
 
 #[derive(Resource, Default)]
@@ -284,6 +408,7 @@ fn run_interactive() {
         .init_resource::<Messages<CharterFlashEvent>>()
         .init_resource::<ActivityLog>()
         .init_resource::<HypergraphSubstrate>()
+        .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<Tier4State>()
@@ -428,6 +553,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         .init_resource::<Messages<CharterFlashEvent>>()
         .init_resource::<ActivityLog>()
         .init_resource::<HypergraphSubstrate>()
+        .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<RespawnState>()
@@ -1890,7 +2016,10 @@ struct VisualDebugGsSprite;
 struct VisualDebugThermalSprite;
 
 #[derive(Component)]
-struct LiveStatsOverlay;
+struct LiveStatsPanelBg;
+
+#[derive(Component)]
+struct LiveStatsPanelText;
 
 const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 200;
 const VISUAL_DEBUG_MAX_GS_SPRITES: usize = 30;
@@ -3635,6 +3764,7 @@ fn hypergraph_tick_system(
     mut substrate: ResMut<HypergraphSubstrate>,
     mut chemistry: ResMut<ChemistryState>,
     mut thermal: ResMut<ThermalState>,
+    mut runtime_stats: ResMut<HypergraphRuntimeStats>,
     mut report: Option<ResMut<SimulationReport>>,
 ) {
     let started = Instant::now();
@@ -3709,6 +3839,10 @@ fn hypergraph_tick_system(
         charter.release_lease(handle);
     }
     perf_record("charter_lease_release", release_started.elapsed());
+
+    runtime_stats.rewritten_total = runtime_stats
+        .rewritten_total
+        .saturating_add(stats.rewritten as u64);
 
     if let Some(ref mut report) = report {
         if stats.considered > 0 {
