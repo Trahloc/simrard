@@ -93,14 +93,8 @@ fn live_stats_overlay_system(
         _ => return,
     };
 
-    let panel_w = 1650.0;
-    let panel_h = 640.0;
-    let margin_x = 220.0;
-    let margin_y = 180.0;
-    let panel_center_x = cam_x + area_max_x - margin_x - panel_w * 0.5;
-    let panel_center_y = cam_y + area_max_y - margin_y - panel_h * 0.5;
-    let text_x = panel_center_x - panel_w * 0.5 + 90.0;
-    let text_y = panel_center_y + panel_h * 0.5 - 70.0;
+    let (panel_center_x, panel_center_y, text_x, text_y, panel_w, panel_h) =
+        live_stats_panel_layout(cam_x, cam_y, area_max_x, area_max_y);
 
     let now = time.elapsed_secs();
     let dt = time.delta_secs().max(0.0001);
@@ -1945,6 +1939,23 @@ fn visible_world_bounds(
     }
 }
 
+fn live_stats_panel_layout(
+    cam_x: f32,
+    cam_y: f32,
+    area_max_x: f32,
+    area_max_y: f32,
+) -> (f32, f32, f32, f32, f32, f32) {
+    let panel_w = 1650.0;
+    let panel_h = 640.0;
+    let margin_x = 220.0;
+    let margin_y = 180.0;
+    let panel_center_x = cam_x + area_max_x - margin_x - panel_w * 0.5;
+    let panel_center_y = cam_y + area_max_y - margin_y - panel_h * 0.5;
+    let text_x = panel_center_x - panel_w * 0.5 + 90.0;
+    let text_y = panel_center_y + panel_h * 0.5 - 70.0;
+    (panel_center_x, panel_center_y, text_x, text_y, panel_w, panel_h)
+}
+
 fn chunk_grid_gizmo_system(
     camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
     mut gizmos: Gizmos,
@@ -2483,8 +2494,9 @@ mod tests {
     use super::{
         advance_simlife_grass, apply_heat_and_cooling_to_chunk, camera_viewport_bounds,
         food_portions_from_grass, force_panic_error_handlers,
-        interactive_tier1_setting_from_flags, run_headless_with_target_ticks, visible_world_bounds,
-        world_bounds_pixels, HeadlessTermination, SimLifeState, ThermalState,
+        interactive_tier1_setting_from_flags, live_stats_panel_layout,
+        run_headless_with_target_ticks, visible_world_bounds, world_bounds_pixels,
+        HeadlessTermination, SimLifeState, ThermalState,
         HEADLESS_SURVIVAL_BASELINE_TICK, SIMLIFE_GRASS_MAX,
         THERMAL_HEAT_PER_USABLE_FLUX_CHEMISTRY, WORLD_EXTENT_PIXELS,
     };
@@ -2638,6 +2650,47 @@ mod tests {
     fn tier1_flag_conflict_is_rejected() {
         let setting = interactive_tier1_setting_from_flags(true, true);
         assert!(setting.is_err());
+    }
+
+    #[test]
+    fn resolution_agnostic_live_resize_keeps_square_world_and_panel_anchor() {
+        // Simulate a live-resize sequence (narrow, wide, tall, square-ish).
+        let sizes = [
+            (1000.0, 700.0),
+            (1400.0, 700.0),
+            (900.0, 900.0),
+            (1600.0, 900.0),
+            (800.0, 1100.0),
+        ];
+
+        let transform = Transform::from_xyz(WORLD_EXTENT_PIXELS * 0.5, WORLD_EXTENT_PIXELS * 0.5, 0.0);
+        let (world_min_x, world_max_x, world_min_y, world_max_y) = world_bounds_pixels();
+
+        for (w, h) in sizes {
+            let ortho = make_ortho_for_resolution(w, h, 10.0);
+            let (vx0, vx1, vy0, vy1) = camera_viewport_bounds(&transform, &ortho);
+            let vis = visible_world_bounds(vx0, vx1, vy0, vy1);
+            assert!(vis.is_some(), "world not visible during resize at {}x{}", w, h);
+
+            let (panel_cx, panel_cy, _tx, _ty, panel_w, panel_h) =
+                live_stats_panel_layout(transform.translation.x, transform.translation.y, ortho.area.max.x, ortho.area.max.y);
+            let panel_left = panel_cx - panel_w * 0.5;
+            let panel_right = panel_cx + panel_w * 0.5;
+            let panel_bottom = panel_cy - panel_h * 0.5;
+            let panel_top = panel_cy + panel_h * 0.5;
+
+            // Panel should remain anchored within the camera view top-right area.
+            assert!(panel_right <= vx1 + 0.001, "panel exceeds right viewport edge at {}x{}", w, h);
+            assert!(panel_top <= vy1 + 0.001, "panel exceeds top viewport edge at {}x{}", w, h);
+            assert!(panel_left >= vx0 - 0.001, "panel exceeds left viewport edge at {}x{}", w, h);
+            assert!(panel_bottom >= vy0 - 0.001, "panel exceeds bottom viewport edge at {}x{}", w, h);
+
+            // World bounds must remain invariant regardless of resize.
+            assert_eq!(world_min_x, 0.0);
+            assert_eq!(world_min_y, 0.0);
+            assert_eq!(world_max_x, WORLD_EXTENT_PIXELS);
+            assert_eq!(world_max_y, WORLD_EXTENT_PIXELS);
+        }
     }
 }
 
