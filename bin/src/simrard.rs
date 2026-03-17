@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy::ecs::message::{MessageReader, Messages};
 use bevy::input::mouse::MouseWheel;
 use bevy::sprite::Sprite;
+use bevy::text::{Font, FontSmoothing};
 use std::cmp::Ordering;
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -61,9 +62,15 @@ struct SimulationModeRuntime {
     interactive_with_tier1: bool,
 }
 
+#[derive(Resource, Clone)]
+struct HudFontHandle(Handle<Font>);
+
+const LIVE_STATS_FONT_SIZE: f32 = 11.0;
+
 fn live_stats_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
+    hud_font: Res<HudFontHandle>,
     tier4: Res<Tier4State>,
     simlife: Res<SimLifeState>,
     hypergraph_stats: Res<HypergraphRuntimeStats>,
@@ -72,14 +79,8 @@ fn live_stats_overlay_system(
     time: Res<Time>,
     camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
     mut panel_queries: ParamSet<(
-        Query<
-            (&mut Text2d, &mut Transform, &mut Visibility),
-            (With<LiveStatsPanelText>, Without<Camera2d>),
-        >,
-        Query<
-            (&mut Sprite, &mut Transform, &mut Visibility),
-            (With<LiveStatsPanelBg>, Without<Camera2d>),
-        >,
+        Query<(&mut Text, &mut TextFont, &mut Visibility), With<LiveStatsPanelTextUi>>,
+        Query<&mut Visibility, With<LiveStatsPanelUiRoot>>,
     )>,
     mut local: Local<LiveStatsPanelLocal>,
 ) {
@@ -93,8 +94,8 @@ fn live_stats_overlay_system(
         _ => return,
     };
 
-    let (panel_center_x, panel_center_y, text_x, text_y, panel_w, panel_h) =
-        live_stats_panel_layout(cam_x, cam_y, area_max_x, area_max_y);
+    // Keep layout function in the live path for resolution behavior parity checks.
+    let _ = live_stats_panel_layout(cam_x, cam_y, area_max_x, area_max_y);
 
     let now = time.elapsed_secs();
     let dt = time.delta_secs().max(0.0001);
@@ -196,39 +197,52 @@ fn live_stats_overlay_system(
         if let Ok((_, _, mut vis)) = panel_queries.p0().single_mut() {
             *vis = Visibility::Hidden;
         }
-        if let Ok((_, _, mut vis)) = panel_queries.p1().single_mut() {
+        if let Ok(mut vis) = panel_queries.p1().single_mut() {
             *vis = Visibility::Hidden;
         }
         return;
     }
 
-    if let Ok((mut sprite, mut transform, mut vis)) = panel_queries.p1().single_mut() {
-        sprite.color = Color::srgba(0.08, 0.10, 0.14, 0.62);
-        sprite.custom_size = Some(Vec2::new(panel_w, panel_h));
-        *transform = Transform::from_translation(Vec3::new(panel_center_x, panel_center_y, 9.0));
-        *vis = Visibility::Visible;
-    } else {
-        commands.spawn((
-            LiveStatsPanelBg,
-            Sprite::from_color(Color::srgba(0.08, 0.10, 0.14, 0.62), Vec2::new(panel_w, panel_h)),
-            Transform::from_translation(Vec3::new(panel_center_x, panel_center_y, 9.0)),
-        ));
-    }
-
-    if let Ok((mut text, mut transform, mut vis)) = panel_queries.p0().single_mut() {
+    if let Ok((mut text, mut text_font, mut vis)) = panel_queries.p0().single_mut() {
         text.0 = stats_text;
-        *transform = Transform::from_translation(Vec3::new(text_x, text_y, 10.0));
+        text_font.font = hud_font.0.clone();
+        text_font.font_size = LIVE_STATS_FONT_SIZE;
+        text_font.font_smoothing = FontSmoothing::AntiAliased;
         *vis = Visibility::Visible;
+        if let Ok(mut panel_vis) = panel_queries.p1().single_mut() {
+            *panel_vis = Visibility::Visible;
+        }
     } else {
         commands.spawn((
-            LiveStatsPanelText,
-            Text2d::new(stats_text),
-            TextFont { font_size: 92.0, ..default() },
-            TextColor(Color::srgba(0.92, 0.94, 0.98, 0.92)),
-            Transform::from_translation(Vec3::new(text_x, text_y, 10.0)),
-        ));
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(24.0),
+                top: Val::Px(24.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.08, 0.10, 0.14, 0.62)),
+            LiveStatsPanelUiRoot,
+            Visibility::Visible,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(stats_text),
+                TextFont {
+                    font: hud_font.0.clone(),
+                    font_size: LIVE_STATS_FONT_SIZE,
+                    font_smoothing: FontSmoothing::AntiAliased,
+                    ..default()
+                },
+                TextColor(Color::srgba(0.92, 0.94, 0.98, 0.94)),
+                LiveStatsPanelTextUi,
+                Visibility::Visible,
+            ));
+        });
     }
 }
+
+
 
 #[derive(Default)]
 struct LiveStatsPanelLocal {
@@ -423,7 +437,7 @@ fn run_interactive() {
     // Some plugins create or reconfigure sub-app worlds during build, so overwrite all handlers
     // only after plugin registration is complete and before any schedule runs.
     force_panic_error_handlers(&mut app);
-    app.add_systems(Startup, (setup, setup_quest_ui))
+    app.add_systems(Startup, (setup_hud_font, setup).chain())
         // Phase 4.0: Run sim tick in PreUpdate before BigBrain so each frame we advance tick then run
         // scorers/thinker/actions (including MoveToChunk). Movement and sim state stay in sync.
         // Phase 4.1: Death first so no system ever sees or queues commands for dead pawns.
@@ -465,12 +479,10 @@ fn run_interactive() {
                 hypergraph_debug_viz_system,
             ),
         )
-        .add_systems(Update, ui_panel_update_system)
         .add_systems(
             Update,
             (
                 visual_debug_toggle_system,
-                legacy_quest_overlay_visibility_system,
                 visual_debug_insect_overlay_system,
                 visual_debug_gs_overlay_system,
             ),
@@ -487,6 +499,17 @@ fn run_interactive() {
     app.add_systems(Update, charter_watchguard_system);
 
     app.run();
+}
+
+fn setup_hud_font(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
+    // Use a vendored in-repo TTF to keep HUD rendering deterministic and independent of host OS fonts.
+    let font_bytes = include_bytes!("../../assets/fonts/SimrardHUD-Regular.ttf").to_vec();
+    let font = Font::try_from_bytes(font_bytes).unwrap_or_else(|err| {
+        panic!(
+            "HUD font load failed: bundled font at assets/fonts/SimrardHUD-Regular.ttf is invalid ({err}). Replace the file with a valid TTF.",
+        )
+    });
+    commands.insert_resource(HudFontHandle(fonts.add(font)));
 }
 
 fn main() {
@@ -1959,10 +1982,12 @@ fn live_stats_panel_layout(
     let panel_h = 640.0;
     let margin_x = 220.0;
     let margin_y = 180.0;
-    let panel_center_x = cam_x + area_max_x - margin_x - panel_w * 0.5;
+    let text_padding_left = 64.0;
+    let text_padding_top = 54.0;
+    let panel_center_x = cam_x - area_max_x + margin_x + panel_w * 0.5;
     let panel_center_y = cam_y + area_max_y - margin_y - panel_h * 0.5;
-    let text_x = panel_center_x - panel_w * 0.5 + 90.0;
-    let text_y = panel_center_y + panel_h * 0.5 - 70.0;
+    let text_x = panel_center_x - panel_w * 0.5 + text_padding_left;
+    let text_y = panel_center_y + panel_h * 0.5 - text_padding_top;
     (panel_center_x, panel_center_y, text_x, text_y, panel_w, panel_h)
 }
 
@@ -2037,10 +2062,10 @@ struct VisualDebugGsFullWorldTint;
 struct VisualDebugThermalSprite;
 
 #[derive(Component)]
-struct LiveStatsPanelBg;
+struct LiveStatsPanelUiRoot;
 
 #[derive(Component)]
-struct LiveStatsPanelText;
+struct LiveStatsPanelTextUi;
 
 const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 200;
 const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 20;
@@ -2048,16 +2073,6 @@ const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 20;
 fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMut<VisualDebug>) {
     if keys.just_pressed(KeyCode::KeyV) {
         visual.enabled = !visual.enabled;
-    }
-}
-
-fn legacy_quest_overlay_visibility_system(
-    _visual: Res<VisualDebug>,
-    mut overlay_query: Query<&mut Visibility, With<QuestOverlayRoot>>,
-) {
-    // Keep legacy quest overlay hidden since everything is now in the unified top-right panel
-    for mut vis in overlay_query.iter_mut() {
-        *vis = Visibility::Hidden;
     }
 }
 
@@ -2418,93 +2433,6 @@ fn charter_flash_tick_system(
     }
 }
 
-// ---- UI overlay: sim status, legend, quests, activity feed ----
-#[derive(Component)]
-struct QuestOverlayRoot;
-
-const UI_SECTIONS: usize = 5; // sim, legend, resources, quests, activity (order in children)
-
-/// Colors used in the legend and for pawns/resources. Use actual color, not words only.
-fn legend_colors() -> (
-    Color,
-    Color,
-    Color,
-    Color,
-    Color,
-    Color,
-) {
-    (
-        Color::srgb(0.9, 0.3, 0.2),   // hunger
-        Color::srgb(0.55, 0.25, 0.9), // thirst
-        Color::srgb(0.5, 0.5, 0.4),   // fatigue
-        Color::srgb(0.9, 0.5, 0.1),   // food
-        Color::srgb(0.2, 0.85, 0.95), // water
-        Color::srgb(0.88, 0.88, 0.88), // neutral label
-    )
-}
-
-fn setup_quest_ui(mut commands: Commands) {
-    let font = TextFont {
-        font_size: 13.0,
-        ..default()
-    };
-    let layout = TextLayout::default();
-    let (hunger_c, thirst_c, fatigue_c, food_c, water_c, neutral_c) = legend_colors();
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(8.0),
-                top: Val::Px(8.0),
-                width: Val::Px(340.0),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(12.0),
-                ..default()
-            },
-            QuestOverlayRoot,
-            Visibility::Hidden,  // Hidden by default; shown only when not in unified panel mode
-        ))
-        .with_children(|parent| {
-            // Section 0: sim status (plain text, updated each frame)
-            parent.spawn((
-                Text::new(""),
-                font.clone(),
-                layout.clone(),
-            ));
-            // Section 1: legend — colored text only (no color words); never overwritten
-            parent
-                .spawn((
-                    Text::default(),
-                    font.clone(),
-                    layout.clone(),
-                ))
-                .with_children(|p| {
-                    p.spawn((TextSpan::new("Pawn color = dominant need:\n  "), TextColor(neutral_c.into())));
-                    p.spawn((TextSpan::new("hunger"), TextColor(hunger_c.into())));
-                    p.spawn((TextSpan::new("   "), TextColor(neutral_c.into())));
-                    p.spawn((TextSpan::new("thirst"), TextColor(thirst_c.into())));
-                    p.spawn((TextSpan::new("   "), TextColor(neutral_c.into())));
-                    p.spawn((TextSpan::new("fatigue"), TextColor(fatigue_c.into())));
-                    p.spawn((TextSpan::new("\n  Big "), TextColor(neutral_c.into())));
-                    p.spawn((TextSpan::new("food"), TextColor(food_c.into())));
-                    p.spawn((TextSpan::new("   "), TextColor(neutral_c.into())));
-                    p.spawn((TextSpan::new("water"), TextColor(water_c.into())));
-                    p.spawn((TextSpan::new("\n  Thermal key: "), TextColor(neutral_c.into())));
-                    p.spawn((TextSpan::new("hot"), TextColor(Color::srgb(0.95, 0.16, 0.12).into())));
-                    p.spawn((TextSpan::new(" / "), TextColor(neutral_c.into())));
-                    p.spawn((TextSpan::new("cold"), TextColor(Color::srgb(0.2, 0.4, 0.98).into())));
-                });
-            // Sections 2–4: resources, quests, activity (plain text, updated each frame)
-            for _ in 0..(UI_SECTIONS - 2) {
-                parent.spawn((
-                    Text::new(""),
-                    font.clone(),
-                    layout.clone(),
-                ));
-            }
-        });
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2706,110 +2634,6 @@ mod tests {
             assert_eq!(world_min_y, 0.0);
             assert_eq!(world_max_x, WORLD_EXTENT_PIXELS);
             assert_eq!(world_max_y, WORLD_EXTENT_PIXELS);
-        }
-    }
-}
-
-fn ui_panel_update_system(
-    global_clock: Res<GlobalTickClock>,
-    scale: Res<SimTimeScale>,
-    hypergraph: Res<HypergraphSubstrate>,
-    visual: Res<VisualDebug>,
-    #[cfg(debug_assertions)] hypergraph_viz: Res<HypergraphDebugViz>,
-    quest_board: Res<QuestBoard>,
-    activity: Res<ActivityLog>,
-    pawn_names: Query<&Name>,
-    food_query: Query<(&Position, &FoodReservation)>,
-    water_query: Query<(&Position, &WaterSource)>,
-    mut writer: bevy::ui::widget::TextUiWriter,
-    overlay_query: Query<&Children, With<QuestOverlayRoot>>,
-) {
-    let Some(children) = overlay_query.iter().next() else { return };
-    if children.len() < UI_SECTIONS {
-        return;
-    }
-    let seq = global_clock.causal_seq();
-    let pause = if scale.0 == 0.0 { " [PAUSED]" } else { "" };
-    #[cfg(debug_assertions)]
-    let hypergraph_controls = if hypergraph_viz.enabled {
-        "J/K chaos  H hyper-viz:on"
-    } else {
-        "J/K chaos  H hyper-viz:off"
-    };
-    #[cfg(not(debug_assertions))]
-    let hypergraph_controls = "";
-    let sim_status = format!(
-        "Sim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}\nVisual Debug: {}",
-        seq,
-        scale.0,
-        pause,
-        hypergraph.chaos(),
-        hypergraph_controls,
-        if visual.enabled { "ON" } else { "OFF" }
-    );
-    // Legend is built once in setup with actual colors (no color words); section 1 is not overwritten.
-    let _legend_placeholder = "Pawn color = dominant need:\n  hunger   thirst   fatigue\n  Big food   water";
-    let food_info: String = food_query
-        .iter()
-        .map(|(pos, f)| format!("{:?}({})", pos.chunk, f.portions))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let water_info: String = water_query
-        .iter()
-        .map(|(pos, w)| format!("{:?}({})", pos.chunk, w.portions))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let resource_lines = format!("Resources:\n  Food {}: {}\n  Water {}: {}", food_query.iter().count(), food_info, water_query.iter().count(), water_info);
-    let quest_lines: String = if quest_board.active_quests.is_empty() {
-        "Quests: (none)".into()
-    } else {
-        std::iter::once("Quests:".into())
-            .chain(
-                quest_board
-                    .active_quests
-                    .iter()
-                    .take(10)
-                    .map(|q| {
-                        let status = match q.status {
-                            QuestStatus::Open => "Open".to_string(),
-                            QuestStatus::Completed => "Completed".to_string(),
-                            QuestStatus::InProgress { provider } => {
-                                let provider_name = pawn_names
-                                    .get(provider)
-                                    .map(|n| n.to_string())
-                                    .unwrap_or_else(|_| format!("{:?}", provider));
-                                format!("InProgress({})", provider_name)
-                            }
-                        };
-                        format!("  {} @ {:?} – {}", q.need, q.chunk, status)
-                    }),
-            )
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let activity_lines: String = if activity.0.is_empty() {
-        "Activity: (none yet)".into()
-    } else {
-        std::iter::once("Activity:".into())
-            .chain(activity.0.iter().rev().take(8).cloned())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let contents = [
-        sim_status,
-        _legend_placeholder.to_string(), // section 1 is colored legend from setup; not overwritten
-        resource_lines,
-        quest_lines,
-        activity_lines,
-    ];
-    for (i, entity) in children.iter().take(UI_SECTIONS).enumerate() {
-        if i == 1 {
-            continue; // legend is static colored text from setup
-        }
-        if let Some((_, _, mut text, ..)) = writer.get(entity, 0) {
-            if *text != contents[i] {
-                *text = contents[i].clone();
-            }
         }
     }
 }
