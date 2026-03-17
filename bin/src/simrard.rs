@@ -56,8 +56,9 @@ struct VisualDebug {
 }
 
 #[derive(Resource, Debug, Clone, Copy)]
-struct Tier1SpawnMode {
-    enabled: bool,
+struct SimulationModeRuntime {
+    mode: SimulationMode,
+    interactive_with_tier1: bool,
 }
 
 fn live_stats_overlay_system(
@@ -192,15 +193,25 @@ fn benchmark_seconds_from_args() -> f64 {
     })
 }
 
+fn interactive_tier1_setting_from_flags(
+    has_visual_debug_only: bool,
+    has_interactive_with_tier1: bool,
+) -> Result<bool, &'static str> {
+    if has_visual_debug_only && has_interactive_with_tier1 {
+        Err("invalid flags: use either --visual-debug-only or --interactive-with-tier1, not both")
+    } else {
+        Ok(has_interactive_with_tier1)
+    }
+}
+
 fn interactive_with_tier1_from_args() -> bool {
     *INTERACTIVE_WITH_TIER1.get_or_init(|| {
         let has_visual_debug_only = std::env::args().skip(1).any(|arg| arg == "--visual-debug-only");
         let has_interactive_with_tier1 = std::env::args().skip(1).any(|arg| arg == "--interactive-with-tier1");
-        assert!(
-            !(has_visual_debug_only && has_interactive_with_tier1),
-            "invalid flags: use either --visual-debug-only or --interactive-with-tier1, not both"
-        );
-        has_interactive_with_tier1
+        match interactive_tier1_setting_from_flags(has_visual_debug_only, has_interactive_with_tier1) {
+            Ok(value) => value,
+            Err(message) => panic!("{}", message),
+        }
     })
 }
 
@@ -281,8 +292,9 @@ fn run_interactive() {
         .insert_resource(VisualDebug {
             enabled: visual_debug_default_on,
         })
-        .insert_resource(Tier1SpawnMode {
-            enabled: interactive_with_tier1_from_args(),
+        .insert_resource(SimulationModeRuntime {
+            mode: SimulationMode::Interactive,
+            interactive_with_tier1: interactive_with_tier1_from_args(),
         })
         .init_resource::<VisualDebugThermalCache>()
         .add_plugins(MirrorPlugin);
@@ -429,7 +441,10 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
             app.add_plugins(BigBrainPlugin::new(PreUpdate))
                 .add_plugins(PawnAIPlugin)
                 .init_resource::<QuestBoard>()
-                .insert_resource(Tier1SpawnMode { enabled: true })
+                .insert_resource(SimulationModeRuntime {
+                    mode: SimulationMode::Headless,
+                    interactive_with_tier1: true,
+                })
                 .add_plugins(MirrorPlugin)
                 .add_systems(Startup, (setup, initialize_report_baseline).chain())
                 .add_systems(
@@ -450,7 +465,10 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         }
         HeadlessProfile::SubstrateOnly => {
             app.init_resource::<QuestBoard>()
-                .insert_resource(Tier1SpawnMode { enabled: false })
+                .insert_resource(SimulationModeRuntime {
+                    mode: SimulationMode::Headless,
+                    interactive_with_tier1: false,
+                })
                 .init_resource::<SubstrateStabilityState>()
                 .add_systems(
                     Startup,
@@ -2335,10 +2353,11 @@ fn setup_quest_ui(mut commands: Commands) {
 mod tests {
     use super::{
         advance_simlife_grass, apply_heat_and_cooling_to_chunk, camera_viewport_bounds,
-        food_portions_from_grass, force_panic_error_handlers, run_headless_with_target_ticks,
-        visible_world_bounds, world_bounds_pixels, HeadlessTermination, SimLifeState, ThermalState,
-        HEADLESS_SURVIVAL_BASELINE_TICK, SIMLIFE_GRASS_MAX, THERMAL_HEAT_PER_USABLE_FLUX_CHEMISTRY,
-        WORLD_EXTENT_PIXELS,
+        food_portions_from_grass, force_panic_error_handlers,
+        interactive_tier1_setting_from_flags, run_headless_with_target_ticks, visible_world_bounds,
+        world_bounds_pixels, HeadlessTermination, SimLifeState, ThermalState,
+        HEADLESS_SURVIVAL_BASELINE_TICK, SIMLIFE_GRASS_MAX,
+        THERMAL_HEAT_PER_USABLE_FLUX_CHEMISTRY, WORLD_EXTENT_PIXELS,
     };
     use bevy::app::{AppLabel, SubApp};
     use bevy::prelude::*;
@@ -2472,6 +2491,24 @@ mod tests {
         assert_eq!(min_y, 0.0);
         assert_eq!(max_x, WORLD_EXTENT_PIXELS);
         assert_eq!(max_y, WORLD_EXTENT_PIXELS);
+    }
+
+    #[test]
+    fn tier1_flag_defaults_to_visual_debug_only() {
+        let setting = interactive_tier1_setting_from_flags(false, false);
+        assert_eq!(setting, Ok(false));
+    }
+
+    #[test]
+    fn tier1_flag_enables_interactive_spawning_when_requested() {
+        let setting = interactive_tier1_setting_from_flags(false, true);
+        assert_eq!(setting, Ok(true));
+    }
+
+    #[test]
+    fn tier1_flag_conflict_is_rejected() {
+        let setting = interactive_tier1_setting_from_flags(true, true);
+        assert!(setting.is_err());
     }
 }
 
@@ -2700,7 +2737,11 @@ fn camera_pan_zoom_input(
     }
 }
 
-fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>, spawn_mode: Option<Res<Tier1SpawnMode>>) {
+fn setup(
+    mut commands: Commands,
+    mut allocator: ResMut<ItemIdAllocator>,
+    sim_mode: Option<Res<SimulationModeRuntime>>,
+) {
     // Center camera on world and zoom to show full 256x256 extent
     let world_cx = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
     let world_cy = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
@@ -2735,8 +2776,11 @@ fn setup(mut commands: Commands, mut allocator: ResMut<ItemIdAllocator>, spawn_m
         ));
     }
 
-    let tier1_enabled = match spawn_mode {
-        Some(mode) => mode.enabled,
+    let tier1_enabled = match sim_mode {
+        Some(mode) => match mode.mode {
+            SimulationMode::Interactive => mode.interactive_with_tier1,
+            SimulationMode::Headless => mode.interactive_with_tier1,
+        },
         None => false,
     };
     if !tier1_enabled {
