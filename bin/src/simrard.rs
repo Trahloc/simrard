@@ -2021,7 +2021,7 @@ fn chunk_grid_gizmo_system(
 struct VisualDebugInsectSprite;
 
 #[derive(Component)]
-struct VisualDebugGsSprite;
+struct VisualDebugGsFullWorldTint;
 
 #[derive(Component)]
 struct VisualDebugThermalSprite;
@@ -2033,7 +2033,6 @@ struct LiveStatsPanelBg;
 struct LiveStatsPanelText;
 
 const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 200;
-const VISUAL_DEBUG_MAX_GS_SPRITES: usize = 30;
 const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 20;
 
 fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMut<VisualDebug>) {
@@ -2126,22 +2125,11 @@ fn visual_debug_insect_overlay_system(
     }
 }
 
-fn gs_v_for(simlife: &SimLifeState, chunk: ChunkId) -> f32 {
-    let value = simlife.v_field.get(&chunk).copied();
-    match value {
-        Some(v) => v,
-        None => 0.0,
-    }
-}
-
 fn visual_debug_gs_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
     simlife: Res<SimLifeState>,
-    time: Res<Time>,
-    camera_query: Query<&Transform, With<Camera2d>>,
-    mut gizmos: Gizmos,
-    existing: Query<Entity, With<VisualDebugGsSprite>>,
+    existing: Query<Entity, With<VisualDebugGsFullWorldTint>>,
 ) {
     for entity in existing.iter() {
         commands.entity(entity).despawn();
@@ -2150,67 +2138,45 @@ fn visual_debug_gs_overlay_system(
         return;
     }
 
-    let camera = match camera_query.single() {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let cam = Vec2::new(camera.translation.x, camera.translation.y);
-
-    let mut cells: Vec<ChunkId> = simlife.gs_active.iter().copied().collect();
-    cells.sort_by(|a, b| {
-        let ap = Vec2::new(a.0 as f32 * CHUNK_PIXEL, a.1 as f32 * CHUNK_PIXEL).distance_squared(cam);
-        let bp = Vec2::new(b.0 as f32 * CHUNK_PIXEL, b.1 as f32 * CHUNK_PIXEL).distance_squared(cam);
-        match ap.partial_cmp(&bp) {
-            Some(ordering) => ordering,
-            None => Ordering::Equal,
-        }
-    });
-
-    let t = time.elapsed_secs();
-    for cell in cells.into_iter().take(VISUAL_DEBUG_MAX_GS_SPRITES) {
-        let u_raw = simlife.u_field.get(&cell).copied();
-        let v_raw = simlife.v_field.get(&cell).copied();
-        let u = match u_raw { Some(value) => value, None => 1.0 }.clamp(0.0, 1.0);
-        let v = match v_raw { Some(value) => value, None => 0.0 }.clamp(0.0, 1.0);
-        let left = gs_v_for(&simlife, ChunkId(cell.0.saturating_sub(1), cell.1));
-        let right = gs_v_for(&simlife, ChunkId((cell.0 + 1).min(CHUNK_EXTENT), cell.1));
-        let down = gs_v_for(&simlife, ChunkId(cell.0, cell.1.saturating_sub(1)));
-        let up = gs_v_for(&simlife, ChunkId(cell.0, (cell.1 + 1).min(CHUNK_EXTENT)));
-        let nx = right - left;
-        let ny = up - down;
-        let nz = 0.55;
-        let len = (nx * nx + ny * ny + nz * nz).sqrt().max(0.0001);
-        let normal = Vec3::new(nx / len, ny / len, nz / len);
-        let light = Vec3::new(0.58, 0.48, 0.66).normalize();
-        let shade = normal.dot(light).clamp(0.0, 1.0);
-        let flow = (nx.abs() + ny.abs()).clamp(0.0, 1.0);
-        let biomass = (v * 1.2).clamp(0.0, 1.0);
-        let r = (u * 0.42 + shade * 0.35 + flow * 0.18).clamp(0.0, 1.0);
-        let g = (biomass * 0.75 + shade * 0.22).clamp(0.0, 1.0);
-        let b = (v * 0.82 + (1.0 - shade) * 0.15 + flow * 0.08).clamp(0.0, 1.0);
-        let shimmer = (t * 1.4 + (cell.0 as f32 * 0.03 + cell.1 as f32 * 0.05)).sin();
-        let alpha = (0.34 + 0.28 * flow + 0.14 * (shade - 0.5) + 0.05 * shimmer).clamp(0.22, 0.72);
-        let h = (CHUNK_PIXEL - 1.4 + v * 0.9 + flow * 0.7).max(1.0);
-        let w = (CHUNK_PIXEL - 1.2 + u * 0.6).max(1.0);
-        let tilt = 0.12 * ny;
-        let color = Color::srgba(r, g, b, alpha);
-        let pos = clip_to_world_bounds(chunk_to_translation(&cell, 2.2));
-        commands.spawn((
-            VisualDebugGsSprite,
-            Sprite::from_color(color, Vec2::new(w, h)),
-            Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(tilt)),
-        ));
-
-        let dir = Vec2::new(nx, ny);
-        let dir_len = dir.length();
-        if dir_len > 0.03 {
-            let tangent = dir / dir_len;
-            let half = (4.0 + 8.0 * flow).min(10.0);
-            let center = Vec2::new(pos.x, pos.y);
-            let line_color = Color::srgba(0.25, 0.95, 0.55, (0.18 + flow * 0.34).clamp(0.18, 0.52));
-            gizmos.line_2d(center - tangent * half, center + tangent * half, line_color);
+    // Compute average v-concentration (biomass) across all active GS cells
+    let mut total_v = 0.0;
+    let mut count = 0;
+    for cell in simlife.gs_active.iter() {
+        if let Some(v) = simlife.v_field.get(cell) {
+            total_v += *v;
+            count += 1;
         }
     }
+    
+    let avg_v = if count > 0 {
+        (total_v / count as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    
+    // Map concentration to blue-green tint:
+    // - Low concentration (0.0): transparent
+    // - High concentration (1.0): bright blue-green
+    // Use v as the dominant indicator of biomass spreading
+    let r = 0.1 * avg_v;  // Minimal red component
+    let g = 0.7 * avg_v;  // Strong green for "living" field
+    let b = 0.8 * avg_v;  // Strong blue-cyan tint
+    
+    // Opacity: faint but readable (0.08 to 0.22 range, scales with concentration)
+    let alpha = (0.08 + 0.14 * avg_v).clamp(0.08, 0.22);
+    
+    // Full-world quad: center at world center, covers entire 256×256 chunk world
+    let world_center = WORLD_EXTENT_PIXELS / 2.0;
+    let world_size = WORLD_EXTENT_PIXELS;
+    
+    commands.spawn((
+        VisualDebugGsFullWorldTint,
+        Sprite::from_color(
+            Color::srgba(r, g, b, alpha),
+            Vec2::splat(world_size),
+        ),
+        Transform::from_translation(Vec3::new(world_center, world_center, 1.5)),
+    ));
 }
 
 fn visual_debug_thermal_overlay_system(
