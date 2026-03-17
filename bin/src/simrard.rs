@@ -409,6 +409,29 @@ struct VisualDebugThermalCache {
     prev_temp_by_chunk: HashMap<ChunkId, f32>,
 }
 
+#[derive(Resource, Default)]
+struct VisualSystemsProfiler {
+    window_start_secs: f32,
+    insect_total_ms: f64,
+    insect_calls: u32,
+    gs_total_ms: f64,
+    gs_calls: u32,
+    thermal_total_ms: f64,
+    thermal_calls: u32,
+}
+
+impl VisualSystemsProfiler {
+    fn reset_window(&mut self, now: f32) {
+        self.window_start_secs = now;
+        self.insect_total_ms = 0.0;
+        self.insect_calls = 0;
+        self.gs_total_ms = 0.0;
+        self.gs_calls = 0;
+        self.thermal_total_ms = 0.0;
+        self.thermal_calls = 0;
+    }
+}
+
 #[derive(Default)]
 struct PerfAudit {
     totals: HashMap<&'static str, Duration>,
@@ -573,6 +596,7 @@ fn run_interactive() {
             mode: SimulationMode::Interactive,
             interactive_with_tier1: interactive_with_tier1_from_args(),
         })
+        .init_resource::<VisualSystemsProfiler>()
         .init_resource::<VisualDebugThermalCache>()
         .add_plugins(MirrorPlugin);
     #[cfg(debug_assertions)]
@@ -639,7 +663,8 @@ fn run_interactive() {
         )
         .add_systems(Update, visual_debug_thermal_overlay_system)
         .add_systems(Update, visual_debug_hypergraph_overlay_system)
-        .add_systems(Update, live_stats_overlay_system);
+        .add_systems(Update, live_stats_overlay_system)
+        .add_systems(Update, visual_debug_profiler_report_system);
 
     // Phase 4.D1: Push ECS snapshot to DuckDB mirror after Update (post visual sync).
     // Runs in its own add_systems call so it is not constrained by the Update chain tuple limit.
@@ -2232,9 +2257,15 @@ fn visual_debug_insect_overlay_system(
     visual: Res<VisualDebug>,
     tier4: Res<Tier4State>,
     time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
     camera_query: Query<&Transform, With<Camera2d>>,
     existing: Query<Entity, With<VisualDebugInsectSprite>>,
 ) {
+    let now = time.elapsed_secs();
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
+    }
+    let start = Instant::now();
     for entity in existing.iter() {
         commands.entity(entity).despawn();
     }
@@ -2309,14 +2340,24 @@ fn visual_debug_insect_overlay_system(
             Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(leg_wobble)),
         ));
     }
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    profiler.insect_total_ms += elapsed_ms;
+    profiler.insect_calls = profiler.insect_calls.saturating_add(1);
 }
 
 fn visual_debug_gs_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
     simlife: Res<SimLifeState>,
+    time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
     existing: Query<Entity, With<VisualDebugGsFullWorldTint>>,
 ) {
+    let now = time.elapsed_secs();
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
+    }
+    let start = Instant::now();
     for entity in existing.iter() {
         commands.entity(entity).despawn();
     }
@@ -2363,6 +2404,9 @@ fn visual_debug_gs_overlay_system(
         ),
         Transform::from_translation(Vec3::new(world_center, world_center, 1.5)),
     ));
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    profiler.gs_total_ms += elapsed_ms;
+    profiler.gs_calls = profiler.gs_calls.saturating_add(1);
 }
 
 fn visual_debug_thermal_overlay_system(
@@ -2371,9 +2415,15 @@ fn visual_debug_thermal_overlay_system(
     thermal: Res<ThermalState>,
     mut cache: ResMut<VisualDebugThermalCache>,
     time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
     camera_query: Query<&Transform, With<Camera2d>>,
     existing: Query<Entity, With<VisualDebugThermalSprite>>,
 ) {
+    let now = time.elapsed_secs();
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
+    }
+    let start = Instant::now();
     for entity in existing.iter() {
         commands.entity(entity).despawn();
     }
@@ -2458,6 +2508,58 @@ fn visual_debug_thermal_overlay_system(
         ));
         cache.prev_temp_by_chunk.insert(chunk, current_temp);
     }
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    profiler.thermal_total_ms += elapsed_ms;
+    profiler.thermal_calls = profiler.thermal_calls.saturating_add(1);
+}
+
+fn visual_debug_profiler_report_system(
+    visual: Res<VisualDebug>,
+    time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
+) {
+    let now = time.elapsed_secs();
+    if !visual.enabled {
+        profiler.reset_window(now);
+        return;
+    }
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
+    }
+
+    let window = now - profiler.window_start_secs;
+    if window < 1.0 {
+        return;
+    }
+
+    let insect_avg = if profiler.insect_calls > 0 {
+        profiler.insect_total_ms / profiler.insect_calls as f64
+    } else {
+        0.0
+    };
+    let gs_avg = if profiler.gs_calls > 0 {
+        profiler.gs_total_ms / profiler.gs_calls as f64
+    } else {
+        0.0
+    };
+    let thermal_avg = if profiler.thermal_calls > 0 {
+        profiler.thermal_total_ms / profiler.thermal_calls as f64
+    } else {
+        0.0
+    };
+    let total_visual_avg = insect_avg + gs_avg + thermal_avg;
+    let fps_est = if total_visual_avg > 0.0 {
+        1000.0 / total_visual_avg
+    } else {
+        0.0
+    };
+
+    println!(
+        "[visual-profiler] insect: {:.2}ms gs: {:.2}ms thermal: {:.2}ms total: {:.2}ms fps-est: {:.1}",
+        insect_avg, gs_avg, thermal_avg, total_visual_avg, fps_est
+    );
+
+    profiler.reset_window(now);
 }
 
 fn visual_debug_hypergraph_overlay_system(
