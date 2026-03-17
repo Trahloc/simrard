@@ -4241,11 +4241,15 @@ fn sim_tick_driver(
     log_settings: Option<Res<SimulationLogSettings>>,
 ) {
     accumulator.0 += time.delta_secs() * scale.0 * SIM_TICKS_PER_SECOND_AT_1X;
+    if accumulator.0 > MAX_INTERACTIVE_SIM_ACCUMULATOR_TICKS {
+        accumulator.0 = MAX_INTERACTIVE_SIM_ACCUMULATOR_TICKS;
+    }
     let stdout_enabled = log_settings
         .as_deref()
         .map(|settings| settings.stdout_enabled)
         .unwrap_or(true);
-    while accumulator.0 >= 1.0 {
+    let mut ticks_this_frame = 0u32;
+    while accumulator.0 >= 1.0 && ticks_this_frame < MAX_INTERACTIVE_SIM_TICKS_PER_FRAME {
         advance_simulation_one_tick(
             &mut global_clock,
             &mut event_queue,
@@ -4262,12 +4266,16 @@ fn sim_tick_driver(
             stdout_enabled,
         );
         accumulator.0 -= 1.0;
+        ticks_this_frame += 1;
     }
 }
 
 /// Min/max scale for display sanity; effectively unbounded for gameplay.
 const MIN_SCALE: f32 = 0.01;
 const MAX_SCALE: f32 = 1000.0;
+// Interactive backpressure: prevents sim burst catch-up from starving render at high time scales.
+const MAX_INTERACTIVE_SIM_TICKS_PER_FRAME: u32 = 64;
+const MAX_INTERACTIVE_SIM_ACCUMULATOR_TICKS: f32 = 4096.0;
 
 fn time_scale_input(
     keys: Res<ButtonInput<KeyCode>>,
