@@ -2230,6 +2230,10 @@ fn visual_debug_thermal_overlay_system(
     }
         .max(0.001);
     let time_s = time.elapsed_secs();
+    
+    // Global breathing pulse synced to overall thermal system activity (0.7 Hz)
+    let global_breath = (time_s * 0.7 * std::f32::consts::TAU).sin();
+    
     for (chunk, delta) in hottest.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES) {
         let intensity = (delta / denom).clamp(0.0, 1.0);
         let current_temp = thermal.local_temperature_by_chunk.get(&chunk).copied();
@@ -2244,19 +2248,26 @@ fn visual_debug_thermal_overlay_system(
         };
         let rate = (current_temp - prev_temp).abs().clamp(0.0, 2.0);
         let phase = chunk.0 as f32 * 0.03 + chunk.1 as f32 * 0.05;
-        let pulse = (time_s * (2.8 + rate * 4.0) + phase).sin().abs();
-        let pulse_boost = (rate * 0.2 * pulse).clamp(0.0, 0.22);
-        let alpha = (0.30 + intensity * 0.26 + pulse_boost).clamp(0.20, 0.86);
-        let color = Color::srgba(
-            0.08 + intensity * 0.92,
-            0.08 + pulse_boost * 0.25,
-            1.0 - intensity * 0.95,
-            alpha,
-        );
-        let pos = clip_to_world_bounds(chunk_to_translation(&chunk, 2.0));
+        let local_pulse = (time_s * (2.8 + rate * 4.0) + phase).sin().abs();
+        
+        // Combine local pulse with global breathing for stronger effect
+        let combined_pulse = (0.5 * local_pulse + 0.5 * (global_breath * 0.5 + 0.5)).clamp(0.0, 1.0);
+        let pulse_boost = (rate * 0.3 * combined_pulse).clamp(0.0, 0.35);
+        
+        // Intensified opacity: stronger base + stronger breathing pulse
+        let alpha = (0.40 + intensity * 0.40 + pulse_boost * 0.25).clamp(0.25, 0.95);
+        
+        // Intensified saturation: boost red/orange-red for thermal appearance
+        let red = (0.20 + intensity * 0.95).clamp(0.2, 1.0);
+        let green = (0.02 + pulse_boost * 0.30 + rate * 0.08).clamp(0.0, 0.5);
+        let blue = (0.98 - intensity * 0.92).clamp(0.1, 1.0);
+        
+        let color = Color::srgba(red, green, blue, alpha);
+        let pos = clip_to_world_bounds(chunk_to_translation(&chunk, 1.0));
+        
         commands.spawn((
             VisualDebugThermalSprite,
-            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 1.0 + pulse_boost * 4.0).max(1.0))),
+            Sprite::from_color(color, Vec2::splat((CHUNK_PIXEL - 1.0 + pulse_boost * 6.0).max(1.0))),
             Transform::from_translation(pos),
         ));
         cache.prev_temp_by_chunk.insert(chunk, current_temp);
