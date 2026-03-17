@@ -67,6 +67,7 @@ struct SimulationModeRuntime {
 struct HudFontHandle(Handle<Font>);
 
 const LIVE_STATS_FONT_SIZE: f32 = 11.0;
+const PANEL_UPDATE_THROTTLE_SECS: f32 = 0.2; // 5 Hz update rate for text rendering
 
 fn live_stats_overlay_system(
     mut commands: Commands,
@@ -183,106 +184,112 @@ fn live_stats_overlay_system(
         0.0
     };
 
-    let stats_text = format!(
-        "Live Stats\nFPS / ticks-sec: {:.1} / {:.1}\nThermal sink Δ: +{:.2}K (5s avg +{:.2}K)\nGS active coverage: {:.3}%\nHypergraph rewrite rate: {:.2}/s\nTier-4 births/deaths (5s): {}/{}",
-        local.fps,
-        local.ticks_per_sec,
-        current_delta_k,
-        thermal_avg_5s,
-        gs_coverage_pct,
-        rewrite_rate,
-        births_5s,
-        deaths_5s,
-    );
+    // Throttle expensive text rendering to 5 Hz to recover FPS
+    // Metric buffers update every frame for accuracy; display updates every 200ms
+    if now - local.last_panel_update_secs > PANEL_UPDATE_THROTTLE_SECS {
+        let stats_text = format!(
+            "Live Stats\nFPS / ticks-sec: {:.1} / {:.1}\nThermal sink Δ: +{:.2}K (5s avg +{:.2}K)\nGS active coverage: {:.3}%\nHypergraph rewrite rate: {:.2}/s\nTier-4 births/deaths (5s): {}/{}",
+            local.fps,
+            local.ticks_per_sec,
+            current_delta_k,
+            thermal_avg_5s,
+            gs_coverage_pct,
+            rewrite_rate,
+            births_5s,
+            deaths_5s,
+        );
 
-    let seq = global_clock.causal_seq();
-    let pause = if detail.scale.0 == 0.0 { " [PAUSED]" } else { "" };
-    #[cfg(debug_assertions)]
-    let hypergraph_controls = if detail.hypergraph_viz.enabled {
-        "J/K chaos  H hyper-viz:on"
-    } else {
-        "J/K chaos  H hyper-viz:off"
-    };
-    #[cfg(not(debug_assertions))]
-    let hypergraph_controls = "";
+        let seq = global_clock.causal_seq();
+        let pause = if detail.scale.0 == 0.0 { " [PAUSED]" } else { "" };
+        #[cfg(debug_assertions)]
+        let hypergraph_controls = if detail.hypergraph_viz.enabled {
+            "J/K chaos  H hyper-viz:on"
+        } else {
+            "J/K chaos  H hyper-viz:off"
+        };
+        #[cfg(not(debug_assertions))]
+        let hypergraph_controls = "";
 
-    let sim_status = format!(
-        "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}\nVisual Debug: {}",
-        seq,
-        detail.scale.0,
-        pause,
-        detail.hypergraph.chaos(),
-        hypergraph_controls,
-        if visual.enabled { "ON" } else { "OFF" }
-    );
+        let sim_status = format!(
+            "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}\nVisual Debug: {}",
+            seq,
+            detail.scale.0,
+            pause,
+            detail.hypergraph.chaos(),
+            hypergraph_controls,
+            if visual.enabled { "ON" } else { "OFF" }
+        );
 
-    let food_count = detail.food_query.iter().count();
-    let food_info = detail
-        .food_query
-        .iter()
-        .map(|(pos, f)| format!("{:?}({})", pos.chunk, f.portions))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let water_count = detail.water_query.iter().count();
-    let water_info = detail
-        .water_query
-        .iter()
-        .map(|(pos, w)| format!("{:?}({})", pos.chunk, w.portions))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let resource_lines = format!(
-        "\n\nResources:\n  Food {}: {}\n  Water {}: {}",
-        food_count, food_info, water_count, water_info,
-    );
-
-    let quest_lines = if detail.quest_board.active_quests.is_empty() {
-        "\n\nQuests: (none)".to_string()
-    } else {
-        std::iter::once("\n\nQuests:".to_string())
-            .chain(detail.quest_board.active_quests.iter().take(10).map(|q| {
-                let status = match q.status {
-                    QuestStatus::Open => "Open".to_string(),
-                    QuestStatus::Completed => "Completed".to_string(),
-                    QuestStatus::InProgress { provider } => {
-                        let provider_name = detail
-                            .pawn_names
-                            .get(provider)
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|_| format!("{:?}", provider));
-                        format!("InProgress({})", provider_name)
-                    }
-                };
-                format!("  {} @ {:?} - {}", q.need, q.chunk, status)
-            }))
+        let food_count = detail.food_query.iter().count();
+        let food_info = detail
+            .food_query
+            .iter()
+            .map(|(pos, f)| format!("{:?}({})", pos.chunk, f.portions))
             .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let activity_lines = if detail.activity.0.is_empty() {
-        "\n\nActivity: (none yet)".to_string()
-    } else {
-        std::iter::once("\n\nActivity:".to_string())
-            .chain(detail.activity.0.iter().rev().take(8).cloned())
+            .join(", ");
+        let water_count = detail.water_query.iter().count();
+        let water_info = detail
+            .water_query
+            .iter()
+            .map(|(pos, w)| format!("{:?}({})", pos.chunk, w.portions))
             .collect::<Vec<_>>()
-            .join("\n")
-    };
+            .join(", ");
+        let resource_lines = format!(
+            "\n\nResources:\n  Food {}: {}\n  Water {}: {}",
+            food_count, food_info, water_count, water_info,
+        );
 
-    let last_rewrites = detail.audit_log.last_n(5);
-    let audit_lines = if last_rewrites.is_empty() {
-        "\n\nAudit: no rewrites recorded".to_string()
-    } else {
-        std::iter::once("\n\nLast 5 rewrites:".to_string())
-            .chain(last_rewrites.iter().map(|entry| {
-                format!("  @{} - {} rewrites @ {:.1}s", entry.tick, entry.rewrite_count, entry.elapsed_secs)
-            }))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+        let quest_lines = if detail.quest_board.active_quests.is_empty() {
+            "\n\nQuests: (none)".to_string()
+        } else {
+            std::iter::once("\n\nQuests:".to_string())
+                .chain(detail.quest_board.active_quests.iter().take(10).map(|q| {
+                    let status = match q.status {
+                        QuestStatus::Open => "Open".to_string(),
+                        QuestStatus::Completed => "Completed".to_string(),
+                        QuestStatus::InProgress { provider } => {
+                            let provider_name = detail
+                                .pawn_names
+                                .get(provider)
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|_| format!("{:?}", provider));
+                            format!("InProgress({})", provider_name)
+                        }
+                    };
+                    format!("  {} @ {:?} - {}", q.need, q.chunk, status)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
-    let stats_text = format!(
-        "{}{}{}{}{}{}",
-        stats_text, sim_status, resource_lines, quest_lines, activity_lines, audit_lines
-    );
+        let activity_lines = if detail.activity.0.is_empty() {
+            "\n\nActivity: (none yet)".to_string()
+        } else {
+            std::iter::once("\n\nActivity:".to_string())
+                .chain(detail.activity.0.iter().rev().take(8).cloned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let last_rewrites = detail.audit_log.last_n(5);
+        let audit_lines = if last_rewrites.is_empty() {
+            "\n\nAudit: no rewrites recorded".to_string()
+        } else {
+            std::iter::once("\n\nLast 5 rewrites:".to_string())
+                .chain(last_rewrites.iter().map(|entry| {
+                    format!("  @{} - {} rewrites @ {:.1}s", entry.tick, entry.rewrite_count, entry.elapsed_secs)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let full_text = format!(
+            "{}{}{}{}{}{}",
+            stats_text, sim_status, resource_lines, quest_lines, activity_lines, audit_lines
+        );
+        local.cached_stats_text = full_text;
+        local.last_panel_update_secs = now;
+    }
 
     if !visual.enabled {
         if let Ok((_, _, mut vis)) = panel_queries.p0().single_mut() {
@@ -295,7 +302,7 @@ fn live_stats_overlay_system(
     }
 
     if let Ok((mut text, mut text_font, mut vis)) = panel_queries.p0().single_mut() {
-        text.0 = stats_text;
+        text.0 = local.cached_stats_text.clone();
         text_font.font = hud_font.0.clone();
         text_font.font_size = LIVE_STATS_FONT_SIZE;
         text_font.font_smoothing = FontSmoothing::AntiAliased;
@@ -318,7 +325,7 @@ fn live_stats_overlay_system(
         ))
         .with_children(|parent| {
             parent.spawn((
-                Text::new(stats_text),
+                Text::new(local.cached_stats_text.clone()),
                 TextFont {
                     font: hud_font.0.clone(),
                     font_size: LIVE_STATS_FONT_SIZE,
@@ -359,6 +366,8 @@ struct LiveStatsPanelLocal {
     thermal_delta_samples: VecDeque<(f32, f32)>,
     hyper_rewrite_samples: VecDeque<(f32, u64)>,
     tier4_birth_death_samples: VecDeque<(f32, u64, u64)>,
+    last_panel_update_secs: f32,
+    cached_stats_text: String,
 }
 
 #[derive(Resource, Default)]
