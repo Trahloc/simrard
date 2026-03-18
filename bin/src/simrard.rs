@@ -240,7 +240,7 @@ fn live_stats_overlay_system(
         let hypergraph_controls = "";
 
         let sim_status = format!(
-            "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  U rules  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} (surv: {:.2}) {}\nVisual Debug: {}",
+            "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: [ ] speed  P pause  V visual  R rule-viz  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} (surv: {:.2}) {}\nVisual Debug: {}",
             seq,
             detail.scale.0,
             pause,
@@ -313,7 +313,10 @@ fn live_stats_overlay_system(
                 .join("\n")
         };
 
-        let rule_lines = if rule_viz.enabled {
+        let rule_lines = if rule_viz.mode == 0 {
+            "\n\nRules: [R to show]".to_string()
+        } else if rule_viz.mode == 1 {
+            // Mode 1: Effective Probability visualization
             let rules = detail.hypergraph.rules();
             let chaos = detail.hypergraph.chaos();
             let mut scored: Vec<_> = rules.iter()
@@ -323,14 +326,25 @@ fn live_stats_overlay_system(
                 })
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            std::iter::once(format!("\n\nRules (U to hide  surv-chaos:{:.2}):", chaos))
+            std::iter::once(format!("\n\nRules Mode 1: Effective Probability (R cycles  surv-chaos:{:.2}):", chaos))
                 .chain(scored.iter().take(5).map(|(r, eff)| {
                     format!("  {:<20} p:{:.2} eff:{:.2}", r.name, r.probability, eff)
                 }))
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
-            "\n\nRules: [U to show]".to_string()
+            // Mode 2: Survival Score visualization
+            let chaos = detail.hypergraph.chaos();
+            let mut scored: Vec<_> = rule_viz.per_rule_survival_scores.iter()
+                .map(|(name, score)| (name.clone(), *score))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            std::iter::once(format!("\n\nRules Mode 2: Survival Score (R cycles  surv-chaos:{:.2}):", chaos))
+                .chain(scored.iter().take(5).map(|(name, score)| {
+                    format!("  {:<20} survival:{:+.4}", name, score)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
 
         let full_text = format!(
@@ -427,12 +441,23 @@ struct HypergraphRuntimeStats {
 
 #[derive(Resource, Default)]
 struct RuleVizState {
-    enabled: bool,
+    /// Visualization mode: 0=off, 1=effective probability, 2=survival score.
+    mode: u8,
     /// Survival chaos applied on the last tick (for panel display).
     last_survival_chaos: f32,
+    /// Per-rule survival scores: EMA of (post_rewrite_energy_delta / baseline_energy).
+    /// Updated each tick when rewrites occur.
+    per_rule_survival_scores: Vec<(String, f32)>,
+    /// Fire counts per rule for diagnostics (reset periodically).
+    rule_fire_counts: Vec<u64>,
+    /// Baseline avg energy from last tick (used for survival delta computation).
+    last_baseline_energy: f32,
 }
 
+const RULE_SURVIVAL_EMA_ALPHA: f32 = 0.1; // How fast survival scores adapt to new data
+
 #[derive(Resource, Default)]
+#[allow(dead_code)]
 struct Tier5DiagnosticsSystem {
     active: bool,
 }
@@ -2392,8 +2417,8 @@ fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMu
 }
 
 fn rule_viz_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut rule_viz: ResMut<RuleVizState>) {
-    if keys.just_pressed(KeyCode::KeyU) {
-        rule_viz.enabled = !rule_viz.enabled;
+    if keys.just_pressed(KeyCode::KeyR) {
+        rule_viz.mode = (rule_viz.mode + 1) % 3; // Cycle: 0 (off) → 1 (prob) → 2 (survival) → 0
     }
 }
 
@@ -4222,6 +4247,15 @@ fn hypergraph_tick_system(
         rule_viz.last_survival_chaos = survival_chaos;
     }
 
+    // Capture baseline energy for per-rule survival delta computation.
+    let baseline_avg_energy = if tier4.insects.is_empty() {
+        0.0_f32
+    } else {
+        let sum: f32 = tier4.insects.iter().map(|i| i.energy).sum();
+        sum / (tier4.insects.len() as f32 * 8.0)
+    };
+    rule_viz.last_baseline_energy = baseline_avg_energy;
+
     let seq = global_clock.causal_seq();
     let patch_chunk_size = substrate.config().patch_chunk_size;
     let mut active_handles: Vec<LeaseHandle> = Vec::new();
@@ -4301,6 +4335,43 @@ fn hypergraph_tick_system(
             description: format!("{} rewrites", stats.rewritten),
         };
         audit_log.push(entry);
+    }
+
+    // Per-rule survival score tracking: compute energy delta and update EMA for each rule.
+    {
+        let post_avg_energy = if tier4.insects.is_empty() {
+            0.0_f32
+        } else {
+            let sum: f32 = tier4.insects.iter().map(|i| i.energy).sum();
+            sum / (tier4.insects.len() as f32 * 8.0)
+        };
+
+        let survival_delta = if rule_viz.last_baseline_energy > 0.0 {
+            (post_avg_energy - rule_viz.last_baseline_energy) / rule_viz.last_baseline_energy
+        } else {
+            0.0_f32
+        };
+
+        // Initialize per-rule scores if empty (first tick or first enabling of viz).
+        if rule_viz.per_rule_survival_scores.is_empty() {
+            for rule in substrate.rules() {
+                rule_viz.per_rule_survival_scores.push((rule.name.clone(), 0.0_f32));
+                rule_viz.rule_fire_counts.push(0u64);
+            }
+        }
+
+        // Update per-rule survival scores with EMA; weight by rule fire probability.
+        if stats.rewritten > 0 && !rule_viz.per_rule_survival_scores.is_empty() {
+            let chaos = substrate.chaos();
+            for (_idx, (rule_name, score_ref)) in rule_viz.per_rule_survival_scores.iter_mut().enumerate() {
+                // Find the rule to get its effective probability.
+                if let Some(rule) = substrate.rules().iter().find(|r| r.name == *rule_name) {
+                    let eff_prob = (rule.probability * (0.5 + chaos)).clamp(0.0, 1.0);
+                    let weighted_delta = survival_delta * eff_prob;
+                    *score_ref = *score_ref * (1.0 - RULE_SURVIVAL_EMA_ALPHA) + weighted_delta * RULE_SURVIVAL_EMA_ALPHA;
+                }
+            }
+        }
     }
 
     if let Some(ref mut report) = report {
@@ -4550,9 +4621,7 @@ fn time_scale_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut scale: ResMut<SimTimeScale>,
 ) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        scale.0 = 1.0;
-    }
+    // R-key repurposed for rule visualization cycling; speed reset removed
     if keys.just_pressed(KeyCode::BracketRight) {
         scale.0 = (scale.0 * 1.5).min(MAX_SCALE);
     }
