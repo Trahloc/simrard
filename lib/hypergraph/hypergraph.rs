@@ -212,9 +212,17 @@ impl HypergraphSubstrate {
         self.config.chaos = chaos.clamp(0.0, 1.0);
     }
 
-        pub fn rules(&self) -> &[RewriteRule] {
-            &self.rules
-        }
+    pub fn rules(&self) -> &[RewriteRule] {
+        &self.rules
+    }
+
+    pub fn reinforce_rule(&mut self, rule_name: &str, delta: f32) -> bool {
+        let Some(rule) = self.rules.iter_mut().find(|rule| rule.name == rule_name) else {
+            return false;
+        };
+        rule.probability = (rule.probability + delta).clamp(0.05, 0.95);
+        true
+    }
 
 
     pub fn set_interval_ticks(&mut self, interval_ticks: u64) {

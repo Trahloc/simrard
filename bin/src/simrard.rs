@@ -340,8 +340,18 @@ fn live_stats_overlay_system(
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             std::iter::once(format!("\n\nRules Mode 2: Survival Score (R cycles  surv-chaos:{:.2}):", chaos))
+                .chain(std::iter::once(format!(
+                    "  Survival Fitness: {:.2} | Reinforced: {} rules",
+                    rule_viz.survival_fitness,
+                    rule_viz.reinforcements_this_cycle
+                )))
                 .chain(scored.iter().take(5).map(|(name, score)| {
-                    format!("  {:<20} survival:{:+.4}", name, score)
+                    let reinforced = if rule_viz.reinforced_rule_names.iter().any(|n| n == name) {
+                        "  ↑ reinforced"
+                    } else {
+                        ""
+                    };
+                    format!("  {:<20} survival:{:+.4}{}", name, score, reinforced)
                 }))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -452,14 +462,19 @@ struct RuleVizState {
     rule_fire_counts: Vec<u64>,
     /// Baseline avg energy from last tick (used for survival delta computation).
     last_baseline_energy: f32,
+    /// Number of rules reinforced during the most recent Tier-5 cycle.
+    reinforcements_this_cycle: u32,
+    /// Mean survival score across all tracked rules.
+    survival_fitness: f32,
+    /// Rule names reinforced during the most recent Tier-5 cycle.
+    reinforced_rule_names: Vec<String>,
 }
 
 const RULE_SURVIVAL_EMA_ALPHA: f32 = 0.1; // How fast survival scores adapt to new data
 
 #[derive(Resource, Default)]
-#[allow(dead_code)]
-struct Tier5DiagnosticsSystem {
-    active: bool,
+struct Tier5ReinforcementState {
+    last_reinforcement_tick: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -695,7 +710,7 @@ fn run_interactive() {
         .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<HypergraphAuditLog>()
         .init_resource::<RuleVizState>()
-        .init_resource::<Tier5DiagnosticsSystem>()
+        .init_resource::<Tier5ReinforcementState>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<Tier4State>()
@@ -777,7 +792,7 @@ fn run_interactive() {
         .add_systems(Update, visual_debug_hypergraph_overlay_system)
         .add_systems(Update, live_stats_overlay_system)
         .add_systems(Update, rule_viz_toggle_system)
-        .add_systems(Update, tier5_diagnostics_placeholder_system.run_if(|v: Res<VisualDebug>| v.enabled))
+        .add_systems(Update, tier5_reinforcement_system)
         .add_systems(Update, visual_debug_profiler_report_system);
 
     // Phase 4.D1: Push ECS snapshot to DuckDB mirror after Update (post visual sync).
@@ -872,7 +887,7 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<HypergraphAuditLog>()
         .init_resource::<RuleVizState>()
-        .init_resource::<Tier5DiagnosticsSystem>()
+        .init_resource::<Tier5ReinforcementState>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<RespawnState>()
@@ -2422,11 +2437,49 @@ fn rule_viz_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut rule_viz: ResMut<
     }
 }
 
-fn tier5_diagnostics_placeholder_system(
-    _rule_viz: Res<RuleVizState>,
-    _tier5: Res<Tier5DiagnosticsSystem>,
+fn tier5_reinforcement_system(
+    global_clock: Res<GlobalTickClock>,
+    time: Res<Time>,
+    mut substrate: ResMut<HypergraphSubstrate>,
+    mut rule_viz: ResMut<RuleVizState>,
+    mut audit_log: ResMut<HypergraphAuditLog>,
+    mut state: ResMut<Tier5ReinforcementState>,
 ) {
-    // Tier-5 diagnostics hook — placeholder for next sprint
+    let seq = global_clock.causal_seq();
+    if seq == 0 || seq % 100 != 0 || state.last_reinforcement_tick == seq {
+        return;
+    }
+
+    let mut ranked_scores: Vec<(String, f32)> = rule_viz
+        .per_rule_survival_scores
+        .iter()
+        .map(|(name, score)| (name.clone(), *score))
+        .collect();
+    ranked_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mean_score = if ranked_scores.is_empty() {
+        0.0
+    } else {
+        ranked_scores.iter().map(|(_, score)| *score).sum::<f32>() / ranked_scores.len() as f32
+    };
+    rule_viz.survival_fitness = mean_score;
+
+    let mut reinforced_rule_names = Vec::new();
+    for (rule_name, _) in ranked_scores.into_iter().take(3) {
+        if substrate.reinforce_rule(&rule_name, 0.005) {
+            reinforced_rule_names.push(rule_name.clone());
+            audit_log.push(HypergraphAuditEntry {
+                tick: seq,
+                elapsed_secs: time.elapsed_secs(),
+                rewrite_count: 0,
+                description: format!("Tier-5 reinforced {} -> +0.005", rule_name),
+            });
+        }
+    }
+
+    rule_viz.reinforcements_this_cycle = reinforced_rule_names.len() as u32;
+    rule_viz.reinforced_rule_names = reinforced_rule_names;
+    state.last_reinforcement_tick = seq;
 }
 
 fn visual_debug_insect_overlay_system(
