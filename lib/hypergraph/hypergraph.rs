@@ -216,6 +216,10 @@ impl HypergraphSubstrate {
         &self.rules
     }
 
+    pub fn rules_mut(&mut self) -> &mut [RewriteRule] {
+        &mut self.rules
+    }
+
     pub fn reinforce_rule(&mut self, rule_name: &str, delta: f32) -> bool {
         let Some(rule) = self.rules.iter_mut().find(|rule| rule.name == rule_name) else {
             return false;

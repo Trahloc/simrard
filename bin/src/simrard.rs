@@ -333,10 +333,17 @@ fn live_stats_overlay_system(
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
-            // Mode 2: Survival Score visualization
+            // Mode 2: Survival Score visualization with current rule probabilities
             let chaos = detail.hypergraph.chaos();
+            let rules = detail.hypergraph.rules();
             let mut scored: Vec<_> = rule_viz.per_rule_survival_scores.iter()
-                .map(|(name, score)| (name.clone(), *score))
+                .map(|(name, score)| {
+                    let current_prob = rules.iter()
+                        .find(|r| &r.name == name)
+                        .map(|r| r.probability)
+                        .unwrap_or(0.0);
+                    (name.clone(), *score, current_prob)
+                })
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             std::iter::once(format!("\n\nRules Mode 2: Survival Score (R cycles  surv-chaos:{:.2}):", chaos))
@@ -345,13 +352,13 @@ fn live_stats_overlay_system(
                     rule_viz.survival_fitness,
                     rule_viz.reinforcements_this_cycle
                 )))
-                .chain(scored.iter().take(5).map(|(name, score)| {
+                .chain(scored.iter().take(5).map(|(name, score, prob)| {
                     let reinforced = if rule_viz.reinforced_rule_names.iter().any(|n| n == name) {
-                        "  ↑ reinforced"
+                        "  ↑"
                     } else {
                         ""
                     };
-                    format!("  {:<20} survival:{:+.4}{}", name, score, reinforced)
+                    format!("  {:<20} p:{:.2} surv:{:+.4}{}", name, prob, score, reinforced)
                 }))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -793,6 +800,7 @@ fn run_interactive() {
         .add_systems(Update, live_stats_overlay_system)
         .add_systems(Update, rule_viz_toggle_system)
         .add_systems(Update, tier5_reinforcement_system)
+        .add_systems(Update, tier5_natural_decay_system)
         .add_systems(Update, visual_debug_profiler_report_system);
 
     // Phase 4.D1: Push ECS snapshot to DuckDB mirror after Update (post visual sync).
@@ -2467,6 +2475,12 @@ fn tier5_reinforcement_system(
     let mut reinforced_rule_names = Vec::new();
     for (rule_name, _) in ranked_scores.into_iter().take(3) {
         if substrate.reinforce_rule(&rule_name, 0.005) {
+            let new_prob = substrate.rules()
+                .iter()
+                .find(|r| r.name == rule_name)
+                .map(|r| r.probability)
+                .unwrap_or(0.0);
+            println!("[Tier-5] Reinforced '{}' (+0.005 → p:{:.3})", rule_name, new_prob);
             reinforced_rule_names.push(rule_name.clone());
             audit_log.push(HypergraphAuditEntry {
                 tick: seq,
@@ -2480,6 +2494,29 @@ fn tier5_reinforcement_system(
     rule_viz.reinforcements_this_cycle = reinforced_rule_names.len() as u32;
     rule_viz.reinforced_rule_names = reinforced_rule_names;
     state.last_reinforcement_tick = seq;
+}
+
+fn tier5_natural_decay_system(
+    global_clock: Res<GlobalTickClock>,
+    time: Res<Time>,
+    mut substrate: ResMut<HypergraphSubstrate>,
+    mut audit_log: ResMut<HypergraphAuditLog>,
+) {
+    let seq = global_clock.causal_seq();
+    if seq == 0 || seq % 200 != 0 {
+        return;
+    }
+
+    // Apply natural decay: reduce all rule probabilities by 0.001 (floor at 0.05)
+    for rule in substrate.rules_mut() {
+        rule.probability = (rule.probability - 0.001).max(0.05);
+    }
+    audit_log.push(HypergraphAuditEntry {
+        tick: seq,
+        elapsed_secs: time.elapsed_secs(),
+        rewrite_count: 0,
+        description: "Tier-5 natural decay applied (-0.001 to all rules)".to_string(),
+    });
 }
 
 fn visual_debug_insect_overlay_system(
