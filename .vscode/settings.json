@@ -1,0 +1,14 @@
+{
+  "files.exclude": {
+    ".cursor": false
+  },
+  "chat.tools.terminal.autoApprove": {
+    "cargo test": true,
+    "cargo build": true,
+    "cargo run": true,
+    "cargo search": true,
+    "cargo check": true,
+    "git add": true,
+    "git commit": true
+  }
+}

@@ -1,0 +1,187 @@
+---
+description: Complete rust-2026-Trahloc (r2026t) workspace convention — layout, naming, Cargo config, features, testing, and tooling. Supersedes rust-r2025t. Use when working in any r2026t Rust workspace.
+alwaysApply: false
+---
+
+# rust-r2026t Workspace Convention
+
+The **rust-2026-Trahloc Microcrate Convention (r2026t)** is a strict layout, naming, and configuration standard. Supersedes r2025t — layout invariants unchanged; r2026t adds centralized dep/lint config and toolchain pinning.
+
+## The Uniqueness Invariant
+
+> For every crate directory `X/`, the root module is `X.rs` (flattened) or `src/X.rs` (binary only).
+
+**Banned**: `mod.rs` (strictly forbidden everywhere) · `lib.rs`/`main.rs` as logic containers (max 5 lines as tooling redirects only).
+
+Never name a crate `core` — shadows `std::core`. Use `common`, `shared`, or `kernel`.
+
+## Workspace Structure
+
+```
+<root>/
+├── Cargo.toml              # workspace root
+├── rust-toolchain.toml     # toolchain pin (r2026t)
+├── .cargo/config.toml      # linker + sccache
+├── bin/                    # binary (uses src/)
+├── lib/                    # shared microcrates (no src/)
+├── tests/                  # integration test crate
+└── command/                # optional: CLI verb crates
+```
+
+## Workspace Cargo.toml (canonical template)
+
+```toml
+[workspace]
+members = ["bin", "lib/*", "tests"]
+resolver = "2"
+
+[workspace.dependencies]           # centralized dep versions (r2026t)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[workspace.lints.rust]             # workspace-wide lint policy (r2026t)
+unused_imports = "deny"
+dead_code = "deny"
+unused_variables = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 2
+```
+
+## Member Crate Cargo.toml (template)
+
+```toml
+[package]
+name = "myapp-lib-common"
+version = "0.1.0"
+edition = "2024"
+publish = false              # all internal crates (r2026t)
+
+[lib]
+name = "myapp_lib_common"
+path = "common.rs"           # explicit path; no src/
+
+[lints]
+workspace = true             # inherit [workspace.lints] (r2026t)
+
+[dependencies]
+serde = { workspace = true } # inherit version from workspace
+myapp-lib-other = { path = "../other" }  # path deps stay per-crate
+```
+
+## rust-toolchain.toml
+
+```toml
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+```
+
+## Crate Naming
+
+`<project>-<kind>-<tld>` — `<kind>` is `bin`, `lib`, `tests`, or `command`.
+
+| Dir | Package | Lib/Bin Name |
+|---|---|---|
+| `bin/` | `myapp-bin` | binary `myapp` |
+| `lib/common/` | `myapp-lib-common` | `myapp_lib_common` |
+| `tests/` | `myapp-tests` | `myapp_tests` |
+
+## Feature Flag Strategy
+
+Features flow **downward binary → libs. Never upward.**
+
+```toml
+[features]
+default = ["install"]
+install = ["myapp-command-install"]
+verbose-logging = ["myapp-lib-common/logging"]  # propagated
+
+[dependencies]
+myapp-command-install = { path = "../command/install", optional = true }
+```
+
+## Microcrate Splitting Criteria
+
+Split only when a threshold is met — NOT by line count:
+
+| # | Criterion |
+|---|---|
+| 1 | Type Proliferation: 3+ non-trivial public types/traits |
+| 2 | Dependency Isolation: heavy dep nothing else needs |
+| 3 | Test Divergence: materially different fixtures/setup |
+| 4 | Independent Versioning: separate semver/feature-gating |
+| 5 | Collaboration Boundary: two devs/agents work simultaneously |
+
+**Goal**: Change one file → rebuild one crate → tests in < 2s.
+**Path**: Module → Nested Microcrate → `lib/<name>/` (promoted library)
+
+## Testing
+
+**Unit tests**: In-file `#[cfg(test)] mod tests { ... }`. Never in separate files.
+
+**Integration tests**: Workspace crate `tests/` (NOT bare Cargo test folder):
+
+```toml
+# tests/Cargo.toml
+[package]
+name = "myapp-tests"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[[test]]
+name = "integration"
+path = "integration.rs"
+```
+
+```bash
+cargo test -p myapp-lib-common   # unit tests
+cargo test -p myapp-tests        # integration tests
+cargo test --workspace           # everything
+```
+
+## Tooling
+
+```toml
+# .cargo/config.toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[build]
+rustc-wrapper = "sccache"
+```
+
+```bash
+cargo watch -x check                        # continuous type checking
+cargo watch -x "test -p myapp-lib-common"   # test on save
+```
+
+## External Repositories
+
+Cloned third-party repositories (for reference, patching, or upstream PRs) MUST be placed in the `/external/` directory.
+
+The standard `.gitignore` ensures that the massive histories and files of these third-party repos do not pollute the workspace's version control. However, we explicitly track ALL `README.md` files within `external/` as breadcrumbs. The root `external/README.md` acts as an index of what repos we have and why, and the individual `external/<repo>/README.md` files are the original upstream readmes kept to provide context on the clone.
+
+## r2026t vs r2025t Delta
+
+| Area | r2025t | r2026t |
+|---|---|---|
+| Dep versions | per-crate only | `[workspace.dependencies]` + `{ workspace = true }` |
+| Lint config | `.cargo/config.toml` rustflags | `[workspace.lints]` + `[lints] workspace = true` |
+| Toolchain | unspecified | `rust-toolchain.toml` |
+| `publish = false` | `tests/` only | all internal crates |
+| Edition | mixed 2021/2024 | 2024 everywhere |
+| Layout | ✓ | unchanged |
