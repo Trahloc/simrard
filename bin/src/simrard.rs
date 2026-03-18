@@ -2519,6 +2519,9 @@ fn tier5_natural_decay_system(
     });
 }
 
+// TODO: Move Tier-5 reinforcement/decay policy logic into a dedicated lib crate module and keep
+// this binary function as orchestration-only wiring to satisfy r2026t crate-boundary guidance.
+
 fn visual_debug_insect_overlay_system(
     visual: Res<VisualDebug>,
     scale: Res<SimTimeScale>,
