@@ -1,0 +1,176 @@
+---
+description: Baseline agent behavior — fail-fast, warnings-as-errors, git safety, TODO conventions, repo orientation, and run-with-timeout. Applies to all repos.
+alwaysApply: true
+---
+
+# Baseline Agent Practices
+
+**Precedence**: If the project has `CONTRIBUTING.md`, `AGENTS.md`, or equivalent, follow that first. These are universal defaults.
+
+## Orientation Before Coding
+
+1. Run `git remote -v` to classify repo topology:
+   - **Upstream clone** (origin push = `UPSTREAM_DO_NOT_PUSH`): push to `fork` remote
+   - **Own fork / personal**: push to `origin` normally
+2. Scan for guidance (stop at first match per category):
+   - AI rules: `AGENTS.md`, `CLAUDE.md`, `.agents/`, `.cursorrules`
+   - Contribution: `.github/CONTRIBUTING.md`, `CONTRIBUTING.md`
+   - PR template: `.github/PULL_REQUEST_TEMPLATE.md`
+3. Discover build/test/lint commands (`package.json`, `Makefile`, `Cargo.toml`, etc.)
+4. Run existing checks before making changes. Verify the build passes.
+
+## Fail-Fast Policy
+
+**No silent fallbacks for systems we control.** Fail immediately on errors.
+
+```text
+ERROR: [Component] [Operation] failed
+CAUSE: [Root cause or violated invariant]
+CONTEXT: File: [path:line], Variable: [name=value], State: [state]
+REQUIRED ACTION: [What to fix]
+DIAGNOSTIC: [Info or command]
+```
+
+Strict modes: `set -euo pipefail` (Bash), strict `tsconfig.json`. Never `|| true` or `except: pass`.
+
+**External dependencies only**: Silent fallback acceptable for network/API calls — but MUST log a loud `WARNING` first.
+
+```bash
+# ✅ External fallback with warning
+if ! fetch_external; then
+    echo "WARNING: External unreachable — using fallback
+CAUSE: Timeout / REQUIRED ACTION: Check network." >&2
+    use_local_fallback
+fi
+```
+
+```bash
+# ❌ Silent internal fallback — forbidden
+[ -f "$CONFIG" ] && source "$CONFIG" || source "/default/config"
+
+# ✅ Loud internal failure
+[ -f "$CONFIG" ] || { echo "ERROR: Config missing\nREQUIRED ACTION: Create $CONFIG" >&2; exit 1; }
+source "$CONFIG"
+```
+
+## Warnings as Errors
+
+Treat warnings as build-failing errors. Never suppress without user approval.
+
+| ❌ Do NOT | ✅ Do Instead |
+|---|---|
+| `#[allow(unused)]` | Fix or stub + `TODO` |
+| `@ts-ignore` | `@ts-expect-error` with detailed comment |
+| `# type: ignore` | `mypy --warn-error` in CI |
+
+Approved suppressions require a dated `TODO`:
+```rust
+// User approved (2026-03-14): Deferred per #42.
+// TODO(2026-04-14): Remove once feature lands.
+#[allow(dead_code)]
+pub fn stub() {}
+```
+
+## Tech Debt Tracking
+
+| Marker | Purpose |
+|---|---|
+| `TODO:` | Future work |
+| `FIXME:` | Known bugs |
+| `NOTE:` | Non-obvious context |
+| `HACK:` | Temporary workarounds |
+
+**ISO Date Required** for `HACK`, `FIXME`, and `TODO` on temporary/disabled features:
+```
+// HACK(2026-03-14): Workaround for upstream bug #1234
+// TODO(2026-03-14): Re-enable caching after migration
+```
+
+**30-Day Rule**: When you encounter a dated marker older than 30 days, tell the user: how old it is, what it says, recommend reinvestigating.
+
+## Git Safety
+
+**Hard rules:**
+- **NEVER commit on `main`/`master`** — always work on a named branch
+- **NEVER force-push** unless explicitly asked
+- Run `git branch --show-current` before any commit; if on default, branch first
+
+**Branch naming:**
+
+| Purpose | Pattern |
+|---|---|
+| Feature PR | `trahloc/feat/<name>` |
+| Fix PR | `trahloc/fix/<name>` |
+| Local throwaway | `local/<name>` |
+
+**Commits**: Conventional Commits (`feat:`, `fix:`, `chore:`). Explain *why*.
+
+**PR workflow:**
+```bash
+git fetch origin && git checkout -b trahloc/feat/<name> origin/main
+# work, commit
+git fetch origin && git rebase origin/main
+git push fork trahloc/feat/<name> -u   # upstream clone
+git push origin trahloc/feat/<name> -u # fork/personal
+```
+
+**Upstream clone setup:**
+```bash
+git config --local remote.origin.pushurl UPSTREAM_DO_NOT_PUSH
+git remote add fork git@github.com:trahloc/<repo>.git
+git checkout -b local/run origin/main
+```
+
+## Local File Management
+
+Local configs belong in `.git/info/exclude` (not `.gitignore`) so they don't pollute upstream. Some repos commit these intentionally — check before excluding.
+
+## Filesystem Operations
+
+**Directory moves — rename, don't scatter.**
+When moving an entire directory, rename it atomically. Never use glob patterns (`mv dir/* dst/`) — they silently skip dotfiles (`.git`, `.gitignore`, etc.) and destroy git history.
+
+```bash
+# ✅ Rename whole directory — preserves all dotfiles including .git
+mv old_name/ new_location/old_name
+
+# ❌ Glob scatter — silently drops .git and other dotfiles
+mv old_name/* new_location/old_name/
+```
+
+**Foreign directories — audit before writing.**
+Before creating or overwriting any file inside a directory you did not create (e.g., an upstream clone, vendored library, or `external/` subdirectory), run `ls -la` first. Treat existing files as immutable unless explicitly instructed to modify them.
+
+```bash
+# ✅ Audit first
+ls -la external/some-upstream/
+# Only then create a new file, never overwrite existing ones
+echo "# index" > external/some-upstream/NOTES.md
+
+# ❌ Blindly overwrite upstream's own README
+echo "my notes" > external/some-upstream/README.md
+```
+
+## Run Programs With Timeout
+
+When running a program or command that could block (e.g. `cargo run`, dev servers, tests, scripts), use a **reasonable timeout** so the run doesn't hang indefinitely.
+
+| Context | Timeout (guideline) |
+|---|---|
+| Builds / short commands | ~30–60 s |
+| Tests | 60–120 s (or project default) |
+| Dev servers / interactive apps | 5–15 s if only confirming startup; use background or no timeout only when the user explicitly wants a long-lived process |
+
+Prefer the runner's timeout (e.g. `timeout` in scripts, or the `timeout` parameter when invoking run/exec).
+
+## MDC Rules Configuration
+
+All `.mdc` files must have YAML frontmatter:
+```yaml
+---
+description: When this rule applies.
+alwaysApply: true|false
+---
+```
+
+Only use `alwaysApply: true` for short, globally applicable rules (< 50 lines). Use `false` for language/domain-specific rules — Cursor loads them contextually.
