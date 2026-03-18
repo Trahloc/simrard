@@ -27,6 +27,7 @@ pub enum DriveType {
 /// Order of variants does not imply priority — the queue orders by `causal_seq`.
 pub enum CausalEventKind {
     DriveThresholdCrossed { entity: Entity, drive: DriveType },
+    LeaseDenied { entity: Entity, chunk: ChunkId, component: TypeId },
     LeaseReleased { chunk: ChunkId, component: TypeId },
     ResourceDepleted { chunk: ChunkId },
     DiscoveryPropagated { recipe: String, from: Entity, to: Entity },

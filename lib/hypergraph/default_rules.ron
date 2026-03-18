@@ -1,0 +1,23 @@
+[
+  (
+    name: "fractal_branch",
+    pattern: Triangle,
+    replacement: AddNodeWithEdges(arity: 3),
+    probability: 0.185,
+    bias: High,
+  ),
+  (
+    name: "steady_merge",
+    pattern: Line,
+    replacement: Merge,
+    probability: 0.110,
+    bias: Low,
+  ),
+  (
+    name: "split_cycle",
+    pattern: Cycle,
+    replacement: Split,
+    probability: 0.140,
+    bias: Neutral,
+  ),
+]

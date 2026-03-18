@@ -1,0 +1,18 @@
+[package]
+name = "simrard-lib-hypergraph"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "simrard_lib_hypergraph"
+path = "hypergraph.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+serde = { workspace = true }
+rand = { version = "0.8", features = ["small_rng"] }
+ron = "0.8"
