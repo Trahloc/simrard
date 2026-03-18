@@ -51,6 +51,7 @@ static TIER10_ENABLED: OnceLock<bool> = OnceLock::new();
 static HEADLESS_SUBSTRATE: OnceLock<bool> = OnceLock::new();
 static BENCHMARK_SECONDS: OnceLock<f64> = OnceLock::new();
 static INTERACTIVE_WITH_TIER1: OnceLock<bool> = OnceLock::new();
+static INITIAL_SIM_SPEED: OnceLock<f32> = OnceLock::new();
 
 #[derive(Resource, Debug, Clone, Copy)]
 struct VisualDebug {
@@ -67,6 +68,34 @@ struct SimulationModeRuntime {
 struct HudFontHandle(Handle<Font>);
 
 const LIVE_STATS_FONT_SIZE: f32 = 11.0;
+const PANEL_UPDATE_THROTTLE_SECS: f32 = 0.2; // 5 Hz update rate for text rendering
+
+#[derive(Resource)]
+struct InsectSpritePool {
+    entities: Vec<Entity>,
+    active_count: usize,
+}
+
+impl InsectSpritePool {
+    fn new(entities: Vec<Entity>) -> Self {
+        Self {
+            entities,
+            active_count: 0,
+        }
+    }
+    
+    fn get_active(&self, idx: usize) -> Option<Entity> {
+        if idx < self.entities.len() {
+            Some(self.entities[idx])
+        } else {
+            None
+        }
+    }
+    
+    fn set_active_count(&mut self, count: usize) {
+        self.active_count = count.min(self.entities.len());
+    }
+}
 
 fn live_stats_overlay_system(
     mut commands: Commands,
@@ -85,6 +114,7 @@ fn live_stats_overlay_system(
     )>,
     mut local: Local<LiveStatsPanelLocal>,
     detail: LiveStatsDetailParams,
+    rule_viz: Res<RuleVizState>,
 ) {
     let (cam_x, cam_y, area_max_x, area_max_y) = match camera_query.single() {
         Ok((transform, Projection::Orthographic(ortho))) => (
@@ -183,106 +213,164 @@ fn live_stats_overlay_system(
         0.0
     };
 
-    let stats_text = format!(
-        "Live Stats\nFPS / ticks-sec: {:.1} / {:.1}\nThermal sink Δ: +{:.2}K (5s avg +{:.2}K)\nGS active coverage: {:.3}%\nHypergraph rewrite rate: {:.2}/s\nTier-4 births/deaths (5s): {}/{}",
-        local.fps,
-        local.ticks_per_sec,
-        current_delta_k,
-        thermal_avg_5s,
-        gs_coverage_pct,
-        rewrite_rate,
-        births_5s,
-        deaths_5s,
-    );
+    // Throttle expensive text rendering to 5 Hz to recover FPS
+    // Metric buffers update every frame for accuracy; display updates every 200ms
+    if now - local.last_panel_update_secs > PANEL_UPDATE_THROTTLE_SECS {
+        let stats_text = format!(
+            "Live Stats\nFPS / ticks-sec: {:.1} / {:.1}\nThermal sink Δ: +{:.2}K (5s avg +{:.2}K)\nGS active coverage: {:.3}%\nHypergraph rewrite rate: {:.2}/s\nTier-4 births/deaths (5s): {}/{}",
+            local.fps,
+            local.ticks_per_sec,
+            current_delta_k,
+            thermal_avg_5s,
+            gs_coverage_pct,
+            rewrite_rate,
+            births_5s,
+            deaths_5s,
+        );
 
-    let seq = global_clock.causal_seq();
-    let pause = if detail.scale.0 == 0.0 { " [PAUSED]" } else { "" };
-    #[cfg(debug_assertions)]
-    let hypergraph_controls = if detail.hypergraph_viz.enabled {
-        "J/K chaos  H hyper-viz:on"
-    } else {
-        "J/K chaos  H hyper-viz:off"
-    };
-    #[cfg(not(debug_assertions))]
-    let hypergraph_controls = "";
+        let seq = global_clock.causal_seq();
+        let pause = if detail.scale.0 == 0.0 { " [PAUSED]" } else { "" };
+        #[cfg(debug_assertions)]
+        let hypergraph_controls = if detail.hypergraph_viz.enabled {
+            "J/K chaos  H hyper-viz:on"
+        } else {
+            "J/K chaos  H hyper-viz:off"
+        };
+        #[cfg(not(debug_assertions))]
+        let hypergraph_controls = "";
 
-    let sim_status = format!(
-        "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: R reset  [ ] speed  P pause  V visual  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} {}\nVisual Debug: {}",
-        seq,
-        detail.scale.0,
-        pause,
-        detail.hypergraph.chaos(),
-        hypergraph_controls,
-        if visual.enabled { "ON" } else { "OFF" }
-    );
+        let sim_status = format!(
+            "\n\nSim tick: {}  Speed: {:.2}x{}\nKeys: [ ] speed  P pause  V visual  R rule-viz  Arrows/WASD pan  Wheel zoom\nHypergraph chaos: {:.2} (surv: {:.2}) {}\nVisual Debug: {}",
+            seq,
+            detail.scale.0,
+            pause,
+            detail.hypergraph.chaos(),
+            rule_viz.last_survival_chaos,
+            hypergraph_controls,
+            if visual.enabled { "ON" } else { "OFF" }
+        );
 
-    let food_count = detail.food_query.iter().count();
-    let food_info = detail
-        .food_query
-        .iter()
-        .map(|(pos, f)| format!("{:?}({})", pos.chunk, f.portions))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let water_count = detail.water_query.iter().count();
-    let water_info = detail
-        .water_query
-        .iter()
-        .map(|(pos, w)| format!("{:?}({})", pos.chunk, w.portions))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let resource_lines = format!(
-        "\n\nResources:\n  Food {}: {}\n  Water {}: {}",
-        food_count, food_info, water_count, water_info,
-    );
-
-    let quest_lines = if detail.quest_board.active_quests.is_empty() {
-        "\n\nQuests: (none)".to_string()
-    } else {
-        std::iter::once("\n\nQuests:".to_string())
-            .chain(detail.quest_board.active_quests.iter().take(10).map(|q| {
-                let status = match q.status {
-                    QuestStatus::Open => "Open".to_string(),
-                    QuestStatus::Completed => "Completed".to_string(),
-                    QuestStatus::InProgress { provider } => {
-                        let provider_name = detail
-                            .pawn_names
-                            .get(provider)
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|_| format!("{:?}", provider));
-                        format!("InProgress({})", provider_name)
-                    }
-                };
-                format!("  {} @ {:?} - {}", q.need, q.chunk, status)
-            }))
+        let food_count = detail.food_query.iter().count();
+        let food_info = detail
+            .food_query
+            .iter()
+            .map(|(pos, f)| format!("{:?}({})", pos.chunk, f.portions))
             .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let activity_lines = if detail.activity.0.is_empty() {
-        "\n\nActivity: (none yet)".to_string()
-    } else {
-        std::iter::once("\n\nActivity:".to_string())
-            .chain(detail.activity.0.iter().rev().take(8).cloned())
+            .join(", ");
+        let water_count = detail.water_query.iter().count();
+        let water_info = detail
+            .water_query
+            .iter()
+            .map(|(pos, w)| format!("{:?}({})", pos.chunk, w.portions))
             .collect::<Vec<_>>()
-            .join("\n")
-    };
+            .join(", ");
+        let resource_lines = format!(
+            "\n\nResources:\n  Food {}: {}\n  Water {}: {}",
+            food_count, food_info, water_count, water_info,
+        );
 
-    let last_rewrites = detail.audit_log.last_n(5);
-    let audit_lines = if last_rewrites.is_empty() {
-        "\n\nAudit: no rewrites recorded".to_string()
-    } else {
-        std::iter::once("\n\nLast 5 rewrites:".to_string())
-            .chain(last_rewrites.iter().map(|entry| {
-                format!("  @{} - {} rewrites @ {:.1}s", entry.tick, entry.rewrite_count, entry.elapsed_secs)
-            }))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+        let quest_lines = if detail.quest_board.active_quests.is_empty() {
+            "\n\nQuests: (none)".to_string()
+        } else {
+            std::iter::once("\n\nQuests:".to_string())
+                .chain(detail.quest_board.active_quests.iter().take(10).map(|q| {
+                    let status = match q.status {
+                        QuestStatus::Open => "Open".to_string(),
+                        QuestStatus::Completed => "Completed".to_string(),
+                        QuestStatus::InProgress { provider } => {
+                            let provider_name = detail
+                                .pawn_names
+                                .get(provider)
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|_| format!("{:?}", provider));
+                            format!("InProgress({})", provider_name)
+                        }
+                    };
+                    format!("  {} @ {:?} - {}", q.need, q.chunk, status)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
-    let stats_text = format!(
-        "{}{}{}{}{}{}",
-        stats_text, sim_status, resource_lines, quest_lines, activity_lines, audit_lines
-    );
+        let activity_lines = if detail.activity.0.is_empty() {
+            "\n\nActivity: (none yet)".to_string()
+        } else {
+            std::iter::once("\n\nActivity:".to_string())
+                .chain(detail.activity.0.iter().rev().take(8).cloned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let last_rewrites = detail.audit_log.last_n(5);
+        let audit_lines = if last_rewrites.is_empty() {
+            "\n\nAudit: no rewrites recorded".to_string()
+        } else {
+            std::iter::once("\n\nLast 5 rewrites:".to_string())
+                .chain(last_rewrites.iter().map(|entry| {
+                    format!("  @{} - {} rewrites @ {:.1}s", entry.tick, entry.rewrite_count, entry.elapsed_secs)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let rule_lines = if rule_viz.mode == 0 {
+            "\n\nRules: [R to show]".to_string()
+        } else if rule_viz.mode == 1 {
+            // Mode 1: Effective Probability visualization
+            let rules = detail.hypergraph.rules();
+            let chaos = detail.hypergraph.chaos();
+            let mut scored: Vec<_> = rules.iter()
+                .map(|r| {
+                    let eff = (r.probability * (0.5 + chaos)).clamp(0.0, 1.0);
+                    (r, eff)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            std::iter::once(format!("\n\nRules Mode 1: Effective Probability (R cycles  surv-chaos:{:.2}):", chaos))
+                .chain(scored.iter().take(5).map(|(r, eff)| {
+                    format!("  {:<20} p:{:.2} eff:{:.2}", r.name, r.probability, eff)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            // Mode 2: Survival Score visualization with current rule probabilities
+            let chaos = detail.hypergraph.chaos();
+            let rules = detail.hypergraph.rules();
+            let mut scored: Vec<_> = rule_viz.per_rule_survival_scores.iter()
+                .map(|(name, score)| {
+                    let current_prob = rules.iter()
+                        .find(|r| &r.name == name)
+                        .map(|r| r.probability)
+                        .unwrap_or(0.0);
+                    (name.clone(), *score, current_prob)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            std::iter::once(format!("\n\nRules Mode 2: Survival Score (R cycles  surv-chaos:{:.2}):", chaos))
+                .chain(std::iter::once(format!(
+                    "  Survival Fitness: {:.2} | Reinforced: {} rules",
+                    rule_viz.survival_fitness,
+                    rule_viz.reinforcements_this_cycle
+                )))
+                .chain(scored.iter().take(5).map(|(name, score, prob)| {
+                    let reinforced = if rule_viz.reinforced_rule_names.iter().any(|n| n == name) {
+                        "  ↑"
+                    } else {
+                        ""
+                    };
+                    format!("  {:<20} p:{:.2} surv:{:+.4}{}", name, prob, score, reinforced)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let full_text = format!(
+            "{}{}{}{}{}{}{}",
+            stats_text, sim_status, resource_lines, quest_lines, activity_lines, audit_lines, rule_lines
+        );
+        local.cached_stats_text = full_text;
+        local.last_panel_update_secs = now;
+    }
 
     if !visual.enabled {
         if let Ok((_, _, mut vis)) = panel_queries.p0().single_mut() {
@@ -295,7 +383,7 @@ fn live_stats_overlay_system(
     }
 
     if let Ok((mut text, mut text_font, mut vis)) = panel_queries.p0().single_mut() {
-        text.0 = stats_text;
+        text.0 = local.cached_stats_text.clone();
         text_font.font = hud_font.0.clone();
         text_font.font_size = LIVE_STATS_FONT_SIZE;
         text_font.font_smoothing = FontSmoothing::AntiAliased;
@@ -318,7 +406,7 @@ fn live_stats_overlay_system(
         ))
         .with_children(|parent| {
             parent.spawn((
-                Text::new(stats_text),
+                Text::new(local.cached_stats_text.clone()),
                 TextFont {
                     font: hud_font.0.clone(),
                     font_size: LIVE_STATS_FONT_SIZE,
@@ -359,11 +447,41 @@ struct LiveStatsPanelLocal {
     thermal_delta_samples: VecDeque<(f32, f32)>,
     hyper_rewrite_samples: VecDeque<(f32, u64)>,
     tier4_birth_death_samples: VecDeque<(f32, u64, u64)>,
+    last_panel_update_secs: f32,
+    cached_stats_text: String,
 }
 
 #[derive(Resource, Default)]
 struct HypergraphRuntimeStats {
     rewritten_total: u64,
+}
+
+#[derive(Resource, Default)]
+struct RuleVizState {
+    /// Visualization mode: 0=off, 1=effective probability, 2=survival score.
+    mode: u8,
+    /// Survival chaos applied on the last tick (for panel display).
+    last_survival_chaos: f32,
+    /// Per-rule survival scores: EMA of (post_rewrite_energy_delta / baseline_energy).
+    /// Updated each tick when rewrites occur.
+    per_rule_survival_scores: Vec<(String, f32)>,
+    /// Fire counts per rule for diagnostics (reset periodically).
+    rule_fire_counts: Vec<u64>,
+    /// Baseline avg energy from last tick (used for survival delta computation).
+    last_baseline_energy: f32,
+    /// Number of rules reinforced during the most recent Tier-5 cycle.
+    reinforcements_this_cycle: u32,
+    /// Mean survival score across all tracked rules.
+    survival_fitness: f32,
+    /// Rule names reinforced during the most recent Tier-5 cycle.
+    reinforced_rule_names: Vec<String>,
+}
+
+const RULE_SURVIVAL_EMA_ALPHA: f32 = 0.1; // How fast survival scores adapt to new data
+
+#[derive(Resource, Default)]
+struct Tier5ReinforcementState {
+    last_reinforcement_tick: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +516,29 @@ impl HypergraphAuditLog {
 #[derive(Resource, Default)]
 struct VisualDebugThermalCache {
     prev_temp_by_chunk: HashMap<ChunkId, f32>,
+}
+
+#[derive(Resource, Default)]
+struct VisualSystemsProfiler {
+    window_start_secs: f32,
+    insect_total_ms: f64,
+    insect_calls: u32,
+    gs_total_ms: f64,
+    gs_calls: u32,
+    thermal_total_ms: f64,
+    thermal_calls: u32,
+}
+
+impl VisualSystemsProfiler {
+    fn reset_window(&mut self, now: f32) {
+        self.window_start_secs = now;
+        self.insect_total_ms = 0.0;
+        self.insect_calls = 0;
+        self.gs_total_ms = 0.0;
+        self.gs_calls = 0;
+        self.thermal_total_ms = 0.0;
+        self.thermal_calls = 0;
+    }
 }
 
 #[derive(Default)]
@@ -481,6 +622,29 @@ fn interactive_with_tier1_from_args() -> bool {
     })
 }
 
+fn initial_sim_speed_from_args() -> f32 {
+    *INITIAL_SIM_SPEED.get_or_init(|| {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == "--sim-speed" {
+                let raw = args
+                    .next()
+                    .expect("missing value for --sim-speed; provide a number in [0.0, 1000.0]");
+                let parsed: f32 = raw
+                    .parse()
+                    .expect("invalid --sim-speed value; provide a number in [0.0, 1000.0]");
+                assert!(parsed.is_finite(), "--sim-speed must be finite");
+                assert!(
+                    (0.0..=1000.0).contains(&parsed),
+                    "--sim-speed must be in [0.0, 1000.0]"
+                );
+                return parsed;
+            }
+        }
+        1.0
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SimulationMode {
     Interactive,
@@ -552,6 +716,8 @@ fn run_interactive() {
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<HypergraphAuditLog>()
+        .init_resource::<RuleVizState>()
+        .init_resource::<Tier5ReinforcementState>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<Tier4State>()
@@ -564,6 +730,7 @@ fn run_interactive() {
             mode: SimulationMode::Interactive,
             interactive_with_tier1: interactive_with_tier1_from_args(),
         })
+        .init_resource::<VisualSystemsProfiler>()
         .init_resource::<VisualDebugThermalCache>()
         .add_plugins(MirrorPlugin);
     #[cfg(debug_assertions)]
@@ -630,7 +797,11 @@ fn run_interactive() {
         )
         .add_systems(Update, visual_debug_thermal_overlay_system)
         .add_systems(Update, visual_debug_hypergraph_overlay_system)
-        .add_systems(Update, live_stats_overlay_system);
+        .add_systems(Update, live_stats_overlay_system)
+        .add_systems(Update, rule_viz_toggle_system)
+        .add_systems(Update, tier5_reinforcement_system)
+        .add_systems(Update, tier5_natural_decay_system)
+        .add_systems(Update, visual_debug_profiler_report_system);
 
     // Phase 4.D1: Push ECS snapshot to DuckDB mirror after Update (post visual sync).
     // Runs in its own add_systems call so it is not constrained by the Update chain tuple limit.
@@ -723,6 +894,8 @@ fn run_headless_with_profile(target_ticks: u64, profile: HeadlessProfile) -> Hea
         .init_resource::<HypergraphSubstrate>()
         .init_resource::<HypergraphRuntimeStats>()
         .init_resource::<HypergraphAuditLog>()
+        .init_resource::<RuleVizState>()
+        .init_resource::<Tier5ReinforcementState>()
         .init_resource::<ChemistryState>()
         .init_resource::<ThermalState>()
         .init_resource::<RespawnState>()
@@ -2134,6 +2307,7 @@ fn live_stats_panel_layout(
 }
 
 fn chunk_grid_gizmo_system(
+    scale: Res<SimTimeScale>,
     camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
     mut gizmos: Gizmos,
 ) {
@@ -2162,13 +2336,27 @@ fn chunk_grid_gizmo_system(
     gizmos.line_2d(Vec2::new(world_max_x, world_max_y), Vec2::new(world_min_x, world_max_y), border_color);
     gizmos.line_2d(Vec2::new(world_min_x, world_max_y), Vec2::new(world_min_x, world_min_y), border_color);
 
-    // Draw interior grid lines only where visible and within world bounds
+    // Draw interior grid lines only where visible and within world bounds.
+    // At high sim speeds, thin out minor lines to keep the render path responsive.
     let start_i = ((vis_min_x / CHUNK_PIXEL).floor() as i32).max(0);
     let end_i = ((vis_max_x / CHUNK_PIXEL).ceil() as i32).min(256);
     let start_j = ((vis_min_y / CHUNK_PIXEL).floor() as i32).max(0);
     let end_j = ((vis_max_y / CHUNK_PIXEL).ceil() as i32).min(256);
 
+    let min_grid_step = if scale.0 >= 500.0 {
+        64 // Ultra-sparse at 500x+
+    } else if scale.0 >= 250.0 {
+        32
+    } else if scale.0 >= 100.0 {
+        8
+    } else {
+        1
+    };
+
     for i in start_i..=end_i {
+        if min_grid_step > 1 && i % min_grid_step != 0 {
+            continue;
+        }
         let p = i as f32 * CHUNK_PIXEL;
         let major = i % 32 == 0;
         let color = if major {
@@ -2181,6 +2369,9 @@ fn chunk_grid_gizmo_system(
         gizmos.line_2d(Vec2::new(p, vis_min_y), Vec2::new(p, vis_max_y), color);
     }
     for j in start_j..=end_j {
+        if min_grid_step > 1 && j % min_grid_step != 0 {
+            continue;
+        }
         let p = j as f32 * CHUNK_PIXEL;
         let major = j % 32 == 0;
         let color = if major {
@@ -2212,26 +2403,157 @@ struct LiveStatsPanelTextUi;
 const VISUAL_DEBUG_MAX_INSECT_SPRITES: usize = 200;
 const VISUAL_DEBUG_MAX_THERMAL_SPRITES: usize = 20;
 
+fn visual_debug_insect_budget(sim_speed: f32) -> usize {
+    if sim_speed >= 500.0 {
+        40
+    } else if sim_speed >= 100.0 {
+        80
+    } else {
+        VISUAL_DEBUG_MAX_INSECT_SPRITES
+    }
+}
+
+fn visual_debug_thermal_budget(sim_speed: f32) -> usize {
+    if sim_speed >= 500.0 {
+        8
+    } else if sim_speed >= 100.0 {
+        12
+    } else {
+        VISUAL_DEBUG_MAX_THERMAL_SPRITES
+    }
+}
+
+fn visual_debug_overlay_update_interval_secs(sim_speed: f32) -> f32 {
+    if sim_speed >= 500.0 {
+        0.1
+    } else if sim_speed >= 100.0 {
+        1.0 / 15.0
+    } else {
+        0.0
+    }
+}
+
 fn visual_debug_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut visual: ResMut<VisualDebug>) {
     if keys.just_pressed(KeyCode::KeyV) {
         visual.enabled = !visual.enabled;
     }
 }
 
-fn visual_debug_insect_overlay_system(
-    mut commands: Commands,
-    visual: Res<VisualDebug>,
-    tier4: Res<Tier4State>,
-    time: Res<Time>,
-    camera_query: Query<&Transform, With<Camera2d>>,
-    existing: Query<Entity, With<VisualDebugInsectSprite>>,
-) {
-    for entity in existing.iter() {
-        commands.entity(entity).despawn();
+fn rule_viz_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut rule_viz: ResMut<RuleVizState>) {
+    if keys.just_pressed(KeyCode::KeyR) {
+        rule_viz.mode = (rule_viz.mode + 1) % 3; // Cycle: 0 (off) → 1 (prob) → 2 (survival) → 0
     }
-    if !visual.enabled || tier4.insects.is_empty() {
+}
+
+fn tier5_reinforcement_system(
+    global_clock: Res<GlobalTickClock>,
+    time: Res<Time>,
+    mut substrate: ResMut<HypergraphSubstrate>,
+    mut rule_viz: ResMut<RuleVizState>,
+    mut audit_log: ResMut<HypergraphAuditLog>,
+    mut state: ResMut<Tier5ReinforcementState>,
+) {
+    let seq = global_clock.causal_seq();
+    if seq == 0 || seq % 100 != 0 || state.last_reinforcement_tick == seq {
         return;
     }
+
+    let mut ranked_scores: Vec<(String, f32)> = rule_viz
+        .per_rule_survival_scores
+        .iter()
+        .map(|(name, score)| (name.clone(), *score))
+        .collect();
+    ranked_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mean_score = if ranked_scores.is_empty() {
+        0.0
+    } else {
+        ranked_scores.iter().map(|(_, score)| *score).sum::<f32>() / ranked_scores.len() as f32
+    };
+    rule_viz.survival_fitness = mean_score;
+
+    let mut reinforced_rule_names = Vec::new();
+    for (rule_name, _) in ranked_scores.into_iter().take(3) {
+        if substrate.reinforce_rule(&rule_name, 0.005) {
+            let new_prob = substrate.rules()
+                .iter()
+                .find(|r| r.name == rule_name)
+                .map(|r| r.probability)
+                .unwrap_or(0.0);
+            println!("[Tier-5] Reinforced '{}' (+0.005 → p:{:.3})", rule_name, new_prob);
+            reinforced_rule_names.push(rule_name.clone());
+            audit_log.push(HypergraphAuditEntry {
+                tick: seq,
+                elapsed_secs: time.elapsed_secs(),
+                rewrite_count: 0,
+                description: format!("Tier-5 reinforced {} -> +0.005", rule_name),
+            });
+        }
+    }
+
+    rule_viz.reinforcements_this_cycle = reinforced_rule_names.len() as u32;
+    rule_viz.reinforced_rule_names = reinforced_rule_names;
+    state.last_reinforcement_tick = seq;
+}
+
+fn tier5_natural_decay_system(
+    global_clock: Res<GlobalTickClock>,
+    time: Res<Time>,
+    mut substrate: ResMut<HypergraphSubstrate>,
+    mut audit_log: ResMut<HypergraphAuditLog>,
+) {
+    let seq = global_clock.causal_seq();
+    if seq == 0 || seq % 200 != 0 {
+        return;
+    }
+
+    // Apply natural decay: reduce all rule probabilities by 0.001 (floor at 0.05)
+    for rule in substrate.rules_mut() {
+        rule.probability = (rule.probability - 0.001).max(0.05);
+    }
+    audit_log.push(HypergraphAuditEntry {
+        tick: seq,
+        elapsed_secs: time.elapsed_secs(),
+        rewrite_count: 0,
+        description: "Tier-5 natural decay applied (-0.001 to all rules)".to_string(),
+    });
+}
+
+fn visual_debug_insect_overlay_system(
+    visual: Res<VisualDebug>,
+    scale: Res<SimTimeScale>,
+    tier4: Res<Tier4State>,
+    time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
+    mut pool: ResMut<InsectSpritePool>,
+    mut last_update: Local<f32>,
+    camera_query: Query<&Transform, (With<Camera2d>, Without<VisualDebugInsectSprite>)>,
+    mut sprite_query: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<VisualDebugInsectSprite>>,
+) {
+    let now = time.elapsed_secs();
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
+    }
+
+    if !visual.enabled || tier4.insects.is_empty() {
+        // Hide all pool sprites when visual debug is disabled
+        for entity in pool.entities.iter() {
+            if let Ok((_, _, mut vis)) = sprite_query.get_mut(*entity) {
+                *vis = Visibility::Hidden;
+            }
+        }
+        pool.set_active_count(0);
+        return;
+    }
+
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
+    let start = Instant::now();
+    pool.active_count = 0;
 
     let camera = match camera_query.single() {
         Ok(value) => value,
@@ -2253,7 +2575,9 @@ fn visual_debug_insect_overlay_system(
     });
 
     let t = time.elapsed_secs();
-    for (idx, _) in order.into_iter().take(VISUAL_DEBUG_MAX_INSECT_SPRITES) {
+    let max_sprites = visual_debug_insect_budget(scale.0);
+    let mut active_count = 0usize;
+    for (idx, _) in order.into_iter().take(max_sprites) {
         let insect = &tier4.insects[idx];
         let hunger = insect.hunger.clamp(0.0, 1.0);
         let fear = insect.fear.clamp(0.0, 1.0);
@@ -2293,26 +2617,61 @@ fn visual_debug_insect_overlay_system(
         
         let leg_wobble = 0.28 * (t * (6.0 + hunger * 4.0) + phase * 0.7).sin();
         let alpha = (0.82 + 0.14 * energy_norm + 0.06 * scale_pulse).clamp(0.55, 1.0);
-        
-        commands.spawn((
-            VisualDebugInsectSprite,
-            Sprite::from_color(Color::srgba(r, g, b, alpha), Vec2::new(width, height)),
-            Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(leg_wobble)),
-        ));
+
+        if let Some(pool_entity) = pool.get_active(active_count) {
+            if let Ok((mut sprite, mut transform, mut vis)) = sprite_query.get_mut(pool_entity) {
+                sprite.color = Color::srgba(r, g, b, alpha);
+                sprite.custom_size = Some(Vec2::new(width, height));
+                *transform = Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(leg_wobble));
+                *vis = Visibility::Inherited;
+            }
+            active_count += 1;
+        }
     }
+
+    pool.set_active_count(active_count);
+    for i in active_count..pool.entities.len() {
+        if let Ok((_, _, mut vis)) = sprite_query.get_mut(pool.entities[i]) {
+            *vis = Visibility::Hidden;
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    profiler.insect_total_ms += elapsed_ms;
+    profiler.insect_calls = profiler.insect_calls.saturating_add(1);
 }
 
 fn visual_debug_gs_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
+    scale: Res<SimTimeScale>,
     simlife: Res<SimLifeState>,
+    time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
+    mut last_update: Local<f32>,
     existing: Query<Entity, With<VisualDebugGsFullWorldTint>>,
 ) {
+    let now = time.elapsed_secs();
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
+    }
+
+    if !visual.enabled || simlife.gs_active.is_empty() {
+        for entity in existing.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
+
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
+    let start = Instant::now();
     for entity in existing.iter() {
         commands.entity(entity).despawn();
-    }
-    if !visual.enabled || simlife.gs_active.is_empty() {
-        return;
     }
 
     // Compute average v-concentration (biomass) across all active GS cells
@@ -2354,23 +2713,45 @@ fn visual_debug_gs_overlay_system(
         ),
         Transform::from_translation(Vec3::new(world_center, world_center, 1.5)),
     ));
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    profiler.gs_total_ms += elapsed_ms;
+    profiler.gs_calls = profiler.gs_calls.saturating_add(1);
 }
 
 fn visual_debug_thermal_overlay_system(
     mut commands: Commands,
     visual: Res<VisualDebug>,
+    scale: Res<SimTimeScale>,
     thermal: Res<ThermalState>,
     mut cache: ResMut<VisualDebugThermalCache>,
     time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
+    mut last_update: Local<f32>,
     camera_query: Query<&Transform, With<Camera2d>>,
     existing: Query<Entity, With<VisualDebugThermalSprite>>,
 ) {
-    for entity in existing.iter() {
-        commands.entity(entity).despawn();
+    let now = time.elapsed_secs();
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
     }
+
     if !visual.enabled || thermal.local_temperature_by_chunk.is_empty() {
+        for entity in existing.iter() {
+            commands.entity(entity).despawn();
+        }
         cache.prev_temp_by_chunk.clear();
         return;
+    }
+
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
+    let start = Instant::now();
+    for entity in existing.iter() {
+        commands.entity(entity).despawn();
     }
 
     let camera = match camera_query.single() {
@@ -2392,7 +2773,8 @@ fn visual_debug_thermal_overlay_system(
             None => Ordering::Equal,
         }
     });
-    let mut hottest: Vec<(ChunkId, f32)> = hotspots.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES * 3).collect();
+    let thermal_budget = visual_debug_thermal_budget(scale.0);
+    let mut hottest: Vec<(ChunkId, f32)> = hotspots.into_iter().take(thermal_budget * 3).collect();
     hottest.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
         Some(ordering) => ordering,
         None => Ordering::Equal,
@@ -2411,7 +2793,7 @@ fn visual_debug_thermal_overlay_system(
     // Global breathing pulse synced to overall thermal system activity (0.7 Hz)
     let global_breath = (time_s * 0.7 * std::f32::consts::TAU).sin();
     
-    for (chunk, delta) in hottest.into_iter().take(VISUAL_DEBUG_MAX_THERMAL_SPRITES) {
+    for (chunk, delta) in hottest.into_iter().take(thermal_budget) {
         let intensity = (delta / denom).clamp(0.0, 1.0);
         let current_temp = thermal.local_temperature_by_chunk.get(&chunk).copied();
         let current_temp = match current_temp {
@@ -2449,6 +2831,70 @@ fn visual_debug_thermal_overlay_system(
         ));
         cache.prev_temp_by_chunk.insert(chunk, current_temp);
     }
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    profiler.thermal_total_ms += elapsed_ms;
+    profiler.thermal_calls = profiler.thermal_calls.saturating_add(1);
+}
+
+fn visual_debug_profiler_report_system(
+    visual: Res<VisualDebug>,
+    time: Res<Time>,
+    mut profiler: ResMut<VisualSystemsProfiler>,
+    mut frame_acc: Local<(f32, u32)>, // (total_fps_sum, count) since last report
+) {
+    let now = time.elapsed_secs();
+    let raw_fps = 1.0 / time.delta_secs().max(0.0001);
+    frame_acc.0 += raw_fps;
+    frame_acc.1 += 1;
+
+    if !visual.enabled {
+        profiler.reset_window(now);
+        return;
+    }
+    if profiler.window_start_secs == 0.0 {
+        profiler.window_start_secs = now;
+    }
+
+    let window = now - profiler.window_start_secs;
+    if window < 1.0 {
+        return;
+    }
+
+    let insect_avg = if profiler.insect_calls > 0 {
+        profiler.insect_total_ms / profiler.insect_calls as f64
+    } else {
+        0.0
+    };
+    let gs_avg = if profiler.gs_calls > 0 {
+        profiler.gs_total_ms / profiler.gs_calls as f64
+    } else {
+        0.0
+    };
+    let thermal_avg = if profiler.thermal_calls > 0 {
+        profiler.thermal_total_ms / profiler.thermal_calls as f64
+    } else {
+        0.0
+    };
+    let total_visual_avg = insect_avg + gs_avg + thermal_avg;
+    let fps_est = if total_visual_avg > 0.0 {
+        1000.0 / total_visual_avg
+    } else {
+        0.0
+    };
+
+    let actual_fps = if frame_acc.1 > 0 {
+        frame_acc.0 / frame_acc.1 as f32
+    } else {
+        0.0
+    };
+    *frame_acc = (0.0, 0);
+
+    println!(
+        "[visual-profiler] fps: {:.1} insect: {:.2}ms gs: {:.2}ms thermal: {:.2}ms total: {:.2}ms overlay-fps-budget: {:.1}",
+        actual_fps, insect_avg, gs_avg, thermal_avg, total_visual_avg, fps_est
+    );
+
+    profiler.reset_window(now);
 }
 
 fn visual_debug_hypergraph_overlay_system(
@@ -2510,7 +2956,10 @@ struct DisplayOffset(pub Vec3);
 struct ResourceLevelBarVisual;
 
 fn sync_position_to_transform(
-    mut query: Query<(&Position, &mut Transform, Option<&DisplayOffset>), With<Sprite>>,
+    mut query: Query<
+        (&Position, &mut Transform, Option<&DisplayOffset>),
+        (With<Sprite>, Changed<Position>),
+    >,
 ) {
     for (position, mut transform, offset) in query.iter_mut() {
         let base = chunk_to_translation(&position.chunk, transform.translation.z);
@@ -2825,11 +3274,20 @@ fn chunk_to_translation(chunk: &ChunkId, z: f32) -> Vec3 {
 
 fn resource_level_bar_system(
     mut commands: Commands,
+    time: Res<Time>,
+    scale: Res<SimTimeScale>,
+    mut last_update: Local<f32>,
     existing_bars: Query<Entity, With<ResourceLevelBarVisual>>,
     food_query: Query<(&Position, &FoodReservation)>,
     water_query: Query<(&Position, &WaterSource)>,
 ) {
-    // Keep implementation simple: rebuild tiny bar overlays each frame from current resource state.
+    let now = time.elapsed_secs();
+    let interval = visual_debug_overlay_update_interval_secs(scale.0);
+    if interval > 0.0 && (now - *last_update) < interval {
+        return;
+    }
+    *last_update = now;
+
     for entity in existing_bars.iter() {
         commands.entity(entity).despawn();
     }
@@ -2904,8 +3362,11 @@ fn camera_pan_zoom_input(
 fn setup(
     mut commands: Commands,
     mut allocator: ResMut<ItemIdAllocator>,
+    mut sim_scale: ResMut<SimTimeScale>,
     sim_mode: Option<Res<SimulationModeRuntime>>,
 ) {
+    sim_scale.0 = initial_sim_speed_from_args();
+
     // Center camera on world and zoom to show full 256x256 extent
     let world_cx = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
     let world_cy = CHUNK_EXTENT as f32 * CHUNK_PIXEL / 2.0;
@@ -2917,6 +3378,20 @@ fn setup(
             ..OrthographicProjection::default_2d()
         }),
     ));
+
+    // Pre-allocate insect sprite pool (max budget for 1x speed)
+    let pool_size = VISUAL_DEBUG_MAX_INSECT_SPRITES;
+    let mut pool_entities = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let entity = commands.spawn((
+            VisualDebugInsectSprite,
+            Sprite::from_color(Color::srgba(1.0, 1.0, 1.0, 1.0), Vec2::splat(4.0)),
+            Transform::from_translation(Vec3::ZERO),
+            Visibility::Hidden,
+        )).id();
+        pool_entities.push(entity);
+    }
+    commands.insert_resource(InsectSpritePool::new(pool_entities));
 
     // Axis coordinate labels every 32 chunks - smaller font, positioned outside world bounds
     let axis_font = TextFont { font_size: 96.0, ..default() };
@@ -3835,12 +4310,41 @@ fn hypergraph_tick_system(
     mut report: Option<ResMut<SimulationReport>>,
     time: Res<Time>,
     mut audit_log: ResMut<HypergraphAuditLog>,
+    tier4: Res<Tier4State>,
+    mut rule_viz: ResMut<RuleVizState>,
 ) {
     let started = Instant::now();
     if !tier10_enabled_from_args() {
         perf_record("hypergraph_tick", started.elapsed());
         return;
     }
+
+    // Survival-weighted dispatcher: low Tier-4 energy → lower chaos → more deterministic rewrites.
+    // Thermal pressure reduces chaos further when the environment is overheating.
+    {
+        let base_chaos = substrate.chaos();
+        let avg_energy_norm = if tier4.insects.is_empty() {
+            1.0_f32
+        } else {
+            let sum: f32 = tier4.insects.iter().map(|i| i.energy).sum();
+            (sum / (tier4.insects.len() as f32 * 8.0)).clamp(0.0, 1.0)
+        };
+        let thermal_stress = ((thermal.latest_peak_temperature_k - thermal.sink_temperature_k) / 50.0)
+            .clamp(0.0, 1.0);
+        let survival_factor = (avg_energy_norm * (1.0 - thermal_stress * 0.3)).clamp(0.1, 1.0);
+        let survival_chaos = (base_chaos * survival_factor).clamp(0.05, 1.0);
+        substrate.set_chaos(survival_chaos);
+        rule_viz.last_survival_chaos = survival_chaos;
+    }
+
+    // Capture baseline energy for per-rule survival delta computation.
+    let baseline_avg_energy = if tier4.insects.is_empty() {
+        0.0_f32
+    } else {
+        let sum: f32 = tier4.insects.iter().map(|i| i.energy).sum();
+        sum / (tier4.insects.len() as f32 * 8.0)
+    };
+    rule_viz.last_baseline_energy = baseline_avg_energy;
 
     let seq = global_clock.causal_seq();
     let patch_chunk_size = substrate.config().patch_chunk_size;
@@ -3921,6 +4425,43 @@ fn hypergraph_tick_system(
             description: format!("{} rewrites", stats.rewritten),
         };
         audit_log.push(entry);
+    }
+
+    // Per-rule survival score tracking: compute energy delta and update EMA for each rule.
+    {
+        let post_avg_energy = if tier4.insects.is_empty() {
+            0.0_f32
+        } else {
+            let sum: f32 = tier4.insects.iter().map(|i| i.energy).sum();
+            sum / (tier4.insects.len() as f32 * 8.0)
+        };
+
+        let survival_delta = if rule_viz.last_baseline_energy > 0.0 {
+            (post_avg_energy - rule_viz.last_baseline_energy) / rule_viz.last_baseline_energy
+        } else {
+            0.0_f32
+        };
+
+        // Initialize per-rule scores if empty (first tick or first enabling of viz).
+        if rule_viz.per_rule_survival_scores.is_empty() {
+            for rule in substrate.rules() {
+                rule_viz.per_rule_survival_scores.push((rule.name.clone(), 0.0_f32));
+                rule_viz.rule_fire_counts.push(0u64);
+            }
+        }
+
+        // Update per-rule survival scores with EMA; weight by rule fire probability.
+        if stats.rewritten > 0 && !rule_viz.per_rule_survival_scores.is_empty() {
+            let chaos = substrate.chaos();
+            for (_idx, (rule_name, score_ref)) in rule_viz.per_rule_survival_scores.iter_mut().enumerate() {
+                // Find the rule to get its effective probability.
+                if let Some(rule) = substrate.rules().iter().find(|r| r.name == *rule_name) {
+                    let eff_prob = (rule.probability * (0.5 + chaos)).clamp(0.0, 1.0);
+                    let weighted_delta = survival_delta * eff_prob;
+                    *score_ref = *score_ref * (1.0 - RULE_SURVIVAL_EMA_ALPHA) + weighted_delta * RULE_SURVIVAL_EMA_ALPHA;
+                }
+            }
+        }
     }
 
     if let Some(ref mut report) = report {
@@ -4130,11 +4671,15 @@ fn sim_tick_driver(
     log_settings: Option<Res<SimulationLogSettings>>,
 ) {
     accumulator.0 += time.delta_secs() * scale.0 * SIM_TICKS_PER_SECOND_AT_1X;
+    if accumulator.0 > MAX_INTERACTIVE_SIM_ACCUMULATOR_TICKS {
+        accumulator.0 = MAX_INTERACTIVE_SIM_ACCUMULATOR_TICKS;
+    }
     let stdout_enabled = log_settings
         .as_deref()
         .map(|settings| settings.stdout_enabled)
         .unwrap_or(true);
-    while accumulator.0 >= 1.0 {
+    let mut ticks_this_frame = 0u32;
+    while accumulator.0 >= 1.0 && ticks_this_frame < MAX_INTERACTIVE_SIM_TICKS_PER_FRAME {
         advance_simulation_one_tick(
             &mut global_clock,
             &mut event_queue,
@@ -4151,20 +4696,22 @@ fn sim_tick_driver(
             stdout_enabled,
         );
         accumulator.0 -= 1.0;
+        ticks_this_frame += 1;
     }
 }
 
 /// Min/max scale for display sanity; effectively unbounded for gameplay.
 const MIN_SCALE: f32 = 0.01;
 const MAX_SCALE: f32 = 1000.0;
+// Interactive backpressure: prevents sim burst catch-up from starving render at high time scales.
+const MAX_INTERACTIVE_SIM_TICKS_PER_FRAME: u32 = 64;
+const MAX_INTERACTIVE_SIM_ACCUMULATOR_TICKS: f32 = 4096.0;
 
 fn time_scale_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut scale: ResMut<SimTimeScale>,
 ) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        scale.0 = 1.0;
-    }
+    // R-key repurposed for rule visualization cycling; speed reset removed
     if keys.just_pressed(KeyCode::BracketRight) {
         scale.0 = (scale.0 * 1.5).min(MAX_SCALE);
     }
