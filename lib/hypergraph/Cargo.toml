@@ -14,5 +14,5 @@ workspace = true
 [dependencies]
 bevy = { workspace = true }
 serde = { workspace = true }
-rand = { version = "0.8", features = ["small_rng"] }
+rand = { version = "0.9", features = ["small_rng"] }
 ron = "0.8"

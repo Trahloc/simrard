@@ -5454,7 +5454,7 @@ name = "simrard-lib-hypergraph"
 version = "0.1.0"
 dependencies = [
  "bevy",
- "rand 0.8.5",
+ "rand 0.9.2",
  "ron 0.8.1",
  "serde",
 ]
