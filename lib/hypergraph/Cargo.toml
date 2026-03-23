@@ -15,4 +15,4 @@ workspace = true
 bevy = { workspace = true }
 serde = { workspace = true }
 rand = { version = "0.8", features = ["small_rng"] }
-ron = "0.8"
+ron = "0.12"
